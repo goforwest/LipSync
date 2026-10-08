@@ -1,0 +1,153 @@
+# Builds the LipSync firmware and attaches flashable artifacts to the
+# GitHub release for the pushed V* tag:
+#   LipSync_Firmware_<version>_dfu.zip   adafruit-nrfutil serial-DFU package
+#                                        (flashed by the LipSync Connect web app)
+#   LipSync_Firmware_<version>.uf2       UF2 image (bootloader drive drag-and-drop)
+#   LipSync_Firmware_<version>.hex       raw Intel HEX
+#   firmware-manifest.json               version + sha256 + sizes (update-check
+#                                        source of truth for the web app)
+#
+# The build mirrors the manual process in the Maker Guide: Seeed nRF52 core,
+# the library versions listed there, and the sketch compiled for the
+# Seeed XIAO nRF52840. The tag must match the version constants in
+# LSConfig.h, so a release can never report a version it doesn't contain.
+
+name: Build firmware release artifacts
+
+on:
+  push:
+    tags:
+      - 'V*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FQBN: Seeeduino:nrf52:xiaonRF52840
+  SEEED_BOARD_INDEX: https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up arduino-cli
+        uses: arduino/setup-arduino-cli@v2
+        with:
+          version: '1.3.1'
+
+      - name: Install Seeed nRF52 core (pinned)
+        run: |
+          arduino-cli core update-index --additional-urls "$SEEED_BOARD_INDEX"
+          arduino-cli core install Seeeduino:nrf52@1.1.13 --additional-urls "$SEEED_BOARD_INDEX"
+
+      - name: Install libraries (pinned to the Maker Guide set)
+        run: |
+          arduino-cli lib install \
+            "Adafruit BusIO@1.17.4" \
+            "Adafruit GFX Library@1.12.6" \
+            "Adafruit LPS2X@2.0.6" \
+            "Adafruit LPS35HW@1.0.6" \
+            "Adafruit SSD1306@2.5.17" \
+            "Adafruit Unified Sensor@1.1.15" \
+            "ArduinoJson@7.4.3"
+
+      - name: Install the bundled TLV493D library
+        run: |
+          mkdir -p "$HOME/Arduino/libraries"
+          unzip -q -o Build_Files/Firmware_Files/Libraries/TLV493D-A1B6.zip -d "$HOME/Arduino/libraries/"
+          mv "$HOME/Arduino/libraries/TLV493D-A1B6-3DMagnetic-Sensor-master" \
+             "$HOME/Arduino/libraries/TLV493D-A1B6-3DMagnetic-Sensor"
+
+      - name: Read firmware version and verify the tag matches
+        run: |
+          VERSION=$(awk '/^#define[ \t]+CONF_LIPSYNC_VERSION_MAJOR/{printf "%s.", $3}
+                         /^#define[ \t]+CONF_LIPSYNC_VERSION_MINOR/{printf "%s.", $3}
+                         /^#define[ \t]+CONF_LIPSYNC_VERSION_REV/{printf "%s", $3}' \
+            Build_Files/Firmware_Files/LipSync_Firmware/LSConfig.h)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG_VERSION="${GITHUB_REF_NAME#V}"
+            TAG_VERSION="${TAG_VERSION#v}"
+            if [ "$TAG_VERSION" != "$VERSION" ]; then
+              echo "Tag $GITHUB_REF_NAME does not match firmware version $VERSION in LSConfig.h." >&2
+              exit 1
+            fi
+          fi
+
+      - name: Compile firmware
+        run: |
+          mkdir -p build
+          arduino-cli compile \
+            --fqbn "$FQBN" \
+            --build-path build \
+            Build_Files/Firmware_Files/LipSync_Firmware
+
+      - name: Generate UF2
+        run: |
+          curl -sL --fail \
+            https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2conv.py \
+            -o uf2conv.py
+          curl -sL --fail \
+            https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2families.json \
+            -o uf2families.json
+          python3 uf2conv.py -c -f 0xADA52840 \
+            -o "build/LipSync_Firmware_${VERSION}.uf2" \
+            "build/LipSync_Firmware.ino.hex"
+
+      - name: Stage release artifacts + manifest
+        run: |
+          mkdir -p dist
+          cp build/LipSync_Firmware.ino.zip "dist/LipSync_Firmware_${VERSION}_dfu.zip"
+          cp build/LipSync_Firmware.ino.hex "dist/LipSync_Firmware_${VERSION}.hex"
+          mv "build/LipSync_Firmware_${VERSION}.uf2" dist/
+          VERSION="$VERSION" python3 - <<'EOF'
+          import datetime
+          import hashlib
+          import json
+          import os
+          version = os.environ["VERSION"]
+          dist = "dist"
+          files = {
+              "dfu": f"LipSync_Firmware_{version}_dfu.zip",
+              "uf2": f"LipSync_Firmware_{version}.uf2",
+              "hex": f"LipSync_Firmware_{version}.hex",
+          }
+          entry = {}
+          for kind, name in files.items():
+              with open(os.path.join(dist, name), "rb") as f:
+                  data = f.read()
+              entry[kind] = {
+                  "fileName": name,
+                  "size": len(data),
+                  "sha256": hashlib.sha256(data).hexdigest(),
+              }
+          manifest = {
+              "firmwareVersion": version,
+              "fqbn": "Seeeduino:nrf52:xiaonRF52840",
+              "builtAt": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+              "files": entry,
+          }
+          with open(os.path.join(dist, "firmware-manifest.json"), "w") as f:
+              json.dump(manifest, f, indent=2)
+              f.write("\n")
+          EOF
+          ls -l dist/
+
+      - name: Upload build artifacts (workflow_dispatch / debugging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ env.VERSION }}
+          path: dist/
+
+      - name: Attach artifacts to the release
+        if: startsWith(github.ref, 'refs/tags/V')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" --verify-tag --title "${GITHUB_REF_NAME}" \
+            --notes "Firmware ${VERSION}. See CHANGES.txt for details." || true
+          gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
