@@ -16,7 +16,7 @@
   If not, see <http://www.gnu.org/licenses/>
 */
 
-#include <String.h>
+#include <WString.h>
 #include <Wire.h>
 #include "LSUtils.h"
 #include "LSConfig.h"
