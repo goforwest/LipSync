@@ -91,11 +91,15 @@ jobs:
 
       - name: Generate UF2
         run: |
+          # Pinned to the exact microsoft/uf2 revision the local twin
+          # (LipSync_Connect dev/firmware/uf2conv.py + uf2families.json)
+          # vendored byte-identical, so release artifacts always match the
+          # documented local build. Refresh both copies together.
           curl -sL --fail \
-            https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2conv.py \
+            https://raw.githubusercontent.com/microsoft/uf2/90e9741f217f5a40c98ba74d663e408041037578/utils/uf2conv.py \
             -o uf2conv.py
           curl -sL --fail \
-            https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2families.json \
+            https://raw.githubusercontent.com/microsoft/uf2/90e9741f217f5a40c98ba74d663e408041037578/utils/uf2families.json \
             -o uf2families.json
           python3 uf2conv.py -c -f 0xADA52840 \
             -o "build/LipSync_Firmware_${VERSION}.uf2" \
@@ -130,6 +134,11 @@ jobs:
               }
           manifest = {
               "firmwareVersion": version,
+              # The tag this build was released from (branch name on
+              # workflow_dispatch): lets a stale firmware-binaries branch be
+              # diagnosed from the artifact itself — the web app separately
+              # refuses a manifest whose version disagrees with the release.
+              "tag": os.environ.get("GITHUB_REF_NAME", ""),
               "fqbn": "Seeeduino:nrf52:xiaonRF52840",
               "builtAt": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
               "files": entry,
@@ -163,9 +172,27 @@ jobs:
       # holds exactly one commit with the current artifacts.
       - name: Publish artifacts to the firmware-binaries branch
         if: startsWith(github.ref, 'refs/tags/V')
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Stale-race guard: the branch is force-pushed per release, but two
+          # near-simultaneous tags can finish in either order — an older build
+          # completing last must never clobber a newer release's artifacts
+          # (releases/latest would then disagree with the branch, and every
+          # update check would report the older version). If the branch
+          # already holds a NEWER firmwareVersion than this build, leave it
+          # untouched.
+          BRANCH_VERSION=$(gh api "repos/${GITHUB_REPOSITORY}/contents/firmware-manifest.json?ref=firmware-binaries" \
+            --jq '.content' 2>/dev/null | base64 -d 2>/dev/null \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("firmwareVersion",""))' || echo "")
+          if [ -z "$BRANCH_VERSION" ] || python3 -c "import sys; sys.exit(0 if [int(p) for p in '${BRANCH_VERSION}'.lstrip('Vv').split('.')] <= [int(p) for p in '${VERSION}'.lstrip('Vv').split('.')] else 1)"; then
+            echo "Branch holds ${BRANCH_VERSION:-nothing yet}; publishing ${VERSION}."
+          else
+            echo "firmware-binaries already holds ${BRANCH_VERSION} — newer than this build (${VERSION}); leaving it untouched."
+            exit 0
+          fi
           git switch --orphan firmware-binaries
           mv dist/* .
           git add firmware-manifest.json "LipSync_Firmware_${VERSION}_dfu.zip" "LipSync_Firmware_${VERSION}.uf2" "LipSync_Firmware_${VERSION}.hex"
