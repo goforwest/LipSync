@@ -205,11 +205,7 @@ jobs:
               exit 1
             fi
             if ! BRANCH_VERSION=$(printf '%s' "$MANIFEST_B64" | base64 -d 2>/dev/null \
-              | python3 -c 'import json,sys,re
-v = json.load(sys.stdin).get("firmwareVersion","")
-if not re.fullmatch(r"[Vv]?\d+(\.\d+)*", v):
-    sys.exit(1)
-print(v)'); then
+              | python3 -c 'import json,sys,re; v=json.load(sys.stdin).get("firmwareVersion",""); print(v); sys.exit(1 if v and not re.fullmatch(r"[Vv]?\d+(\.\d+)*", v) else 0)'); then
               echo "firmware-binaries holds a manifest that is not valid JSON, or a firmwareVersion that is not a plain dotted number — refusing to publish ${VERSION} over it." >&2
               exit 1
             fi
