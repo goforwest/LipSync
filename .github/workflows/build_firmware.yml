@@ -184,14 +184,45 @@ jobs:
           # update check would report the older version). If the branch
           # already holds a NEWER firmwareVersion than this build, leave it
           # untouched.
-          BRANCH_VERSION=$(gh api "repos/${GITHUB_REPOSITORY}/contents/firmware-manifest.json?ref=firmware-binaries" \
-            --jq '.content' 2>/dev/null | base64 -d 2>/dev/null \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("firmwareVersion",""))' || echo "")
-          if [ -z "$BRANCH_VERSION" ] || python3 -c "import sys; sys.exit(0 if [int(p) for p in '${BRANCH_VERSION}'.lstrip('Vv').split('.')] <= [int(p) for p in '${VERSION}'.lstrip('Vv').split('.')] else 1)"; then
-            echo "Branch holds ${BRANCH_VERSION:-nothing yet}; publishing ${VERSION}."
+          #
+          # Residual race (accepted): the check is read-then-push — two builds
+          # that both read the branch before either pushes can still finish
+          # out of order. The web app's tag↔manifest cross-check refuses a
+          # branch that disagrees with releases/latest, so the failure mode is
+          # "everyone sees a clear error until the next release", never a
+          # wrong flash. Do not rely on this guard for correctness — rely on
+          # it to make the common orderings do the right thing.
+          #
+          # Failure policy: fail CLOSED. A missing branch is the first
+          # release (publish); anything unparsable or unreadable is a broken
+          # state that must not be published over silently.
+          if ! git ls-remote --exit-code origin refs/heads/firmware-binaries >/dev/null 2>&1; then
+            echo "firmware-binaries does not exist yet — publishing ${VERSION} (first release)."
           else
-            echo "firmware-binaries already holds ${BRANCH_VERSION} — newer than this build (${VERSION}); leaving it untouched."
-            exit 0
+            if ! MANIFEST_B64=$(gh api "repos/${GITHUB_REPOSITORY}/contents/firmware-manifest.json?ref=firmware-binaries" \
+              --jq '.content' 2>/dev/null); then
+              echo "Could not read firmware-manifest.json from firmware-binaries — refusing to publish ${VERSION} blind." >&2
+              exit 1
+            fi
+            if ! BRANCH_VERSION=$(printf '%s' "$MANIFEST_B64" | base64 -d 2>/dev/null \
+              | python3 -c 'import json,sys,re
+v = json.load(sys.stdin).get("firmwareVersion","")
+if not re.fullmatch(r"[Vv]?\d+(\.\d+)*", v):
+    sys.exit(1)
+print(v)'); then
+              echo "firmware-binaries holds a manifest that is not valid JSON, or a firmwareVersion that is not a plain dotted number — refusing to publish ${VERSION} over it." >&2
+              exit 1
+            fi
+            if [ -z "$BRANCH_VERSION" ]; then
+              echo "firmware-binaries holds a manifest with an empty firmwareVersion — refusing to publish ${VERSION} over it." >&2
+              exit 1
+            fi
+            if python3 -c "import sys; sys.exit(0 if [int(p) for p in '${BRANCH_VERSION}'.lstrip('Vv').split('.')] <= [int(p) for p in '${VERSION}'.lstrip('Vv').split('.')] else 1)"; then
+              echo "Branch holds ${BRANCH_VERSION}; publishing ${VERSION}."
+            else
+              echo "firmware-binaries already holds ${BRANCH_VERSION} — newer than this build (${VERSION}); leaving it untouched."
+              exit 0
+            fi
           fi
           git switch --orphan firmware-binaries
           mv dist/* .
