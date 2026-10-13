@@ -154,6 +154,17 @@ void setup() {
 
   Serial.begin(115200);
 
+  // The settings API frames host messages by idle time: serialSettings() reads
+  // each message with Serial.readString(), which returns only after this many
+  // milliseconds pass with no incoming byte (the host sends no line terminator).
+  // The Stream default of 1000 ms padded EVERY host message to a full second —
+  // ~2 s per command (SETTINGS handshake + command) and ~30 s for the app's
+  // 17-setting load. 50 ms still exceeds any real intra-message gap: the host
+  // writes each message as one USB CDC transfer, so its bytes arrive in the
+  // CDC FIFO at once. This cuts per-command latency ~20x without any protocol
+  // change on the host side.
+  Serial.setTimeout(50);
+
   initMemory();  // Initialize Memory
 
   //initUID(); // Intilize unique identifier

@@ -1,4 +1,5 @@
 Version 4.1.1 | 2025-July-24
+- Reduced serial settings API latency: host messages are now framed on a 50 ms idle timeout instead of the 1000 ms stream default, cutting per-command round trip from ~2 s to ~0.1 s (LipSync Connect settings load: ~30 s to ~2 s)
 - Added CSV version of BOM to documentation folder to make it easier to see via GitHub
 - Added copy of TLV493D-A1B6 library to repository
 - Updated Maker Guide
