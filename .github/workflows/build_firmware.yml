@@ -87,6 +87,7 @@ jobs:
           arduino-cli compile \
             --fqbn "$FQBN" \
             --build-path build \
+            --libraries Build_Files/Firmware_Files/Libraries \
             Build_Files/Firmware_Files/LipSync_Firmware
 
       - name: Generate UF2

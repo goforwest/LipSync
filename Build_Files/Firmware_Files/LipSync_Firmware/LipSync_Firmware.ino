@@ -321,7 +321,8 @@ void loop() {
   }
 
   pollTimer.run();  // Timer for normal joystick functions
-  
+
+  buzzer.update();  // Fire queued buzzer notes (non-blocking sound sequencing)
 
   settingsEnabled = serialSettings(settingsEnabled);  // Process Serial API commands
   //yield();
@@ -757,6 +758,45 @@ void clearSplashScreen() {
   if (!screen.isMenuActive()) {
     screen.deactivateMenu();
   }
+}
+
+//***SCREEN TRANSITION CONTINUATION FUNCTIONS***//
+// Free-function continuations for LSScreen::scheduleTransition() — the
+// non-blocking replacements for the delay() calls that used to freeze the
+// main loop while informational pages were shown. The screen timer calls
+// these when a page's dwell time ends.
+//
+// Function   : screen transition continuations
+//
+// Description: Each hands the follow-up action to the matching LSScreen
+//              method, which also clears the pending-transition state.
+//
+// Parameters : void
+//
+// Return     : void
+//****************************************//
+void screenExitTransitionDone() {
+  screen.finishExitMenu();
+}
+
+void screenScrollTransitionDone() {
+  screen.beginLongTextScroll();
+}
+
+void screenChangeModeTransitionDone() {
+  screen.finishChangeMode();
+}
+
+void screenReturnToMenuTransitionDone() {
+  screen.returnToMenu();
+}
+
+void screenFullCalibConfirmTransitionDone() {
+  screen.fullCalibrationConfirmMenu();
+}
+
+void screenFactoryResetConfirm2TransitionDone() {
+  screen.factoryResetConfirm2Menu();
 }
 
 //***SHOW CENTER RESET COMPLETE PAGE SCREEN FUNCTION***//

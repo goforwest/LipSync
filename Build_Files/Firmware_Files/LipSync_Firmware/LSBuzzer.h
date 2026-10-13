@@ -130,6 +130,19 @@ class LSBuzzer {
   private:
     boolean _buzzerOn = true; // Sound feedback is on by default
     int _soundModeLevel; // Levels that correspond to volume
+
+    // Non-blocking note sequencing: multi-tone sounds queue their follow-up
+    // tones and buzzer.update() (called from the main loop) fires each when
+    // its time comes. The old delay()s between tones froze the whole main
+    // loop — serial API, joystick, pressure — for the length of the sound.
+    typedef struct {
+      unsigned int frequency;      // Tone frequency in Hz
+      unsigned int duration;       // Tone duration in ms
+      unsigned long fireAtMs;      // millis() timestamp when the note fires
+    } noteStep_t;
+    noteStep_t _noteQueue[3];
+    uint8_t _noteQueueLen = 0;
+    void queueNote(unsigned long delayMs, unsigned int frequency, unsigned int duration);
 };
 
 //*********************************//
@@ -169,7 +182,35 @@ void LSBuzzer::begin(){
 // Return     : void
 //*********************************//
 void LSBuzzer::update(){
-  
+  // Fire queued notes whose time has come (called from the main loop)
+  for (uint8_t i = 0; i < _noteQueueLen; ) {
+    if ((long)(millis() - _noteQueue[i].fireAtMs) >= 0) {
+      tone(CONF_BUZZER_PIN, _noteQueue[i].frequency, _noteQueue[i].duration);
+      for (uint8_t j = i; j < _noteQueueLen - 1; j++) {
+        _noteQueue[j] = _noteQueue[j + 1];
+      }
+      _noteQueueLen--;
+    } else {
+      i++;
+    }
+  }
+}
+
+//*********************************//
+// Function   : queueNote
+//
+// Description: Queue a follow-up tone to fire delayMs from now.
+//
+// Arguments :  delayMs : unsigned long : delay from now in milliseconds
+//              frequency : unsigned int : tone frequency in Hz
+//              duration : unsigned int : tone duration in ms
+//
+// Return     : void
+//*********************************//
+void LSBuzzer::queueNote(unsigned long delayMs, unsigned int frequency, unsigned int duration) {
+  if (_noteQueueLen >= sizeof(_noteQueue) / sizeof(_noteQueue[0])) return;  // Queue full — drop the note
+  _noteQueue[_noteQueueLen] = { frequency, duration, millis() + delayMs };
+  _noteQueueLen++;
 }
 
 //*********************************//
@@ -251,8 +292,7 @@ void LSBuzzer::playStartupSound(){
 void LSBuzzer::playReadySound(){ 
   if (_buzzerOn && (_soundModeLevel != CONF_SOUND_MODE_OFF)){
     tone(CONF_BUZZER_PIN, NOTE_F5, 500);
-    delay(500);  // TODO: add timer instead of delay
-    tone(CONF_BUZZER_PIN, NOTE_C6, 250);
+    queueNote(500, NOTE_C6, 250);  // Was delay(500) between the tones — the loop now runs through the pause
   }
 }
 
@@ -267,8 +307,7 @@ void LSBuzzer::playReadySound(){
 //*********************************//
 void LSBuzzer::playErrorSound(){
     tone(CONF_BUZZER_PIN, NOTE_G4, 500);
-    delay(500);
-    tone(CONF_BUZZER_PIN, NOTE_C4, 500);       
+    queueNote(500, NOTE_C4, 500);  // Was delay(500) between the tones — the loop now runs through the pause
 }
 
 //*********************************//
@@ -281,6 +320,10 @@ void LSBuzzer::playErrorSound(){
 // Return     : void
 //*********************************//
 void LSBuzzer::playShutdownSound(){
+  // Deliberately still blocking: this plays inside softwareReset()'s
+  // pre-restart sequence, and the reset that follows would cut off any
+  // queued notes. The block is bounded (~1 s) and the device is about to
+  // reboot anyway.
   if (_buzzerOn && (_soundModeLevel != CONF_SOUND_MODE_OFF)) {
     tone(CONF_BUZZER_PIN, NOTE_C6, 500);
     delay(250);

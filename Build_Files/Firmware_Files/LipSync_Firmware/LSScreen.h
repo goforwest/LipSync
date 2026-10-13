@@ -101,6 +101,18 @@ public:
   bool isMenuActive();
   void activateMenu();
   void deactivateMenu();
+
+  // Non-blocking page transitions (see scheduleTransition): the continuations
+  // run on the screen timer when the informational page's dwell time ends,
+  // instead of delay() freezing the whole main loop for 0.2-3 s.
+  void scheduleTransition(unsigned long delayMs, void (*transitionFn)());
+  void finishExitMenu();
+  void beginLongTextScroll();
+  void returnToMenu();
+  void finishChangeMode();
+  void fullCalibrationConfirmMenu();
+  void factoryResetConfirm2Menu();
+
   void centerResetPage();
   void centerResetCompletePage();
   void fullCalibrationPrompt(int stepNum);
@@ -126,6 +138,8 @@ private:
   LSTimer<void> _screenStateTimer;  // Timer with a callback function
   int _screenStateTimerId;          // Timer ID for screen
   int _screenTimeoutTimerId;        // Timer ID to trigger next screen based on time
+  unsigned long _inputFrozenUntil = 0;  // While millis() is before this, menu input is frozen (a scheduled transition owns the menu)
+  int _transitionTimerId = -1;           // Pending scheduled page transition (LSTimer id), -1 = none
 
   bool _isActive = false;
   bool _menuTimeoutEnabled = true;
@@ -331,6 +345,8 @@ void LSScreen::update() {
 // Return     : void
 //*********************************//
 void LSScreen::activateMenu() {
+  if ((long)(millis() - _inputFrozenUntil) < 0) return;  // A scheduled page transition owns the menu right now
+
   _lastActivityMillis = millis();
   _isActive = true;
   _countMenuScroll = 0;
@@ -352,6 +368,96 @@ void LSScreen::deactivateMenu() {
   _isActive = false;
   clear();
   _display.display();
+}
+
+//*********************************//
+// Function   : scheduleTransition
+//
+// Description: Shows an informational page, then runs `transitionFn` after
+//              `delayMs` on the screen timer. Replaces the delay() calls that
+//              froze the entire main loop (serial API, joystick, pressure)
+//              for the dwell time of each page. Menu input is frozen for the
+//              same window so button presses are dropped exactly as they were
+//              under the old blocking wait — the rest of the device keeps
+//              running. Only one transition may be pending; a new one
+//              replaces it (and unfreezes input for its own window).
+//
+// Arguments :  delayMs : unsigned long : page dwell time in milliseconds
+//              transitionFn : void (*)() : free-function continuation (defined
+//                            in LipSync_Firmware.ino, like clearSplashScreen)
+//
+// Return     : void
+//*********************************//
+void LSScreen::scheduleTransition(unsigned long delayMs, void (*transitionFn)()) {
+  _inputFrozenUntil = millis() + delayMs;
+  if (_transitionTimerId >= 0) {
+    _screenStateTimer.deleteTimer(_transitionTimerId);
+  }
+  _transitionTimerId = _screenStateTimer.setTimeout(delayMs, transitionFn);
+}
+
+// Each continuation first clears the pending-transition id (the timer just
+// fired), so a later scheduleTransition cannot delete a recycled timer slot.
+
+void LSScreen::finishExitMenu() {
+  _transitionTimerId = -1;
+  deactivateMenu();
+}
+
+void LSScreen::beginLongTextScroll() {
+  _transitionTimerId = -1;
+  scrollLongText();
+}
+
+void LSScreen::returnToMenu() {
+  _transitionTimerId = -1;
+  if (_isActive) {
+    mainMenu();
+  } else {
+    deactivateMenu();
+  }
+}
+
+void LSScreen::finishChangeMode() {
+  _transitionTimerId = -1;
+
+  if (_communicationMode != _tempCommunicationMode) {
+    _communicationMode = _tempCommunicationMode;
+    setCommunicationMode(false, false, _tempCommunicationMode);  // Sets new communication mode, saves in memory
+  }
+
+  if (_operatingMode != _tempOperatingMode) {
+    _operatingMode = _tempOperatingMode;
+    setOperatingMode(false, false, _tempOperatingMode);  // Sets new operating mode, saves in memory, and conducts software reset
+  }
+
+  softwareReset();  // TODO: is there a way to avoid software reset if just changing com mode?
+
+  _currentMenu = MAIN_MENU;
+  mainMenu();
+}
+
+void LSScreen::fullCalibrationConfirmMenu() {
+  _transitionTimerId = -1;
+  _currentMenu = FULL_CALIB_CONFIRM_PAGE;
+  _currentMenuLength = _fullCalibrationConfirmLen;
+  _currentMenuText = _fullCalibrationConfirmText;
+  _cursorStart = 2;
+  _currentSelection = 0;
+  _countMenuScroll = 0;
+
+  displayMenu();  //  Print items in current menu
+}
+
+void LSScreen::factoryResetConfirm2Menu() {
+  _transitionTimerId = -1;
+  _currentMenu = FACTORY_RESET_CONFIRM2_PAGE;
+  _currentMenuLength = _factoryResetConfirm2Len;
+  _currentMenuText = _factoryResetConfirm2Text;
+  _cursorStart = 2;
+  _currentSelection = 0;
+
+  displayMenu();  //  Print items in current menu
 }
 
 //*********************************//
@@ -466,6 +572,8 @@ void LSScreen::splashScreen2() {
 // Return     : void
 //*********************************//
 void LSScreen::nextMenuItem() {
+  if ((long)(millis() - _inputFrozenUntil) < 0) return;  // A scheduled page transition owns the menu right now
+
   _lastActivityMillis = millis();
 
   if (_scrollOn) {
@@ -502,6 +610,8 @@ void LSScreen::nextMenuItem() {
 // Return     : void
 //*********************************//
 void LSScreen::selectMenuItem() {
+  if ((long)(millis() - _inputFrozenUntil) < 0) return;  // A scheduled page transition owns the menu right now
+
   _lastActivityMillis = millis();
 
   _countMenuScroll = 0;
@@ -538,9 +648,7 @@ void LSScreen::selectMenuItem() {
         setupDisplay();
         _display.println("Exiting");
         _display.display();
-        delay(500);  // TODO: remove delay
-
-        deactivateMenu();
+        scheduleTransition(500, screenExitTransitionDone);  // was delay(500) — the menu closes on the next ticks
       }
       break;
     case CALIB_MENU:
@@ -983,8 +1091,7 @@ void LSScreen::displayCursor() {
     //Serial.println("Long text");
     _scrollOn = true;
     _scrollPos = 12;
-    delay(200);  // TODO: remove delay
-    scrollLongText();
+    scheduleTransition(200, screenScrollTransitionDone);  // was delay(200); scrollLongText() — fires once, 200 ms from now
   } else {
     _scrollOn = false;
   }
@@ -1206,22 +1313,7 @@ void LSScreen::changeMode() {
   _display.println("Release");
   _display.println("joystick.");
   _display.display();
-  delay(2000);
-
-  if (_communicationMode != _tempCommunicationMode) {
-    _communicationMode = _tempCommunicationMode;
-    setCommunicationMode(false, false, _tempCommunicationMode);  // Sets new communication mode, saves in memory
-  }
-
-  if (_operatingMode != _tempOperatingMode) {
-    _operatingMode = _tempOperatingMode;
-    setOperatingMode(false, false, _tempOperatingMode);  // Sets new operating mode, saves in memory, and conducts software reset
-  }
-
-  softwareReset();  // TODO: is there a way to avoid software reset if just changing com mode?
-
-  _currentMenu = MAIN_MENU;
-  mainMenu();
+  scheduleTransition(2000, screenChangeModeTransitionDone);  // was delay(2000) — finishChangeMode runs on the timer
 }
 
 
@@ -1339,13 +1431,7 @@ void LSScreen::centerResetCompletePage(void) {
 
   _display.display();
 
-  delay(2000);
-
-  if (_isActive) {
-    mainMenu();
-  } else {
-    deactivateMenu();
-  }
+  scheduleTransition(2000, screenReturnToMenuTransitionDone);  // was delay(2000) — returnToMenu runs on the timer
 }
 
 //*********************************//
@@ -1415,12 +1501,7 @@ void LSScreen::fullCalibrationPrompt(int stepNum) {
       _display.println("calibrated");
       _display.display();
 
-      delay(1500);
-      if (_isActive) {
-        mainMenu();
-      } else {
-        deactivateMenu();
-      }
+      scheduleTransition(1500, screenReturnToMenuTransitionDone);  // was delay(1500) — returnToMenu runs on the timer
       break;
     case CONF_JOY_CALIB_ERROR:  // One or more values were too low to be replaced, flag error message
       _display.println("Movement");
@@ -1571,17 +1652,7 @@ void LSScreen::fullCalibrationConfirmPage(void) {
   _display.println("may cause");
   _display.println("drift.");
   _display.display();
-  delay(3000);  //TODO 2025-Feb-28 Assess removal of delay
-
-
-  _currentMenu = FULL_CALIB_CONFIRM_PAGE;
-  _currentMenuLength = _fullCalibrationConfirmLen;
-  _currentMenuText = _fullCalibrationConfirmText;
-  _cursorStart = 2;
-  _currentSelection = 0;
-  _countMenuScroll = 0;
-
-  displayMenu();  //  Print items in current menu
+  scheduleTransition(3000, screenFullCalibConfirmTransitionDone);  // was delay(3000) — the confirm menu registers on the timer
 }
 
 //*********************************//
@@ -1647,16 +1718,7 @@ void LSScreen::factoryResetConfirm2Page(void) {
   _display.println("custom");
   _display.println("settings");
   _display.display();
-  delay(2000); // TODO 2025-Feb-28 replace with timer.
-
-
-  _currentMenu = FACTORY_RESET_CONFIRM2_PAGE;
-  _currentMenuLength = _factoryResetConfirm2Len;
-  _currentMenuText = _factoryResetConfirm2Text;
-  _cursorStart = 2;
-  _currentSelection = 0;
-
-  displayMenu();  //  Print items in current menu
+  scheduleTransition(2000, screenFactoryResetConfirm2TransitionDone);  // was delay(2000) — the confirm menu registers on the timer
 }
 
 //*********************************//
