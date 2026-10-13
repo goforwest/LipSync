@@ -29,8 +29,8 @@
 #define CONF_LIPSYNC_MODEL 1                // 1: Lipsync w/ Hub
 
 #define CONF_LIPSYNC_VERSION_MAJOR  4
-#define CONF_LIPSYNC_VERSION_MINOR  1
-#define CONF_LIPSYNC_VERSION_REV  1
+#define CONF_LIPSYNC_VERSION_MINOR  2
+#define CONF_LIPSYNC_VERSION_REV  0
 
 const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + "." + String(CONF_LIPSYNC_VERSION_MINOR) + "." + String(CONF_LIPSYNC_VERSION_REV);
 
@@ -175,6 +175,10 @@ const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + 
 #define CONF_BUTTON_PRESS_DELAY 150         // 150 ms - Duration of single button press in gamepad mode
 
 #define CONF_WATCHDOG_TIMEOUT_SEC 30        // 30 second hardware watchdog
+
+#define CONF_WATCHDOG_BOOT_RETRY_LIMIT 3    // Consecutive watchdog-reset boots before the watchdog stops
+                                            // re-arming (device settles in safe mode instead of resetting forever)
+#define CONF_WATCHDOG_BOOT_CLEAR_MS 120000  // Uptime that restores the full watchdog-reset retry budget
 
 
 // Safe Boot Mode

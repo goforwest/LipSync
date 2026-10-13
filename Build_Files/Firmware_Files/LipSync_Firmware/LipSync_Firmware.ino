@@ -54,6 +54,7 @@ int g_errorCode = 0;  // Global variable for storing error code. 0 is no error. 
 
 uint32_t g_lastRebootReason = 0;
 bool g_watchdogReset = false;
+uint8_t g_watchdogBootCount = 0;  // Consecutive watchdog-reset boots (see LSWatchdog.h)
 bool g_safeModeEnabled = false;
 int  g_safeModeReason = 0;
 bool readyToUseFirstTime = true;
@@ -153,17 +154,6 @@ void setup() {
   beginMillis = millis();  // Intialize timer
 
   Serial.begin(115200);
-
-  // The settings API frames host messages by idle time: serialSettings() reads
-  // each message with Serial.readString(), which returns only after this many
-  // milliseconds pass with no incoming byte (the host sends no line terminator).
-  // The Stream default of 1000 ms padded EVERY host message to a full second —
-  // ~2 s per command (SETTINGS handshake + command) and ~30 s for the app's
-  // 17-setting load. 50 ms still exceeds any real intra-message gap: the host
-  // writes each message as one USB CDC transfer, so its bytes arrive in the
-  // CDC FIFO at once. This cuts per-command latency ~20x without any protocol
-  // change on the host side.
-  Serial.setTimeout(50);
 
   initMemory();  // Initialize Memory
 
@@ -288,7 +278,15 @@ void setup() {
 
   toggleSafeMode(g_safeModeEnabled);
 
-  if (CONF_ENABLE_WATCHDOG && !g_watchdogReset && !g_safeModeEnabled) { 
+  // Arm the hardware watchdog on every boot — including safe mode and
+  // watchdog-reset boots, which are exactly the boots that need it most (a
+  // safe-mode unit already has hardware trouble, and the old
+  // !g_watchdogReset && !g_safeModeEnabled guard left both with no recovery
+  // from a wedged main loop other than unplugging). Only a run of
+  // CONF_WATCHDOG_BOOT_RETRY_LIMIT consecutive watchdog resets stops
+  // re-arming, so a genuinely wedged device settles in safe mode instead of
+  // resetting forever.
+  if (CONF_ENABLE_WATCHDOG && g_watchdogBootCount < CONF_WATCHDOG_BOOT_RETRY_LIMIT) { 
     initWatchdog();  // Initialize hardware watchdog
   }
 
@@ -357,6 +355,7 @@ void initGlobals() {
   //g_firstLoop = true;
 
   g_watchdogReset = false;
+  g_watchdogBootCount = 0;
   g_safeModeEnabled = false;
   g_safeModeReason = 0;
 

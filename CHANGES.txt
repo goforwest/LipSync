@@ -1,5 +1,9 @@
+Version 4.2.0 | 2026-Oct-13
+- Cut serial settings API command latency: messages are now framed by a non-blocking line parser — newline-terminated messages are processed the instant they arrive, and legacy bare messages keep a 50 ms idle-gap frame — removing readString()'s timed busy-wait that padded every exchange with a fixed delay (1 s at the Stream default; ~2 s per command, ~30 s for LipSync Connect's settings load, now ~2 s)
+- Hardened the hardware watchdog: it is now armed on every boot, including safe mode and watchdog-reset boots; a run of 3 consecutive watchdog resets (tracked in the GPREGRET2 retention register) stops re-arming so a wedged device settles in safe mode instead of resetting forever, and the budget restores after 2 minutes of uptime
+- Sip and puff robustness: the once-a-minute pressure offset re-measure (and the boot-time one) now gathers its five samples one per polling tick instead of blocking the main loop for up to 15 s when a sensor misbehaves; sensors that return consecutive invalid readings are marked unhealthy — the I2C bus is left alone until a 2 s re-probe succeeds — so a flaky mouthpiece sensor can no longer stall the device, and stale readings can never fire a phantom sip or puff
+
 Version 4.1.1 | 2025-July-24
-- Reduced serial settings API latency: host messages are now framed on a 50 ms idle timeout instead of the 1000 ms stream default, cutting per-command round trip from ~2 s to ~0.1 s (LipSync Connect settings load: ~30 s to ~2 s)
 - Added CSV version of BOM to documentation folder to make it easier to see via GitHub
 - Added copy of TLV493D-A1B6 library to repository
 - Updated Maker Guide

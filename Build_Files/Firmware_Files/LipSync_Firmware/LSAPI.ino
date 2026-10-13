@@ -122,45 +122,90 @@ _functionList apiFunction[] = { //Let compiler determine number of functions
 };
 
 //***SERIAL SETTINGS FUNCTION TO CHANGE SPEED AND COMMUNICATION MODE USING SOFTWARE***//
+
+// Non-blocking input framing for the settings API. A host may terminate a
+// message with a newline — it is framed and processed the instant it
+// arrives, with no added latency — or, like the current LipSync Connect,
+// send it bare and rely on an idle gap to delimit messages
+// (SERIAL_FRAMING_GAP_MS, kept for wire compatibility with the tuned v4.x
+// host). serialSettings() never blocks: it drains whatever bytes have
+// arrived and returns, so the 20 ms joystick / 50 ms pressure ticks stay
+// alive even mid-message. readString()'s timed busy-wait — whose timeout was
+// the message delimiter, padding every exchange with a fixed delay (1 s per
+// message at the Stream default) and freezing the loop while it spun — is
+// gone entirely.
+const unsigned long SERIAL_FRAMING_GAP_MS = 50;   // Idle that ends a legacy (bare) message
+const size_t SERIAL_RX_MAX_LEN = 32;              // Longest legal command is 11 bytes; past this it is a flood
+String serialRxBuf = "";
+unsigned long serialRxBufLastByteMs = 0;
+
+// Process one delimited message. Returns the settings-mode flag for the
+// caller to carry across loop iterations.
+bool processSerialMessage(String commandString, bool settingsFlag) {
+  commandString.trim();  // Tolerate CR/LF line endings and stray whitespace
+
+  if (settingsFlag == false && commandString == "SETTINGS") {
+    // SETTINGS received
+    printResponseInt(true, true, true, 0, commandString, false, 0);
+    return true;  // Enter settings mode
+  } else if (settingsFlag == true && commandString == "EXIT") {
+    // EXIT received
+    printResponseInt(true, true, true, 0, commandString, false, 0);
+    return false;  // Leave settings mode
+  } else if (settingsFlag == true && isValidCommandFormat(commandString)) {
+    performCommand(commandString);  // Valid command — run it and leave settings mode
+    return false;
+  }
+
+  // Unrecognized input in either mode
+  printResponseInt(true, true, false, 0, commandString, false, 0);
+  return false;
+}
+
 // Function   : serialSettings
 //
-// Description: This function confirms if serial settings should be enabled.
-//              It returns true if it's in the settings mode and is waiting for a command.
-//              It returns false if it's not in the settings mode or it needs to exit the settings mode.
+// Description: Drains pending serial bytes, framing messages on newline or
+//              idle gap, and processes each through processSerialMessage().
+//              Called every loop() pass; must never block.
 //
-// Parameters :  enabled : bool : The input flag
+// Parameters :  enabled : bool : The current settings-mode flag
 //
-// Return     : bool
-//*************************************************************************************//
+// Return     : bool : The settings-mode flag to carry to the next pass
+//*********************************************************************//
 bool serialSettings(bool enabled) {
 
-  String commandString = "";
   bool settingsFlag = enabled;
 
-  // Set the input parameter to the flag returned. This will help to detect that the settings actions should be performed.
-  if (Serial.available() > 0)
-  {
-    // Check if serial has received or read input string and word "SETTINGS" is in input string.
-    commandString = Serial.readString();
-    if (settingsFlag == false && commandString == "SETTINGS") {
-      // SETTING received
-      // Set the return flag to true so settings actions can be performed in the next call to the function
-      printResponseInt(true, true, true, 0, commandString, false, 0);
-      settingsFlag = true;
-    } else if (settingsFlag == true && commandString == "EXIT") {
-      // EXIT Received
-      // Set the return flag to false so settings actions can be exited
-      printResponseInt(true, true, true, 0, commandString, false, 0);
-      settingsFlag = false;
-    } else if (settingsFlag == true && isValidCommandFormat(commandString)) { // Check if command's format is correct and it's in settings mode
-      performCommand(commandString);                  // Sub function to process valid strings
-      settingsFlag = false;
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    serialRxBufLastByteMs = millis();
+
+    if (c == '\n' || c == '\r') {
+      if (serialRxBuf.length() == 0) continue;  // Blank line (e.g. the \n of a \r\n pair)
+      String message = serialRxBuf;
+      serialRxBuf = "";
+      settingsFlag = processSerialMessage(message, settingsFlag);
+      Serial.flush();
     } else {
-      printResponseInt(true, true, false, 0, commandString, false, 0);
-      settingsFlag = false;
+      serialRxBuf += c;
+      if (serialRxBuf.length() > SERIAL_RX_MAX_LEN) {
+        // A flood with no terminator: discard and answer once (echo truncated)
+        String overflow = serialRxBuf.substring(0, SERIAL_RX_MAX_LEN);
+        serialRxBuf = "";
+        printResponseInt(true, true, false, 0, overflow, false, 0);
+        settingsFlag = false;
+      }
     }
+  }
+
+  // Legacy framing: a bare message ends when the line falls idle
+  if (serialRxBuf.length() > 0 && millis() - serialRxBufLastByteMs >= SERIAL_FRAMING_GAP_MS) {
+    String message = serialRxBuf;
+    serialRxBuf = "";
+    settingsFlag = processSerialMessage(message, settingsFlag);
     Serial.flush();
   }
+
   return settingsFlag;
 }
 

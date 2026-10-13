@@ -50,7 +50,12 @@
 #define PRESS_SAP_SEC_STATE_RELEASED 2  // Released : Sip or puff was just released (On->Off)
 
 #define PRESS_SAP_ACTION_TIMEOUT 60000  // Reset timer
-#define PRESS_SAP_SENSOR_TIMEOUT 3000 // Timeout for sensor reading
+
+#define PRESS_BAD_READ_LIMIT 3         // Consecutive invalid readings before the sensors are marked unhealthy
+#define PRESS_REPROBE_INTERVAL_MS 2000  // Spacing between sensor re-probes while unhealthy (keeps a dead
+                                        // or flaky sensor from stalling the main loop on every poll)
+#define PRESS_PROBE_GOOD_LIMIT 2        // Consecutive valid re-probes before the sensors are marked healthy again
+#define PRESS_OFFSET_ATTEMPT_LIMIT 10   // updatePressure() ticks spent gathering offset samples before giving up
 
 // Pressure structure 
 typedef struct {
@@ -76,8 +81,8 @@ class LSPressure {
     float getRefTolerance();                            // Get reference pressure change tolerance value that is used to update the reference pressure
     float getOffsetPressure();                          // Get Offset pressure: (sapPressureAbs- ambientPressure)
     void setOffsetPressure(float offsetPressure);       // Set Offset pressure: 
-    void updateOffsetPressure();                        // Zero the base reference pressure and update Offset pressure value 
-    float measureOffsetPressure();                      // Measure the offset pressure between pressure sensors: offsetPressure = (sapPressureAbs- ambientPressure)
+    void startOffsetUpdate();                           // Begin a stepped offset measurement: five valid (sap - ambient)
+                                                        // samples gathered one per update() tick, then averaged
     void setSipThreshold(float s);                      // Set sip threshold
     void setPuffThreshold(float p);                     // Set puff threshold
     void updatePressure();                              // Update the pressure buffer with new readings 
@@ -109,6 +114,15 @@ class LSPressure {
       float _sipThreshold;                                 // Sip Threshold 
       float _puffThreshold;                                // Puff Threshold 
       int _sapMainState;                                   // The value which represents the current main state (example: PRESS_SAP_MAIN_STATE_PUFF) 
+      bool _sensorsHealthy;                               // Both sensors return valid readings
+      unsigned long _lastProbeMs;                         // Timestamp of the last unhealthy-mode re-probe
+      uint8_t _badReadCount;                              // Consecutive invalid readings while healthy
+      uint8_t _goodProbeCount;                            // Consecutive valid re-probes while unhealthy
+      bool _offsetUpdateRunning;                          // Offset measurement in progress (stepped by updatePressure())
+      uint8_t _offsetAttempts;                            // Ticks spent gathering offset samples
+      uint8_t _offsetValidCount;                          // Valid offset samples gathered
+      float _offsetSampleSum;                             // Running sum of valid (sap - ambient) samples
+      void markSensorsUnhealthy();                        // Disable sip and puff and stop reading I2C until a re-probe succeeds
 };
 
 
@@ -125,6 +139,14 @@ LSPressure::LSPressure()
 {
   _pressureBuffer.begin(PRESS_BUFF_SIZE);        // Initialize Pressure Buffer
   _sapBuffer.begin(PRESS_SAP_BUFF_SIZE);         // Initialize Sip and Puff Action Buffer 
+  _sensorsHealthy = true;
+  _lastProbeMs = 0;
+  _badReadCount = 0;
+  _goodProbeCount = 0;
+  _offsetUpdateRunning = false;
+  _offsetAttempts = 0;
+  _offsetValidCount = 0;
+  _offsetSampleSum = 0.00;
 }
 
 //*********************************//
@@ -177,7 +199,11 @@ void LSPressure::begin()
   clear();      // Clear buffers and make sure no sip and puff action is set as previous actions
 
   delay(20);
-  updateOffsetPressure();    // Update the offset pressure between pressure sensors
+  _sensorsHealthy = (g_mouthpiecePressureSensorConnected && g_ambientPressureSensorConnected);
+  startOffsetUpdate();  // Gather offset samples one per update() tick. The old boot-time offset
+                        // read was a blocking 5-reading loop that could freeze startup for up to
+                        // 15 s when a sensor misbehaved; until it completes, the offset is 0 and
+                        // sip and puff stay inert.
 }
 
 //*********************************//
@@ -276,65 +302,50 @@ float LSPressure::getRefTolerance()
 }
 
 //*********************************//
-// Function   : measureOffsetPressure 
+// Function   : startOffsetUpdate 
 // 
-// Description: Measure the offset pressure (hPa) between the mouthpiece sensor and ambient sensor
+// Description: Begin a stepped offset-pressure measurement. Five valid
+//              (sap - ambient) samples are gathered one per update() tick by
+//              updatePressure() and then averaged. This replaces the old
+//              blocking 5-reading loop, which spun up to 3 s per reading on
+//              a misbehaving sensor (15 s of frozen main loop per
+//              re-measure, at boot and once a minute while idle).
 //              
 // Arguments :  void
 // 
-// Return     : tempOffsetPressure : float : The offset pressure value in hPa
+// Return :    void
 //*********************************//
-float LSPressure::measureOffsetPressure()  
+void LSPressure::startOffsetUpdate()
 {
-  // Initialize variables used to calculate offset value  
-  float tempSapPressureAbs = 0.00;
-  float tempAmbientPressure = 0.00;
-  float tempOffsetPressure = 0.00;
+  if (_offsetUpdateRunning) return;  // Already gathering samples
 
-  unsigned long pressureReadingStartTime = millis();
-  unsigned long pressureReadingTime = 0;
+  _offsetUpdateRunning = true;
+  _offsetAttempts = 0;
+  _offsetValidCount = 0;
+  _offsetSampleSum = 0.00;
+}
 
-  // If pressure mode is differential  
-  if(_pressureMode == PRESS_MODE_DIFF) {
-    
-    do  // Keep reading until we have a valid main and reference pressure values > 0.0 
-    {     
-      tempSapPressureAbs = _lps35hw.readPressure();  //TODO replace with generic get function
-      _lps22.getEvent(&_lps22Pressure, &_lps22Temperature);
-      tempAmbientPressure = _lps22Pressure.pressure;
-      pressureReadingTime = millis();
-      if (pressureReadingTime - pressureReadingStartTime > PRESS_SAP_SENSOR_TIMEOUT){
-        Serial.println("ERROR: Mouthpiece pressure sensor timeout");
-        // TODO 2025-Feb-24 Throw error
-        break;
-      }
-    } while (tempSapPressureAbs <= 0.00 || tempAmbientPressure <= 0.00 );
-    
-    tempOffsetPressure = tempSapPressureAbs - tempAmbientPressure;    // Calculate offset value which is the difference between main and reference pressure sensors
-  } else if(_pressureMode == PRESS_MODE_ABS){// If pressure mode is absolute //TODO 2025-Mar-28 Remove ambient pressure
-    
-    // Keep reading until we have a valid main pressure > 0.00
-    pressureReadingStartTime = millis();
-    do 
-    {
-      tempSapPressureAbs = _lps35hw.readPressure();
-      pressureReadingTime = millis();
-      if (pressureReadingTime - pressureReadingStartTime > PRESS_SAP_SENSOR_TIMEOUT){
-        Serial.println("ERROR: Ambient pressure sensor timeout");
-        // TODO 2025-Feb-24 Throw error
-        break;
-      }
-    } while (tempSapPressureAbs <= 0.00);
-
-    tempOffsetPressure = 0.00;  // Set offset value to zero
-    _ambientPressure = tempSapPressureAbs;  // Set the reference value which is the main pressure reading when no sip or puff is performed 
-  }
-  else
-  {
-    
-  }
-
-  return tempOffsetPressure;                         // Return offset value
+//*********************************//
+// Function   : markSensorsUnhealthy 
+// 
+// Description: Stop trusting the pressure sensors: disable sip and puff so
+//              stale buffer values can never fire an action, and leave the
+//              I2C bus alone except for a slow re-probe (a flaky sensor can
+//              no longer stall the poll loop; a wedged bus hangs at most one
+//              transaction, which the watchdog recovers).
+//              
+// Arguments :  void
+// 
+// Return :    void
+//*********************************//
+void LSPressure::markSensorsUnhealthy()
+{
+  _sensorsHealthy = false;
+  _badReadCount = 0;
+  _goodProbeCount = 0;
+  _lastProbeMs = millis();
+  _sapMainState = PRESS_SAP_MAIN_STATE_NONE;  // Stale data must never trigger sip or puff
+  Serial.println(F("ERROR: Pressure sensors not responding — sip and puff disabled until they recover"));
 }
 
 //*********************************//
@@ -364,38 +375,6 @@ void LSPressure::setOffsetPressure(float offsetPressure)
 {
   _offsetPressure = offsetPressure;
 }
-
-//*********************************//
-// Function   : updateOffsetPressure 
-// 
-// Description: Measure and set the offset pressure value (hPa) 
-//
-// Arguments :  void
-// 
-// Return     : void
-//*********************************//
-void LSPressure::updateOffsetPressure()
-{
-  float tempOffsetPressure = 0.00;
-
-  // Measure multiple readings
-  for (int i = 0 ; i < PRESS_BUFF_SIZE ; i++)
-  {        
-    tempOffsetPressure += measureOffsetPressure();  
-  }
-
-  // Set the offsetPressure equal to average offset values in pressure buffer
-  tempOffsetPressure = (tempOffsetPressure / PRESS_BUFF_SIZE);    
-
-  if (USB_DEBUG) {
-    Serial.print("updateOffsetPressure(): Offset Pressure: ");
-    Serial.print(tempOffsetPressure);
-    Serial.println(" hPa");
-  }
-
-  setOffsetPressure(tempOffsetPressure);
-}
-
 
 //*********************************//
 // Function   : setSipThreshold 
@@ -450,33 +429,75 @@ void LSPressure::update()
 //*********************************//
 void LSPressure::updatePressure()
 {
-  
+  unsigned long nowMs = millis();
+
+  // Unhealthy: leave the I2C bus alone except for a slow re-probe. A dead or
+  // flaky sensor can no longer stall this loop; recovery is automatic once
+  // the sensor answers again.
+  if (!_sensorsHealthy) {
+    if (nowMs - _lastProbeMs < PRESS_REPROBE_INTERVAL_MS) return;
+    _lastProbeMs = nowMs;
+    float probeAbs = _lps35hw.readPressure();
+    _lps22.getEvent(&_lps22Pressure, &_lps22Temperature);
+    if (probeAbs > 0.00 && _lps22Pressure.pressure > 0.00) {
+      if (++_goodProbeCount >= PRESS_PROBE_GOOD_LIMIT) {
+        _sensorsHealthy = true;
+        _goodProbeCount = 0;
+        _badReadCount = 0;
+        startOffsetUpdate();  // Offsets drift while the sensors were down — re-measure
+      }
+    } else {
+      _goodProbeCount = 0;
+    }
+    return;
+  }
+
   _sapPressureAbs = _lps35hw.readPressure();        // Update mouthpiece pressure value 
 
   // If pressure mode is differential  
+  float tempAmbientPressure = 0.00;
   if(_pressureMode == PRESS_MODE_DIFF) {
     _lps22.getEvent(&_lps22Pressure, &_lps22Temperature); 
-    float tempAmbientPressure = _lps22Pressure.pressure;  // Set a temporary reference value to new reference pressure reading 
+    tempAmbientPressure = _lps22Pressure.pressure;  // Set a temporary reference value to new reference pressure reading 
     
-    // Update offset pressure value if reference pressure is changed using tolerance value 
-    /*  // TODO 2025-Feb-22 If not used, delete
-    if(abs(ambientPressure - tempAmbientPressure) >= refTolVal && tempAmbientPressure > 0.00){ 
-        //offsetPressure += ambientPressure - tempAmbientPressure;                // Add the reference pressure change to the offset value 
-        //ambientPressure = tempAmbientPressure; 
-      }  
-      */  
     if(tempAmbientPressure > 0.00) { // If ambient pressure is valid, update the ambient pressure value 
       _ambientPressure = tempAmbientPressure; 
     } 
   }
 
-    // Make sure pressure readings are valid 
-  if(_sapPressureAbs > 0.00 && _ambientPressure > 0.00) {
+  // Make sure pressure readings are valid 
+  bool validReading = (_sapPressureAbs > 0.00 && (_pressureMode != PRESS_MODE_DIFF || tempAmbientPressure > 0.00));
+
+  // Stepped offset measurement: this tick's reading IS the sample, so the old
+  // 5-read blocking re-measure (up to 15 s of frozen main loop on a bad
+  // sensor) costs one I2C transaction per tick instead.
+  if (_offsetUpdateRunning) {
+    _offsetAttempts++;
+    if (validReading) {
+      if (_pressureMode == PRESS_MODE_DIFF) {
+        _offsetSampleSum += _sapPressureAbs - _ambientPressure;
+      } else {  // Absolute mode: offset is zero and the reading is its own reference
+        _ambientPressure = _sapPressureAbs;
+      }
+      _offsetValidCount++;
+    }
+    if (_offsetValidCount >= PRESS_BUFF_SIZE || _offsetAttempts >= PRESS_OFFSET_ATTEMPT_LIMIT) {
+      _offsetUpdateRunning = false;
+      if (_offsetValidCount > 0) {
+        setOffsetPressure(_offsetSampleSum / _offsetValidCount);
+      } else {
+        markSensorsUnhealthy();  // Nothing valid came back — stop hammering the bus
+      }
+    }
+  }
+
+  if (validReading) {
+    _badReadCount = 0;
     _sapPressure = _sapPressureAbs - _ambientPressure - _offsetPressure;              // Calculate the pressure difference 
     _pressureBuffer.pushElement({_sapPressureAbs, _ambientPressure, _sapPressure});   // Push new pressure values to pressure buffer 
-
+  } else if (++_badReadCount >= PRESS_BAD_READ_LIMIT) {
+    markSensorsUnhealthy();  // A few consecutive bad readings — stop reading I2C and re-probe slowly
   }
- 
 }
 
 //*********************************//
@@ -496,7 +517,9 @@ void LSPressure::updateState()  //  TODO 2025-Feb-22 This code should be abstrac
   float pressureValue = getSapPressure();    // Get latest pressure value
 
   // check for sip and puff conditions
-  if (pressureValue > _puffThreshold) {
+  if (!_sensorsHealthy) {
+    _sapMainState = PRESS_SAP_MAIN_STATE_NONE; // Never act on readings from unhealthy sensors
+  } else if (pressureValue > _puffThreshold) {
     _sapMainState = PRESS_SAP_MAIN_STATE_PUFF; // Puff detected
   }
   else if (pressureValue < -1 * _sipThreshold) {
@@ -547,7 +570,7 @@ void LSPressure::updateState()  //  TODO 2025-Feb-22 This code should be abstrac
   // No action in 1 minute : reset timer
   //if(_sapPrevState.secondaryState==PRESS_SAP_SEC_STATE_WAITING && _sapStateTimer.elapsedTime(_sapStateTimerId)>PRESS_SAP_ACTION_TIMEOUT){  //TODO 2025-Feb-22 Remove?
   if(_sapStateTimer.elapsedTime(_sapStateTimerId) > PRESS_SAP_ACTION_TIMEOUT) {
-      updateOffsetPressure();   // Update pressure offset value   
+      if (_sensorsHealthy) startOffsetUpdate();  // Stepped re-measure (was the blocking updateOffsetPressure()); skipped while unhealthy
       _sapStateTimer.restartTimer(_sapStateTimerId);    // Reset and start the timer      
   }
 }

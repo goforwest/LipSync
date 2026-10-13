@@ -25,6 +25,7 @@
 
 const uint32_t WATCHDOG_RESET_MASK = 0x2; //POWER_RESETREAS_DOG_Msk; //  0x2;
 extern bool g_watchdogReset;
+extern uint8_t g_watchdogBootCount;  // Consecutive watchdog-reset boots this power cycle (tracked in GPREGRET2)
 extern uint32_t g_lastRebootReason;
 
 //*********************************//
@@ -60,6 +61,22 @@ void checkResetReason() {
     if(USB_DEBUG) { Serial.println("Other reset"); }
   }
 
+  // Consecutive-watchdog-boot counter. Kept in GPREGRET2, which survives soft
+  // resets (a watchdog reset) and clears at power-on; the core itself uses
+  // GPREGRET for its DFU magic values, so the two must not collide. The count
+  // bounds watchdog crash loops: after CONF_WATCHDOG_BOOT_RETRY_LIMIT straight
+  // watchdog boots, setup() stops re-arming the watchdog and the device rests
+  // in safe mode. watchdogLoop clears the count once a boot has stayed up for
+  // CONF_WATCHDOG_BOOT_CLEAR_MS, so isolated hangs months apart never exhaust
+  // the retry budget. Any non-watchdog reset (power cycle, reset pin, soft
+  // reset) also clears it.
+  if (g_watchdogReset) {
+    g_watchdogBootCount = (uint8_t)(NRF_POWER->GPREGRET2 & 0xFF) + 1;
+    NRF_POWER->GPREGRET2 = g_watchdogBootCount;
+  } else {
+    g_watchdogBootCount = 0;
+    NRF_POWER->GPREGRET2 = 0;
+  }
 }
 
 //***INITIALIZE WATCHDOG FUNCTION***//
@@ -91,9 +108,17 @@ void initWatchdog() {
 // Return     : void
 //****************************************//
 void watchdogLoop(void) {
-  //if (USB_DEBUG) { Serial.println("USBDEBUG: watchDogLoop()"); }
+  //if (USB_DEBUG) { Serial.println("USBDEBUG: watchDogLoop"); }
 
   NRF_WDT->RR[0] = WDT_RR_RR_Reload;  // Feed (reset) the watchdog timer
+
+  // A boot that stays up this long proves any hang was transient — restore
+  // the full watchdog-reset retry budget for the next one.
+  static bool watchdogBootCountCleared = false;
+  if (!watchdogBootCountCleared && millis() > CONF_WATCHDOG_BOOT_CLEAR_MS) {
+    NRF_POWER->GPREGRET2 = 0;
+    watchdogBootCountCleared = true;
+  }
 }
 
 
