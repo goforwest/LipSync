@@ -74,6 +74,8 @@ _functionList getDebugModeFunction =              {"DM", "0", "0", &getDebugMode
 _functionList setDebugModeFunction =              {"DM", "1", "",  &setDebugMode};
 _functionList getJoystickValueFunction =          {"JV", "0", "0", &getJoystickValue};
 
+_functionList exportSettingsFunction =             {"EX", "0", "0", &exportSettings};
+
 _functionList runTestFunction =                   {"RT", "1", "",  &runTest};
 _functionList softResetFunction =                 {"SR", "1", "1", &softReset};
 _functionList resetSettingsFunction =               {"RS", "1", "1", &resetSettings};
@@ -119,6 +121,7 @@ _functionList apiFunction[] = { //Let compiler determine number of functions
   controlHubMenuFunction,
   getDebugModeFunction,
   setDebugModeFunction,
+  exportSettingsFunction,
   runTestFunction,
   softResetFunction,
   resetSettingsFunction,
@@ -2293,6 +2296,77 @@ void setDebugMode(bool responseEnabled, bool apiEnabled, int inputDebugMode) {
 // Return     : void
 void setDebugMode(bool responseEnabled, bool apiEnabled, String optionalParameter) {
   setDebugMode(responseEnabled, apiEnabled, optionalParameter.toInt());
+}
+
+//***EXPORT SETTINGS FUNCTION***//
+// Function   : exportSettings
+//
+// Description: One-command settings dump for non-app contexts (roadmap item
+//              13's serial half, upstream #67): a maker or support tech with
+//              a serial monitor sends SETTINGS + EX,0:0 and receives every
+//              stored setting as the exact response lines the individual
+//              endpoint reads produce — the same grammar the team already
+//              reads, so the output pastes straight into a support ticket
+//              with no new format to learn.
+//
+//              The dump is framed by SUCCESS,0:EX,0:BEGIN and
+//              SUCCESS,0:EX,0:END so a paste has clean edges. The device
+//              identifier (ID) is deliberately excluded — the same privacy
+//              line LipSync Connect's settings and log exports draw; a
+//              support request that genuinely needs the identifier can ask
+//              for ID,0:0 explicitly.
+//
+//              Every replayed getter is a pure read of stored settings (the
+//              identical calls the app's connect-time load makes), so this
+//              is safe to run at any time — no input, screen or output state
+//              changes.
+//
+// Parameters :  responseEnabled : bool : The response for serial printing is enabled if it's set to true.
+//                                        The serial printing is ignored if it's set to false.
+//               apiEnabled : bool : The api response is sent if it's set to true.
+//                                   Manual response is sent if it's set to false.
+//
+// Return     : void
+//*********************************//
+void exportSettings(bool responseEnabled, bool apiEnabled) {
+  printResponseString(responseEnabled, apiEnabled, true, 0, "EX,0", true, "BEGIN");
+
+  getModelNumber(responseEnabled, apiEnabled);
+  getVersionNumber(responseEnabled, apiEnabled);
+  getOperatingMode(responseEnabled, apiEnabled);
+  getCommunicationMode(responseEnabled, apiEnabled);
+  getCursorSpeed(responseEnabled, apiEnabled);
+  getScrollLevel(responseEnabled, apiEnabled);
+  getSipPressureThreshold(responseEnabled, apiEnabled);
+  getPuffPressureThreshold(responseEnabled, apiEnabled);
+  getJoystickAcceleration(responseEnabled, apiEnabled);
+  getJoystickInnerDeadzone(responseEnabled, apiEnabled);
+  getJoystickOuterDeadzone(responseEnabled, apiEnabled);
+  getJoystickInitialization(responseEnabled, apiEnabled);
+  getJoystickCalibration(responseEnabled, apiEnabled);
+  getSoundMode(responseEnabled, apiEnabled);
+  getLightMode(responseEnabled, apiEnabled);
+  getLightBrightnessLevel(responseEnabled, apiEnabled);
+  getDebugMode(responseEnabled, apiEnabled);
+
+  printResponseString(responseEnabled, apiEnabled, true, 0, "EX,0", true, "END");
+}
+//***EXPORT SETTINGS API FUNCTION***//
+// Function   : exportSettings
+//
+// Description: This function is redefinition of main exportSettings function to match the types of API function arguments.
+//
+// Parameters :  responseEnabled : bool : The response for serial printing is enabled if it's set to true.
+//                                        The serial printing is ignored if it's set to false.
+//               apiEnabled : bool : The api response is sent if it's set to true.
+//                                   Manual response is sent if it's set to false.
+//               optionalParameter : String : The input parameter string should contain one element with value of zero.
+//
+// Return     : void
+void exportSettings(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 0) {
+    exportSettings(responseEnabled, apiEnabled);
+  }
 }
 
 //***RUN TEST FUNCTION***//

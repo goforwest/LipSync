@@ -125,6 +125,8 @@ void controlHubMenu(bool responseEnabled, bool apiEnabled, String optionalParame
 int getDebugMode(bool responseEnabled, bool apiEnabled);
 void setDebugMode(bool responseEnabled, bool apiEnabled, int inputDebugMode);
 void setDebugMode(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void exportSettings(bool responseEnabled, bool apiEnabled);
+void exportSettings(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void runTest(bool responseEnabled, bool apiEnabled, int inputTest);
 void runTest(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void softReset(bool responseEnabled, bool apiEnabled);
