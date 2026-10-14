@@ -54,7 +54,7 @@ class LSUSBMouse {
     inline LSUSBMouse(void);
     inline void begin(void);
     inline void end(void);
-	  inline void wakeup(void);
+    inline void wakeup(void);
     inline void move(signed char x, signed char y);
     inline void moveAll(signed char x, signed char y, signed char wheel = 0,signed char pan = 0); 
     inline void scroll(signed char wheel = 0);
@@ -63,13 +63,14 @@ class LSUSBMouse {
     inline void press(uint8_t b = MOUSE_LEFT);     // press LEFT by default
     inline void release(uint8_t b = MOUSE_LEFT);   // release LEFT by default
     inline bool isPressed(uint8_t b = MOUSE_LEFT); // check LEFT by default
-	  inline bool isReady(void);
+    inline bool isReady(void);
     inline bool isConnected(void);
     bool usbRetrying = false;
     bool showTestPage = false;
     bool timedOut = false;
   protected:
     uint8_t _buttons;
+    bool _begun = false;   // HID interface registered on the USB configuration — must happen exactly once (see begin())
     void buttons(uint8_t b);
     Adafruit_USBD_HID usb_hid;
 };
@@ -142,7 +143,7 @@ class LSUSBGamepad {
     inline LSUSBGamepad(void);
     inline void begin(void);
     inline void end(void);
-	  inline void wakeup(void);
+    inline void wakeup(void);
     inline void send(void);
     inline bool GamepadReport(void* data, size_t length) {
         return this->usb_hid.sendReport(0, data, (uint8_t)length);
@@ -162,6 +163,7 @@ class LSUSBGamepad {
   protected:
     HID_GamepadReport_Data_t _report;
     uint32_t startMillis;
+    bool _begun = false;   // HID interface registered on the USB configuration — must happen exactly once (see begin())
     Adafruit_USBD_HID usb_hid;
 };
 
@@ -180,10 +182,20 @@ LSUSBMouse::LSUSBMouse(void)
 void LSUSBMouse::begin(void)
 {
   _buttons = 0;
-  this->usb_hid.setPollInterval(1);
-  this->usb_hid.setReportDescriptor(mouse_desc_hid_report, sizeof(mouse_desc_hid_report));
-  //this->usb_hid.setStringDescriptor(MOUSE_DESCRIPTOR); // TODO this causes TinyUSB to crash 2025-Jan-20
-  this->usb_hid.begin();
+  // Register the HID interface on the USB configuration exactly once.
+  // Adafruit_USBD_HID::begin() calls TinyUSBDevice.addInterface() with no
+  // already-begun guard (unlike the CDC class), so re-calling it from the
+  // connect-retry path appended a duplicate HID interface to the descriptor
+  // — and the next enumeration then presented a corrupted configuration to
+  // the host, which can leave the composite device half-configured (serial
+  // alive, HID never ready). Every retry must be a mount check only.
+  if (!_begun) {
+    this->usb_hid.setPollInterval(1);
+    this->usb_hid.setReportDescriptor(mouse_desc_hid_report, sizeof(mouse_desc_hid_report));
+    //this->usb_hid.setStringDescriptor(MOUSE_DESCRIPTOR); // TODO this causes TinyUSB to crash 2025-Jan-20
+    this->usb_hid.begin();
+    _begun = true;
+  }
   if (USB_DEBUG) { Serial.println("USBDEBUG: Initializing USB HID Mouse");  }
 
   unsigned long timerHidTimeoutBegin = millis();
@@ -233,23 +245,33 @@ void LSUSBMouse::wakeup(void)
 
 void LSUSBMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t pan) 
 {
+	// Never block on HID readiness. The old while(!isReady()) delay(1) spin
+  // sat on the joystick-poll path and the connect-retry path, so any window
+  // where the HID interface was not ready while the serial session was
+  // alive — exactly the post-flash / post-bootloader re-enumeration state,
+  // or a host that half-configured the composite device after a retry
+  // re-added the HID interface — froze the whole firmware for up to
+  // CONF_USB_HID_TIMEOUT (5 s) with the recursion re-arming the retry timer
+  // from inside the spin. A live serial session died right there: the first
+  // one or two host exchanges overlapping the freeze timed out waiting for
+  // a response (the observed post-flash SS/SL restore drops, firmware-update
+  // improvements item 2). Skipping the report costs one lost cursor update
+  // while the connect machinery recovers the interface.
 	wakeup();
-  unsigned long timerTimeoutBegin = millis();
-    
-    while(!isReady() && !usbRetrying && !timedOut) {
-      delay(1);
-      if ((millis() - timerTimeoutBegin) > CONF_USB_HID_TIMEOUT){
-        timedOut = true;
-        showTestPage=true;
-        usbCheckConnection();
-        break;
-      }
+  if (!isReady()) {
+    if (!timedOut) {
+      // Episode start: latch the timeout state (consumed by errorCheck and
+      // usbCheckConnection) and hand recovery to the connect machinery once —
+      // the latch keeps the handoff (and any nested report from begin()) from
+      // recursing.
+      timedOut = true;
+      showTestPage = true;
+      usbCheckConnection();
     }
-    if (isReady()){
-      usb_hid.mouseReport(RID_MOUSE,b,x,y,wheel,pan);
-      timedOut = false;
-    }
-    
+    return;
+  }
+  usb_hid.mouseReport(RID_MOUSE,b,x,y,wheel,pan);
+  timedOut = false;
 }
 
 void LSUSBMouse::move(int8_t x, int8_t y) 
@@ -451,7 +473,12 @@ LSUSBGamepad::LSUSBGamepad(void)
 
 void LSUSBGamepad::begin(void)
 {
-  this->usb_hid.begin();
+  // Register the HID interface exactly once — see LSUSBMouse::begin(): a
+  // retry must never re-add the interface to the USB configuration.
+  if (!_begun) {
+    this->usb_hid.begin();
+    _begun = true;
+  }
 
   unsigned long timerHidTimeoutBegin = millis();
   unsigned long usbTimeoutMillis;
@@ -487,13 +514,14 @@ void LSUSBGamepad::send(void)
 {
   if (startMillis != millis()) {
   wakeup();
-  unsigned long timerTimeoutBegin = millis();
 
-  while(!isReady() && !usbRetrying) {
-    delay(1);
-    if ((millis() - timerTimeoutBegin) > CONF_USB_HID_TIMEOUT){
-      break;
-    }
+  // Never block on HID readiness (see LSUSBMouse::mouseReport()): the old
+  // 5-second spin refired on every send while the interface was down,
+  // freezing the whole firmware against its serial session. Flag the
+  // retry path instead and skip this report.
+  if (!isReady()) {
+    usbRetrying = true;
+    return;
   }
   GamepadReport(&_report, sizeof(_report));
     startMillis = millis();
@@ -518,13 +546,11 @@ void LSUSBGamepad::wakeup(void)
 void LSUSBGamepad::write(void)
 {
   wakeup();
-  unsigned long timerTimeoutBegin = millis();
 
-  while(!isReady() && !usbRetrying) {
-    delay(1);
-    if ((millis() - timerTimeoutBegin) > CONF_USB_HID_TIMEOUT){
-      break;
-    }
+  // Never block on HID readiness — see send().
+  if (!isReady()) {
+    usbRetrying = true;
+    return;
   }
   GamepadReport(&_report, sizeof(_report));
 }
@@ -532,13 +558,11 @@ void LSUSBGamepad::write(void)
 void LSUSBGamepad::write(void *report)
 {
   wakeup();
-  unsigned long timerTimeoutBegin = millis();
 
-  while(!isReady() && !usbRetrying) {
-    delay(1);
-    if ((millis() - timerTimeoutBegin) > CONF_USB_HID_TIMEOUT){
-      break;
-    }
+  // Never block on HID readiness — see send().
+  if (!isReady()) {
+    usbRetrying = true;
+    return;
   }
   memcpy(&_report, report, sizeof(_report));
   GamepadReport(&_report, sizeof(_report));
