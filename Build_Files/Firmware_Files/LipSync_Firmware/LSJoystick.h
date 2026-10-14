@@ -24,6 +24,7 @@
 #include <Arduino.h>
 #include "LSCircularBuffer.h"           // LSCircularBuffer
 #include "LSUtils.h"                    // pointIntType
+#include "LSApiDeclarations.h"          // getOperatingMode (roadmap item 5: no auto-prototype dependency)
 
 #define JOY_RAW_BUFF_SIZE 10            // The size of _joystickRawBuffer
 #define JOY_INPUT_BUFF_SIZE 5           // The size of _joystickInputBuffer
@@ -93,6 +94,7 @@ class LSJoystick {
     pointIntType getXYIn();                                               // Get the mapped and filtered x and y values.
     pointIntType getXYOut();                                              // Get the output x and y values.
     int mapRoundInt(int input, int inputStart, int inputEnd, int outputStart, int outputEnd);       // Custom map function that rounds the results instead of truncating
+    bool isPollBackedOff();                                             // True while the slow-bus backoff is engaged (the joystick poll measured its own update crawling — see update())
 
   private:
     Tlv493d _Tlv493dSensor = Tlv493d();                                   // Create an object of Tlv493d class
@@ -665,6 +667,21 @@ int LSJoystick::getXOut() {
 //*********************************//
 int LSJoystick::getYOut() {
   return _joystickOutputBuffer.getLastElement().y;
+}
+
+//*********************************//
+// Function   : isPollBackedOff
+//
+// Description: Bus-crawl backoff state for the bus-health diagnostic
+//              endpoint (BH): the poll backs off hard when its own update
+//              measures a dragged shared I2C bus and restores the base
+//              cadence the moment an update runs fast again.
+// Arguments :  void
+//
+// Return     : backedOff : bool : the backoff interval is above its base
+//*********************************//
+bool LSJoystick::isPollBackedOff() {
+  return _busRetryIntervalMs > 20;
 }
 
 //*********************************//

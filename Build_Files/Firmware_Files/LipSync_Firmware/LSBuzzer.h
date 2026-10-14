@@ -20,6 +20,8 @@
 #ifndef _LSBUZZER_H
 #define _LSBUZZER_H
 
+#include "LSApiDeclarations.h"  // getSoundMode (roadmap item 5: no auto-prototype dependency)
+
 // Notes
 #define NOTE_B0  31
 #define NOTE_C1  33
@@ -126,6 +128,7 @@ class LSBuzzer {
     void setSoundModeLevel(int inputSoundMode);
     void calibCornerTone();
     void calibCenterTone();
+    void modeEngageTone(bool scrollMode);
 
   private:
     boolean _buzzerOn = true; // Sound feedback is on by default
@@ -362,6 +365,28 @@ void LSBuzzer::calibCenterTone(){
   if (_buzzerOn && (_soundModeLevel != CONF_SOUND_MODE_OFF)){
     tone(CONF_BUZZER_PIN, NOTE_A6, 500);
   }
+}
+
+//*********************************//
+// Function   : modeEngageTone
+//
+// Description: One short cue when a hold mode engages (roadmap item 16,
+//              upstream #61): scroll mode chirps higher than drag mode so
+//              a user who cannot see the LEDs can tell which one took.
+//              Gated to the "All" sound tier only — "Basic" is the minimal
+//              sound set users already know, and a new cue does not belong
+//              in it. A single immediate note: nothing queued, nothing
+//              blocking.
+//
+// Arguments :  scrollMode : bool : true = scroll mode engaged, false = drag
+//
+// Return     : void
+//*********************************//
+void LSBuzzer::modeEngageTone(bool scrollMode){
+  if (!_buzzerOn || (_soundModeLevel != CONF_SOUND_MODE_ALL)) {
+    return;
+  }
+  tone(CONF_BUZZER_PIN, scrollMode ? NOTE_E6 : NOTE_C5, 60);
 }
 
 #endif

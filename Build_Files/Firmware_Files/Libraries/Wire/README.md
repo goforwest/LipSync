@@ -23,7 +23,12 @@ in older firmware.
 - On timeout, `wireRecoverBus()` runs: a bounded STOP, then the peripheral
   is disconnected and disabled, the pins are driven as GPIO for the NXP
   I2C bus-clear (I2C-bus spec 3.1.16: up to 9 SCL clocks to release a
-  slave stuck mid-byte), and the TWIM is re-attached and re-enabled.
+  slave stuck mid-byte), and the TWIM is re-attached and re-enabled. The
+  pins' `PIN_CNF` registers are then restored to the `begin()`
+  configuration (input, pull-up, open-drain) — the bus-clear leaves SCL as
+  a GPIO output, which PSEL re-attachment makes benign, but a recovered
+  bus should be bit-identical to a freshly begun one (4.3.0, roadmap
+  item 4).
 - The failing call then reports an error (`requestFrom` returns 0 bytes,
   `endTransmission` returns 4), which the firmware's sensor-health layer
   turns into "sensor unhealthy" — a slow re-probe cycle instead of a hang.
@@ -31,10 +36,15 @@ in older firmware.
   letting firmware loops (joystick ticks, screen draws, the USB-retry page)
   back off all I2C while the bus is held — a held bus then costs one bounded
   recovery per window instead of a constant timeout tax.
+- `TwoWire::recoveryCount()` / `TwoWire::lastRecoveryMs()` expose the
+  recovery total and the millis() stamp of the latest one; the firmware's
+  `BH` serial endpoint turns them into the "seconds since the bus last
+  wedged" diagnostic (4.3.0, roadmap item 3).
 
-`Wire.h` differs from the core's copy only by the `busHealthy()` declaration
-and its comment; everything else lives in `Wire_nRF52.cpp`, marked with
-`LipSync patch` comment blocks.
+`Wire.h` differs from the core's copy only by the `busHealthy()`,
+`recoveryCount()` and `lastRecoveryMs()` declarations and their comments;
+everything else lives in `Wire_nRF52.cpp`, marked with `LipSync patch`
+comment blocks.
 
 ## How the build uses it
 

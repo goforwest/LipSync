@@ -24,6 +24,7 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include "LSApiDeclarations.h"
 
 #define CONF_SCREEN_WIDTH 128  // OLED display width, in pixels
 #define CONF_SCREEN_HEIGHT 64  // OLED display height, in pixels
@@ -58,6 +59,7 @@
 #define FACTORY_RESET_PAGE 57
 #define FACTORY_RESET_CONFIRM2_PAGE 571
 #define INFO_MENU 58
+#define ACCEL_MENU 59
 
 #define SCROLL_DELAY_MILLIS 100 // [ms] This controls the scroll speed of long menu items //TODO 2025-Feb-28 Make this user adjustable
 
@@ -109,6 +111,12 @@ public:
   void finishExitMenu();
   void beginLongTextScroll();
   void returnToMenu();
+  // A serial-API-triggered calibration (#36) must not end by parking the Hub
+  // on a main menu nothing opened: when set, the calibration end transition
+  // (and the center-reset complete page) closes the menu instead of
+  // returning to it. Set by setJoystickCalibration on the API path; the
+  // menu-driven path clears it.
+  void calibrationEndsByClosingMenu(bool enable);
   void finishChangeMode();
   void fullCalibrationConfirmMenu();
   void factoryResetConfirm2Menu();
@@ -121,12 +129,18 @@ public:
   void drawUsbErrorPageOnce();
   void resetUsbErrorPage();
 
+  // Display-health gate state for the bus-health diagnostic endpoint (BH):
+  // false means the last framebuffer push wedged or crawled and the display
+  // is being re-probed on an exponential backoff instead of trusted.
+  bool isDisplayHealthy();
+
   void centerResetPage();
   void centerResetCompletePage();
   void fullCalibrationPrompt(int stepNum);
   void infoMenu();
   void testPage(unsigned int usbConnectDelay);
   void noUsbPage();
+  void updateModePage();
   void errorPageI2C();
   void errorPageCable();
   void warningUSBDebugOn();
@@ -149,6 +163,7 @@ private:
   unsigned long _inputFrozenUntil = 0;  // While millis() is before this, menu input is frozen (a scheduled page transition owns the menu)
   int _transitionTimerId = -1;           // Pending scheduled page transition (LSTimer id), -1 = none
   bool _usbErrorPageShown = false;       // The no-USB page has been drawn for the current error episode
+  bool _calibrationClosesMenu = false;   // The running calibration was started over the serial API — its end pages close the menu (#36)
   bool _displayHealthy = true;               // Display answers on the I2C bus (mirrors the pressure-sensor health gate)
   unsigned long _lastDisplayProbeMs = 0;     // Last cheap re-probe while the display was marked unhealthy
   unsigned long _displayProbeIntervalMs = 2000;  // Re-probe cadence; doubles after each wedged push (flaky buses
@@ -171,6 +186,7 @@ private:
   int _tempCommunicationMode;
   int _cursorSpeedLevel;
   int _scrollSpeedLevel;
+  int _accelLevel;
   int _lightBrightLevel;
   bool _soundOn = true;
   int _soundMode;
@@ -220,6 +236,7 @@ private:
   void sipPuffThreshMenu();
   void adjustSipThreshMenu();
   void adjustPuffThreshMenu();
+  void accelMenu();
   void restartConfirmPage();
   void factoryResetConfirm1Page();
   void factoryResetConfirm2Page();
@@ -234,10 +251,11 @@ private:
   String _modeMenuText[4] = { "MOUSE USB", "MOUSE BT", "GAMEPAD ", "... Back" };
   String _modeConfirmText[4] = { "Change", "mode?", "Confirm", "... Back" };
   String _cursorSpMenuText[4] = { "Speed: ", "Increase", "Decrease", "... Back" };
-  String _moreMenuText[9] = { "Sound",  "Light Brightness", "Scroll Speed",   "Sip & Puff",  "Full Calibration",   "Restart LipSync",  "Factory Reset",  "Info", "... Back",  };
+  String _moreMenuText[10] = { "Sound",  "Light Brightness", "Scroll Speed",   "Sip & Puff",  "Full Calibration",   "Restart LipSync",  "Factory Reset",  "Info", "Acceleration", "... Back",  };
   String _soundMenuText[4] = { "Sound:", "<>", "Turn <>", "... Back" };
   String _lightBrightMenuText[4] = { "Lights: ", "Increase", "Decrease", "... Back" };
   String _scrollSpMenuText[4] = { "Speed: ", "Increase", "Decrease", "... Back" };
+  String _accelMenuText[4] = { "Accel: ", "Increase", "Decrease", "... Back" };
   String _sipPuffThreshMenuText[4] = { "Sip Threshold", "Puff Threshold", "... Back" };
   String _adjustSipThreshMenuText[4] = { "Sip: ", "Increase", "Decrease", "... Back" };
   String _adjustPuffThreshMenuText[4] = { "Puff: ", "Increase", "Decrease", "... Back" };
@@ -254,10 +272,11 @@ private:
   const int _calibMenuLen = 2;
   const int _modeMenuLen = 4;
   const int _cursorSpMenuLen = 3;
-  const int _moreMenuLen = 9;
+  const int _moreMenuLen = 10;
   const int _soundMenuLen = 2;
   const int _lightBrightMenuLen = 3;
   const int _scrollSpMenuLen = 3;
+  const int _accelMenuLen = 3;
   const int _sipPuffThreshMenuLen = 3;
   const int _adjustSipThreshMenuLen = 3;
   const int _adjustPuffThreshMenuLen = 3;
@@ -427,11 +446,23 @@ void LSScreen::beginLongTextScroll() {
 
 void LSScreen::returnToMenu() {
   _transitionTimerId = -1;
+  if (_calibrationClosesMenu) {
+    // #36: this calibration run was started over the serial API — the menu
+    // was not how the flow started, so it must not be how it ends. Close
+    // (clear) instead of parking the Hub on a main menu nothing opened.
+    _calibrationClosesMenu = false;
+    deactivateMenu();
+    return;
+  }
   if (_isActive) {
     mainMenu();
   } else {
     deactivateMenu();
   }
+}
+
+void LSScreen::calibrationEndsByClosingMenu(bool enable) {
+  _calibrationClosesMenu = enable;
 }
 
 void LSScreen::finishChangeMode() {
@@ -490,7 +521,22 @@ void LSScreen::drawUsbErrorPageOnce() {
 }
 
 void LSScreen::resetUsbErrorPage() {
+  bool wasShown = _usbErrorPageShown;
   _usbErrorPageShown = false;
+  // #63 residual: the "No USB" page lingered after the host came back — the
+  // device worked normally but the screen still said otherwise, because the
+  // latch reset never redrew anything. The reset IS the moment the default
+  // screen should return: draw it once, and only when an episode actually
+  // painted something on a live display that no menu owns (an open menu
+  // keeps the screen; a held bus costs nothing — flushDisplay gates the push
+  // and the next flush catches up, but skipping the draw is cheaper).
+  if (wasShown && !_isActive && g_displayConnected && Wire.busHealthy()) {
+    splashScreen2();
+  }
+}
+
+bool LSScreen::isDisplayHealthy() {
+  return _displayHealthy;
 }
 
 //*********************************//
@@ -833,7 +879,10 @@ void LSScreen::selectMenuItem() {
         case 7: // Info
           infoMenu();
           break;
-        case 8: // Back
+        case 8: // Acceleration (roadmap item 9, upstream #86)
+          accelMenu();
+          break;
+        case 9: // Back
           mainMenu();
           break;
       }
@@ -928,6 +977,40 @@ void LSScreen::selectMenuItem() {
           adjustPuffThreshMenu();
           break;
         case 2:
+          _currentMenu = MORE_MENU;
+          moreMenu();
+          break;
+      }
+      break;
+
+    case ACCEL_MENU:
+      // Cursor acceleration level (roadmap item 9): -10 (slowest/most
+      // precise) .. 10 (fastest); 0 is the linear default. The API set
+      // clamps out-of-range steps, and the re-read keeps the label truthful.
+      switch (_currentSelection) {
+        case 0: {  // Increase
+          _accelLevel = getJoystickAcceleration(false, false);
+          _accelLevel++;
+          setJoystickAcceleration(true, false, _accelLevel);
+          _accelLevel = getJoystickAcceleration(false, false);
+          _accelMenuText[0] = "Accel: " + String(_accelLevel) + " ";
+          _display.setCursor(0, 0);
+          _display.print(_accelMenuText[0]);
+          flushDisplay();
+          break;
+        }
+        case 1: {  // Decrease
+          _accelLevel = getJoystickAcceleration(false, false);
+          _accelLevel--;
+          setJoystickAcceleration(true, false, _accelLevel);
+          _accelLevel = getJoystickAcceleration(false, false);
+          _accelMenuText[0] = "Accel: " + String(_accelLevel) + " ";
+          _display.setCursor(0, 0);
+          _display.print(_accelMenuText[0]);
+          flushDisplay();
+          break;
+        }
+        case 2:  // Back
           _currentMenu = MORE_MENU;
           moreMenu();
           break;
@@ -1453,6 +1536,31 @@ void LSScreen::scrollSpeedMenu(void) {
 }
 
 //*********************************//
+// Function   : accelMenu
+//
+// Description: Format and display the Cursor Acceleration Menu (roadmap
+//              item 9): the stored level (-10..10, 0 = linear) with the
+//              same Increase/Decrease/Back shape as the speed menus.
+//
+// Arguments :  void
+//
+// Return     : void
+//*********************************//
+void LSScreen::accelMenu(void) {
+  _currentMenu = ACCEL_MENU;
+  _accelLevel = getJoystickAcceleration(true, false);
+
+  _accelMenuText[0] = "Accel: " + String(_accelLevel);
+
+  _currentMenuLength = _accelMenuLen;
+  _currentMenuText = _accelMenuText;
+  _cursorStart = 1;
+  _currentSelection = 0;
+
+  displayMenu();
+}
+
+//*********************************//
 // Function   : moreMenu
 //
 // Description: Format and display More Menu
@@ -1890,6 +1998,35 @@ void LSScreen::noUsbPage(void) {
   _display.println("Use menu");
   _display.println("to change");
   _display.println("modes.");
+  flushDisplay();
+}
+
+//*********************************//
+// Function   : updateModePage
+//
+// Description: The deliberate update-mode splash (firmware-update
+//              improvements item 1): the stock bootloader never drives the
+//              Hub's OLED, so whatever the app firmware drew last stays
+//              frozen for the whole flash. Drawing this page as the final
+//              frame before the jump replaces the confusing frozen
+//              "Restarting" message with the truth — the device is fine
+//              and waiting for the flash. The OLED is unpowered-fresh: it
+//              keeps this frame without power until the new app boots.
+//
+// Arguments :  void
+//
+// Return     : void
+//*********************************//
+void LSScreen::updateModePage(void) {
+  if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::updateModePage()"); }
+
+  setupDisplay();
+  _display.setTextSize(2);
+  drawCentreString("Update", 0);
+  drawCentreString("mode", 16);
+  _display.setTextSize(1);
+  drawCentreString("Use the LipSync", 40);
+  drawCentreString("Connect app", 52);
   flushDisplay();
 }
 

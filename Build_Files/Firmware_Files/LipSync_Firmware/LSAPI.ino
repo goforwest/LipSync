@@ -18,6 +18,7 @@
 
 
 //***API FUNCTIONS***// - DO NOT CHANGE
+#include "LSApiDeclarations.h"  // Explicit declarations for the API surface (roadmap item 5) — the function table below references functions defined further down the merged tabs
 typedef void (*FunctionPointer)(bool, bool, String);      // Type definition for API function pointer
 
 typedef struct {                                  // Type definition for API function list
@@ -54,6 +55,7 @@ _functionList getScrollLevelFunction =            {"SL", "0", "0", &getScrollLev
 _functionList setScrollLevelFunction =            {"SL", "1", "",  &setScrollLevel};
 
 _functionList getPressureValueFunction =          {"PV", "0", "0", &getPressureValue};
+_functionList getBusHealthFunction =              {"BH", "0", "0", &getBusHealth};
 _functionList getSipPressureThresholdFunction =   {"ST", "0", "0", &getSipPressureThreshold};
 _functionList setSipPressureThresholdFunction =   {"ST", "1", "",  &setSipPressureThreshold};
 _functionList getPuffPressureThresholdFunction =  {"PT", "0", "0", &getPuffPressureThreshold};
@@ -74,8 +76,9 @@ _functionList getJoystickValueFunction =          {"JV", "0", "0", &getJoystickV
 
 _functionList runTestFunction =                   {"RT", "1", "",  &runTest};
 _functionList softResetFunction =                 {"SR", "1", "1", &softReset};
-_functionList resetSettingsFunction =             {"RS", "1", "1", &resetSettings};
-_functionList factoryResetFunction =              {"FR", "1", "1", &doFactoryReset};
+_functionList resetSettingsFunction =               {"RS", "1", "1", &resetSettings};
+_functionList factoryResetFunction =               {"FR", "1", "1", &doFactoryReset};
+_functionList enterUpdateModeFunction =            {"UM", "1", "1", &enterUpdateMode};
 
 // Declare array of API functions
 _functionList apiFunction[] = { //Let compiler determine number of functions
@@ -100,6 +103,7 @@ _functionList apiFunction[] = { //Let compiler determine number of functions
   setScrollLevelFunction,
   getJoystickValueFunction,
   getPressureValueFunction,
+  getBusHealthFunction,
   getSipPressureThresholdFunction,
   setSipPressureThresholdFunction,
   getPuffPressureThresholdFunction,
@@ -118,7 +122,8 @@ _functionList apiFunction[] = { //Let compiler determine number of functions
   runTestFunction,
   softResetFunction,
   resetSettingsFunction,
-  factoryResetFunction
+  factoryResetFunction,
+  enterUpdateModeFunction
 };
 
 //***SERIAL SETTINGS FUNCTION TO CHANGE SPEED AND COMMUNICATION MODE USING SOFTWARE***//
@@ -1009,6 +1014,11 @@ void setJoystickCalibration(bool responseEnabled, bool apiEnabled) {
   js.clear();                                                                                           // Clear previous calibration values
   int stepNumber = 0;
   canOutputAction = false;
+  // #36: apiEnabled is true only on the serial-dispatch path — a calibration
+  // the app started must not end by parking the Hub's menu on screen. The
+  // menu-driven path (fullCalibrationPage) passes false and keeps the
+  // return-to-menu behavior the device user expects.
+  screen.calibrationEndsByClosingMenu(apiEnabled);
   calibrationTimerId[0] = calibrationTimer.setTimeout(CONF_JOY_CALIB_START_DELAY, performJoystickCalibration, (int *)stepNumber);  // Start the process
 }
 //***SET JOYSTICK CALIBRATION API FUNCTION***//
@@ -1296,6 +1306,85 @@ void getPressureValue(bool responseEnabled, bool apiEnabled, String optionalPara
   }
 }
 
+//***GET BUS HEALTH FUNCTION***//
+// Function   : getBusHealth
+//
+// Description: Read-only I2C bus diagnostic (roadmap item 3): everything
+//              the 4.2.0 flaky-bus hunt measured with custom timing probes,
+//              in one endpoint. Turns "the screen is black, is it the USB?"
+//              into a one-line answer for LipSync Connect's health check and
+//              for any maker with a serial monitor.
+//
+//              Response value (comma-separated):
+//                recoveries  : total bounded-timeout bus recoveries this boot
+//                              (Wire.recoveryCount(); every one is a bus that
+//                              wedged hard enough to need the NXP bus-clear)
+//                busHealthy  : 1 = no recent recovery, 0 = a recovery happened
+//                              within the hold-debounce window (bus is being
+//                              held right now)
+//                display     : 0 = not detected, 1 = answering,
+//                              2 = demoted (probing on exponential backoff)
+//                pressure    : 0 = not detected, 1 = healthy,
+//                              2 = unhealthy (gated: sip/puff cannot fire)
+//                joystick    : 0 = not detected, 1 = healthy,
+//                              2 = poll backed off (bus crawls)
+//                ageSec      : seconds since the last recovery, -1 when none
+//                              happened this boot
+//
+// Parameters :  responseEnabled : bool : The response for serial printing is enabled if it's set to true.
+//                                        The serial printing is ignored if it's set to false.
+//               apiEnabled : bool : The api response is sent if it's set to true.
+//                                   Manual response is sent if it's set to false.
+//
+// Return     : void
+//*********************************//
+void getBusHealth(bool responseEnabled, bool apiEnabled) {
+  uint32_t recoveries = Wire.recoveryCount();
+  int ageSec = -1;
+  if (recoveries > 0) {
+    ageSec = (int)((millis() - Wire.lastRecoveryMs()) / 1000UL);
+  }
+
+  int displayHealth = 0;
+  if (g_displayConnected) displayHealth = screen.isDisplayHealthy() ? 1 : 2;
+
+  int pressureHealth = 0;
+  if (g_mouthpiecePressureSensorConnected && g_ambientPressureSensorConnected)
+    pressureHealth = ps.isSensorsHealthy() ? 1 : 2;
+
+  int joystickHealth = 0;
+  if (g_joystickSensorConnected) joystickHealth = js.isPollBackedOff() ? 2 : 1;
+
+  const int outputArraySize = 6;
+  int tempBusHealth[outputArraySize];
+  tempBusHealth[0] = (int)recoveries;
+  tempBusHealth[1] = Wire.busHealthy() ? 1 : 0;
+  tempBusHealth[2] = displayHealth;
+  tempBusHealth[3] = pressureHealth;
+  tempBusHealth[4] = joystickHealth;
+  tempBusHealth[5] = ageSec;
+
+  printResponseIntArray(responseEnabled, apiEnabled, true, 0, "BH,0", true, "", outputArraySize, ',', tempBusHealth);
+}
+
+//***GET BUS HEALTH API FUNCTION***//
+// Function   : getBusHealth
+//
+// Description: This function is redefinition of main getBusHealth function to match the types of API function arguments.
+//
+// Parameters :  responseEnabled : bool : The response for serial printing is enabled if it's set to true.
+//                                        The serial printing is ignored if it's set to false.
+//               apiEnabled : bool : The api response is sent if it's set to true.
+//                                   Manual response is sent if it's set to false.
+//               optionalParameter : String : The input parameter string should contain one element with value of zero.
+//
+// Return     : void
+void getBusHealth(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 0) {
+    getBusHealth(responseEnabled, apiEnabled);
+  }
+}
+
 //***GET SIP PRESSURE THRESHOLD FUNCTION***//
 // Function   : getSipPressureThreshold
 //
@@ -1552,6 +1641,11 @@ void setJoystickAcceleration(bool responseEnabled, bool apiEnabled, int inputAcc
   int responseCode = 0;
   (isValidAcceleration) ? responseCode = 0 : responseCode = 3;
   printResponseInt(responseEnabled, apiEnabled, isValidAcceleration, responseCode, "AV,1", true, tempJoystickAccelerationLevel);
+
+  // Keep the live global in sync with the stored level (roadmap item 9):
+  // the joystick output path reads `acceleration` every tick, and the
+  // hub-menu Increase/Decrease entries step from it.
+  acceleration = tempJoystickAccelerationLevel;
 }
 //***SET JOYSTICK ACCELERATION API FUNCTION***//
 // Function   : setJoystickAcceleration
@@ -1609,9 +1703,11 @@ void increaseJoystickAcceleration(bool responseEnabled, bool apiEnabled) {
 void decreaseJoystickAcceleration(bool responseEnabled, bool apiEnabled) {
   int tempJoystickAccelerationLevel=acceleration;
   tempJoystickAccelerationLevel--;
-  if(tempJoystickAccelerationLevel <= CONF_JOY_ACCELERATION_LEVEL_MIN){
+  // The old comparison was inverted (<= MIN) — the level could only ever be
+  // decreased once it was already at the bottom; anything above it no-op'd.
+  if(tempJoystickAccelerationLevel >= CONF_JOY_ACCELERATION_LEVEL_MIN){
     setJoystickAcceleration(responseEnabled, apiEnabled, tempJoystickAccelerationLevel);
-  } 
+  }
   else{
   }
 
@@ -2370,6 +2466,68 @@ void doFactoryReset(bool responseEnabled, bool apiEnabled) {
 void doFactoryReset(bool responseEnabled, bool apiEnabled, String optionalParameter) {
   if (optionalParameter.length() == 1 && optionalParameter.toInt() == 1) {
     doFactoryReset(responseEnabled, apiEnabled);
+  }
+}
+
+//***ENTER UPDATE MODE FUNCTION***//
+// Function   : enterUpdateMode
+//
+// Description: Deliberate update-mode entry over the settings API
+//              (firmware-update improvements item 1): ack, draw the
+//              "Update mode" splash as the final frame, then reset into
+//              the stock serial-DFU bootloader. The stock bootloader never
+//              drives the Hub's OLED, so without this the screen freezes
+//              on whatever the app firmware drew last (via the SR-first
+//              restart: the "RESTARTING" message) and the device looks
+//              stuck mid-restart while it is actually fine and waiting
+//              for the flash. LipSync Connect (4.3.0+) sends UM,1:1 over
+//              the live session in place of the 1200-baud touch; on older
+//              firmware it falls back to the touch, and a maker with a
+//              serial monitor can send SETTINGS + UM,1:1 instead of the
+//              double-reset dance.
+//
+//              enterSerialDfu() is the core's own 1200-baud-touch
+//              destination (GPREGRET serial-DFU magic + reset), so this
+//              lands in exactly the bootloader the touch lands in.
+//
+// Parameters :  responseEnabled : bool : The response for serial printing is enabled if it's set to true.
+//                                        The serial printing is ignored if it's set to false.
+//               apiEnabled : bool : The api response is sent if it's set to true.
+//                                   Manual response is sent if it's set to false.
+//
+// Return     : void
+//*********************************//
+void enterUpdateMode(bool responseEnabled, bool apiEnabled) {
+  // Ack BEFORE anything else: the reset below kills USB, and the host must
+  // already hold the confirmation when the port departs. The bounded dwell
+  // then gives the ack time to reach the host and the splash's framebuffer
+  // push time to complete before the OLED loses its driver.
+  printResponseInt(responseEnabled, apiEnabled, true, 0, "UM,1", true, 1);
+
+  if (g_displayConnected) {
+    screen.updateModePage();
+  }
+
+  delay(CONF_UPDATE_MODE_DWELL_MS);
+
+  enterSerialDfu();
+}
+
+//***ENTER UPDATE MODE API FUNCTION***//
+// Function   : enterUpdateMode
+//
+// Description: This function is redefinition of main enterUpdateMode function to match the types of API function arguments.
+//
+// Parameters :  responseEnabled : bool : The response for serial printing is enabled if it's set to true.
+//                                        The serial printing is ignored if it's set to false.
+//               apiEnabled : bool : The api response is sent if it's set to true.
+//                                   Manual response is sent if it's set to false.
+//               optionalParameter : String : The input parameter string should contain one element with value of one.
+//
+// Return     : void
+void enterUpdateMode(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 1) {
+    enterUpdateMode(responseEnabled, apiEnabled);
   }
 }
 

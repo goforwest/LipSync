@@ -90,8 +90,9 @@ class LSPressure {
     float getSapPressureAbs();                          // Get last main pressure from pressure buffer
     float getAmbientPressure();                         // Get last reference pressure from pressure buffer
     float getSapPressure();                             // Get the Pressure Difference sapPressure = (sapPressureAbs- ambientPressure- offsetPressure)
-    pressureStruct getAllPressure();                    // Get the latest pressure values 
-    inputStateStruct getState();                        // Get the latest sip and puff state  
+    pressureStruct getAllPressure();                    // Get the latest pressure values
+    inputStateStruct getState();                        // Get the latest sip and puff state
+    bool isSensorsHealthy();                            // True while both pressure sensors return valid readings (false = gated: re-probing slowly, sip/puff cannot fire)
 
   private: 
       Adafruit_LPS35HW _lps35hw = Adafruit_LPS35HW();     // Create an object of Adafruit_LPS35HW class for Sip and Puff pressure
@@ -630,11 +631,11 @@ pressureStruct LSPressure::getAllPressure()
 
 
 //*********************************//
-// Function   : getState 
-// 
-// Description: Get the last sip and puff state from sap buffer 
+// Function   : getState
+//
+// Description: Get the last sip and puff state from sap buffer
 // Arguments :  void
-// 
+//
 // Return     : state : inputStateStruct : Last sip and puff state
 //*********************************//
 inputStateStruct LSPressure::getState()
@@ -643,4 +644,22 @@ inputStateStruct LSPressure::getState()
 }
 
 
-#endif 
+//*********************************//
+// Function   : isSensorsHealthy
+//
+// Description: Sensor-health gate state for the bus-health diagnostic
+//              endpoint (BH): false means the sensors stopped returning
+//              valid readings and the I2C bus is being left alone except
+//              for a slow re-probe — sip and puff cannot fire in that
+//              state, so a support readout must be able to see it.
+// Arguments :  void
+//
+// Return     : healthy : bool : both pressure sensors return valid readings
+//*********************************//
+bool LSPressure::isSensorsHealthy()
+{
+  return _sensorsHealthy;
+}
+
+
+#endif

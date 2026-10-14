@@ -75,6 +75,11 @@ uint32_t TwoWire::recoveryCount()
   return wireRecoveryCount;
 }
 
+unsigned long TwoWire::lastRecoveryMs()
+{
+  return wireRecoveryCount == 0 ? 0 : wireLastRecoveryMs;
+}
+
 // Waits for *eventReg (or EVENTS_ERROR, which callers handle). Returns true
 // when the event fired; false on timeout.
 static bool wireWaitEvent(NRF_TWIM_Type * twim, volatile uint32_t * eventReg, uint32_t timeoutMs)
@@ -130,6 +135,26 @@ static void wireRecoverBus(NRF_TWIM_Type * twim, uint32_t pinSDA, uint32_t pinSC
   twim->PSEL.SCL = pinSCL;
   twim->PSEL.SDA = pinSDA;
   twim->ENABLE = (TWIM_ENABLE_ENABLE_Enabled << TWIM_ENABLE_ENABLE_Pos);
+
+  // Restore the begin()-equivalent pin configuration (roadmap item 4): the
+  // bus-clear above left SCL configured as a GPIO output (and SDA as a plain
+  // input). PSEL re-attachment hands the peripheral ownership of the pins, so
+  // the leftover PIN_CNF is functionally benign today — but DIR/Input+pull-up+
+  // open-drain is the configuration begin() established, and restoring it
+  // keeps the recovered bus bit-identical to a freshly begun one (no
+  // drive-strength or input-buffer surprises for whatever inspects or
+  // re-inits the pins later).
+  *pincfg_reg(pinSCL) = ((uint32_t)GPIO_PIN_CNF_DIR_Input         << GPIO_PIN_CNF_DIR_Pos)
+                        | ((uint32_t)GPIO_PIN_CNF_INPUT_Connect    << GPIO_PIN_CNF_INPUT_Pos)
+                        | ((uint32_t)GPIO_PIN_CNF_PULL_Pullup      << GPIO_PIN_CNF_PULL_Pos)
+                        | ((uint32_t)GPIO_PIN_CNF_DRIVE_S0D1       << GPIO_PIN_CNF_DRIVE_Pos)
+                        | ((uint32_t)GPIO_PIN_CNF_SENSE_Disabled   << GPIO_PIN_CNF_SENSE_Pos);
+
+  *pincfg_reg(pinSDA) = ((uint32_t)GPIO_PIN_CNF_DIR_Input         << GPIO_PIN_CNF_DIR_Pos)
+                        | ((uint32_t)GPIO_PIN_CNF_INPUT_Connect    << GPIO_PIN_CNF_INPUT_Pos)
+                        | ((uint32_t)GPIO_PIN_CNF_PULL_Pullup      << GPIO_PIN_CNF_PULL_Pos)
+                        | ((uint32_t)GPIO_PIN_CNF_DRIVE_S0D1       << GPIO_PIN_CNF_DRIVE_Pos)
+                        | ((uint32_t)GPIO_PIN_CNF_SENSE_Disabled   << GPIO_PIN_CNF_SENSE_Pos);
 }
 // *** end LipSync patch ***
 

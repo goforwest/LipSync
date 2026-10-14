@@ -71,6 +71,11 @@ class TwoWire : public Stream
     // transaction was the one that wedged (e.g. a display framebuffer push).
     uint32_t recoveryCount();
 
+    // *** LipSync patch *** — the millis() stamp of the latest recovery
+    // (0 when none happened this boot). The bus-health diagnostic endpoint
+    // turns it into "seconds since the bus last wedged".
+    unsigned long lastRecoveryMs();
+
     inline size_t write(unsigned long n) { return write((uint8_t)n); }
     inline size_t write(long n)          { return write((uint8_t)n); }
     inline size_t write(unsigned int n)  { return write((uint8_t)n); }

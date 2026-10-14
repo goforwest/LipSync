@@ -19,6 +19,7 @@
 #include <WString.h>
 #include <Wire.h>
 #include "LSUtils.h"
+#include "LSApiDeclarations.h"  // Explicit cross-tab declarations (roadmap item 5) — early so every tab sees them
 #include "LSConfig.h"
 #include "LSTimer.h"
 #include <ArduinoJson.h>
@@ -215,7 +216,7 @@ void setup() {
     initJoystick();  // Initialize Joystick
   }
 
-  //initAcceleration();  // Initialize Cursor Acceleration // TODO Implement acceleration
+  initAcceleration();  // Load the stored cursor acceleration level (roadmap item 9)
 
   initDebug();  // Initialize Debug Mode operation
 
@@ -905,7 +906,10 @@ void buzzerSoundOff() {
 //***INITIALIZE ACCELERATION FUNCTION***//
 // Function   : initAcceleration
 //
-// Description: This function initializes acceletaion
+// Description: This function loads the stored cursor acceleration level into
+//              the live global the joystick output path reads (roadmap item
+//              9 — the level is a stored setting since v4.0; the output
+//              curve now actually applies it).
 //
 // Parameters : void
 //
@@ -913,7 +917,7 @@ void buzzerSoundOff() {
 //****************************************//
 void initAcceleration() {
   if (USB_DEBUG) { Serial.println("USBDEBUG: initAcceleration()"); }
-  //  acceleration=getJoystickAcceleration(false,false);
+  acceleration = getJoystickAcceleration(false, false);
 }
 
 //*********************************//
@@ -1334,6 +1338,13 @@ void evaluateOutputAction(inputStateStruct actionState, unsigned long actionMaxE
                   CONF_INPUT_LED_DELAY,
                   led.getLedBrightness());
       outputAction = tempActionIndex;
+
+      // Engagement cue for the two hold modes (roadmap item 16, upstream
+      // #61): one short tone when scroll or drag takes, so the mode change
+      // is audible, not just visible on the LEDs.
+      if (tempActionIndex == CONF_ACTION_SCROLL || tempActionIndex == CONF_ACTION_DRAG) {
+        buzzer.modeEngageTone(tempActionIndex == CONF_ACTION_SCROLL);
+      }
 
       // Perform led action
       performLedAction(ledCurrentState);
@@ -1975,13 +1986,16 @@ void performJoystick(pointIntType inputPoint) {
     int maxMouse = js.getMouseSpeedRange();
     outputPoint.x = js.mapRoundInt(inputPoint.x, -CONF_JOY_OUTPUT_XY_MAX, CONF_JOY_OUTPUT_XY_MAX ,-maxMouse, maxMouse);
     outputPoint.y = js.mapRoundInt(inputPoint.y, -CONF_JOY_OUTPUT_XY_MAX, CONF_JOY_OUTPUT_XY_MAX ,-maxMouse, maxMouse);
+    // Deflection-based acceleration (roadmap item 9): reshapes the mapped
+    // cursor curve per axis; full deflection keeps the full speed of the
+    // current speed level, and level 0 (the default) is a no-op.
+    outputPoint.x = accelerationModifier(outputPoint.x, maxMouse, acceleration);
+    outputPoint.y = accelerationModifier(outputPoint.y, maxMouse, acceleration);
     // 0 = None , 1 = USB , 2 = Wireless
     if (g_comMode == CONF_COM_MODE_USB) {
-      //(outputAction == CONF_ACTION_SCROLL) ? usbmouse.scroll(scrollModifier(round(inputPoint.y),js.getMinimumRadius(),g_scrollLevel)) : usbmouse.move(accelerationModifier(round(inputPoint.x),js.getMinimumRadius(),acceleration), accelerationModifier(round(-inputPoint.y),js.getMinimumRadius(),acceleration)); // TODO Implement acceleration
       (outputAction == CONF_ACTION_SCROLL) ? usbmouse.scroll(scrollModifier(round(inputPoint.y), CONF_JOY_OUTPUT_XY_MAX, g_scrollLevel)) : usbmouse.move(outputPoint.x, outputPoint.y);
 
     } else if (g_comMode == CONF_COM_MODE_BLE) {
-      //(outputAction == CONF_ACTION_SCROLL) ? btmouse.scroll(scrollModifier(round(inputPoint.y),js.getMinimumRadius(),g_scrollLevel)) : btmouse.move(accelerationModifier(round(inputPoint.x),js.getMinimumRadius(),acceleration), accelerationModifier(round(-inputPoint.y),js.getMinimumRadius(),acceleration)); // TODO Implement acceleration
       (outputAction == CONF_ACTION_SCROLL) ? btmouse.scroll(scrollModifier(round(inputPoint.y), CONF_JOY_OUTPUT_XY_MAX, g_scrollLevel)) : btmouse.move(outputPoint.x, outputPoint.y);
     }
   } else if (g_operatingMode == CONF_OPERATING_MODE_GAMEPAD) {
@@ -2043,24 +2057,41 @@ int scrollModifier(const int cursorValue, const int cursorMaxValue, const int sc
 //***ACCELERATION MOVEMENT MODIFIER FUNCTION***//
 // Function   : accelerationModifier
 //
-// Description: This function converts y cursor movements to y scroll movements based on y cursor value and acceleration level.
+// Description: Deflection-based cursor response curve (roadmap item 9,
+//              upstream #86). The stored level (-10..10, default 0) bends
+//              the deflection-to-speed curve while leaving both endpoints
+//              fixed: zero deflection stays zero, and FULL deflection
+//              always maps to the full speed of the current cursor speed
+//              level — acceleration trades mid-range precision for speed,
+//              never top speed.
+//                level  0  → linear (identical to the pre-acceleration output)
+//                level 10  → exponent 0.0: any deflection moves at ~full speed
+//                level -10 → exponent 2.0: gentle deflections move very slowly
+//              The exponent moves 0.1 per level:
+//                out = sign(v) · max · (|v| / max) ^ (1 − level·0.1)
+//              Host-side acceleration varies per device and affects other
+//              mice when tuned for the LipSync — this keeps the curve on the
+//              device where the speed level already lives.
 //
-// Parameters : cursorValue : const int : y cursor value.
-//              cursorMaxValue : const int : maximum y cursor value.
-//              accelerationValue : const int : acceleration level value.
+// Parameters : cursorValue : const int : The mapped cursor axis value (-max..max).
+//              cursorMaxValue : const int : The maximum cursor axis value.
+//              accelerationValue : const int : The acceleration level (-10..10).
 //
-// Return     : cursorOutput : int : The modified acceleration value.
+// Return     : cursorOutput : int : The reshaped cursor axis value.
 //****************************************//
 int accelerationModifier(const int cursorValue, const int cursorMaxValue, const int accelerationValue) {
-  int accelerationOutput = 0;
-
-  if (accelerationOutput < 0) {
-    accelerationOutput = round((1.0 * pow(cursorValue, 1.0 + (acceleration * 0.025))));
-  } else if (accelerationOutput > 0) {
-    accelerationOutput = round(1.0 * pow(cursorValue, -1.0 * (1.0 + (acceleration * 0.025))));
+  if (cursorValue == 0 || cursorMaxValue <= 0 || accelerationValue == 0) {
+    return cursorValue;  // Zero maps to zero; level 0 is the identity curve
   }
-  accelerationOutput = -1 * constrain(accelerationOutput, -1 * cursorMaxValue, cursorMaxValue);
-  return accelerationOutput;
+
+  float exponent = 1.0f - (accelerationValue * 0.1f);
+  if (exponent < 0.0f) exponent = 0.0f;
+  if (exponent > 2.0f) exponent = 2.0f;
+
+  float magnitude = fabs((float)cursorValue);
+  float scaled = pow(magnitude / (float)cursorMaxValue, exponent) * (float)cursorMaxValue;
+  int accelerationOutput = (int)round(scaled);
+  return (cursorValue < 0) ? -accelerationOutput : accelerationOutput;
 }
 
 

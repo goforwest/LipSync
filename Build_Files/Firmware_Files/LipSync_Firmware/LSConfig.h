@@ -29,7 +29,7 @@
 #define CONF_LIPSYNC_MODEL 1                // 1: Lipsync w/ Hub
 
 #define CONF_LIPSYNC_VERSION_MAJOR  4
-#define CONF_LIPSYNC_VERSION_MINOR  2
+#define CONF_LIPSYNC_VERSION_MINOR  3
 #define CONF_LIPSYNC_VERSION_REV  0
 
 const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + "." + String(CONF_LIPSYNC_VERSION_MINOR) + "." + String(CONF_LIPSYNC_VERSION_REV);
@@ -200,6 +200,11 @@ const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + 
 
 #define CONF_USB_HID_TIMEOUT  5000           // 5 seconds - timeout for connecting to USB and continuing with the program
 #define CONF_USB_HID_INIT_DELAY 2000         // initial delay before attempting to reconnect to usb again
+
+#define CONF_UPDATE_MODE_DWELL_MS 500  // Bounded dwell in enterUpdateMode() between the ack, the "Update mode" splash
+                                        // and the reset into the bootloader: long enough for the ack to reach the host
+                                        // over USB and for the OLED framebuffer push to complete (bounded by Wire), so
+                                        // the splash is the frame the OLED keeps while the bootloader owns the device
 
 // Polling Timer IDs for each module
 #define CONF_TIMER_JOYSTICK 0
