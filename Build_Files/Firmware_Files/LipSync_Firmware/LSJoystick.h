@@ -133,8 +133,10 @@ class LSJoystick {
     int _rangeLevel;                                                      // The range level from 0 to 10 which is used as speed levels.
     int _rangeValue;                                                      // The calculated range value based on range level and an equation. This is maximum output value for each range level. (Cursor or gamepad)
     float _inputRadius;                                                   // The minimum radius of operating area calculated using calibration points.
-    bool _skipInputChange;                                                // The flag to low-pass filter the input changes 
+    bool _skipInputChange;                                                // The flag to low-pass filter the input changes
     int _operatingMode;                                                   // Operating mode, gamepad or mouse  //TODO 2025-Mar-06 Remove - Joystick class should be independent of operating mode
+    unsigned long _busRetryAtMs = 0;                                      // I2C backoff: no reads until this time (a flaky device on the
+    unsigned long _busRetryIntervalMs = 20;                               // shared bus drags transfers until they crawl — see update())
 
 };
 
@@ -603,6 +605,17 @@ void LSJoystick::zeroInputMax(int quad) {
 //*********************************//
 void LSJoystick::update() {
 
+  // A flaky device on the shared I2C bus (failing display or sensor) can
+  // drag every transfer until it completes slowly instead of wedging — no
+  // bounded-timeout ever fires, but the TLV493D's measurement wait turns
+  // this ~1 ms update into ~1 s of crawling transfers, once per 20 ms tick,
+  // which read as a flat ~1 s main-loop tax. Measure each update and back
+  // off hard while the bus crawls; a fast update (bus healthy again)
+  // restores the base cadence immediately.
+  if ((long)(millis() - _busRetryAtMs) < 0) return;
+
+  unsigned long updateStartUs = micros();
+
   _Tlv493dSensor.updateData();
   // Get the new readings as a point
   _rawPoint = {_Tlv493dSensor.getY(), _Tlv493dSensor.getX()};  // TODO 2025-Feb-25 This should be abstracted to a dedicated function   
@@ -616,7 +629,16 @@ void LSJoystick::update() {
     _joystickInputBuffer.pushElement(_inputPoint);            // Add new input point to _joystickInputBuffer
     _outputPoint = processOutputResponse(_inputPoint);        // Process output by applying deadzone, speed control, and linearization
     _joystickOutputBuffer.pushElement(_outputPoint);          // Add new output point to _joystickOutputBuffer    
-  } 
+  }
+
+  unsigned long updateMs = (micros() - updateStartUs) / 1000;
+  if (updateMs > 20) {  // Healthy is ~1 ms; past 20 ms the shared bus is being dragged
+    _busRetryIntervalMs *= 4;
+    if (_busRetryIntervalMs > 60000UL) _busRetryIntervalMs = 60000UL;
+    _busRetryAtMs = millis() + _busRetryIntervalMs;
+  } else {
+    _busRetryIntervalMs = 20;
+  }
 }
 
 //*********************************//

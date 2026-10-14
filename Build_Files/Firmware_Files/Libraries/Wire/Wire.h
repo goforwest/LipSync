@@ -59,6 +59,18 @@ class TwoWire : public Stream
     void onRequest(void(*)(void));
     void onService(void);
 
+    // *** LipSync patch *** — implemented in Wire_nRF52.cpp
+    // False while the bus is being held: a transaction hit the bounded-timeout
+    // recovery path recently. Firmware loops consult this to back off all I2C
+    // (joystick ticks, screen draws) so a held bus costs one bounded recovery
+    // per WIRE_BUS_HOLD_DEBOUNCE_MS instead of a constant timeout tax.
+    bool busHealthy();
+
+    // *** LipSync patch *** — total bounded-timeout recoveries this boot.
+    // Consumers compare it across an operation to detect that their own
+    // transaction was the one that wedged (e.g. a display framebuffer push).
+    uint32_t recoveryCount();
+
     inline size_t write(unsigned long n) { return write((uint8_t)n); }
     inline size_t write(long n)          { return write((uint8_t)n); }
     inline size_t write(unsigned int n)  { return write((uint8_t)n); }

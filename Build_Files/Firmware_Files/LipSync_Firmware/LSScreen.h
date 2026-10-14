@@ -113,6 +113,14 @@ public:
   void fullCalibrationConfirmMenu();
   void factoryResetConfirm2Menu();
 
+  // The USB-retry loop's error page: drawn at most once per error episode, and
+  // only when there is a display on an answerable I2C bus. The old code redrew
+  // the full framebuffer on every retry tick (~2 s apart) without either check
+  // — against held I2C hardware each draw cost seconds of bounded transaction
+  // timeouts, so the retry loop alone dragged every serial exchange to ~2 s.
+  void drawUsbErrorPageOnce();
+  void resetUsbErrorPage();
+
   void centerResetPage();
   void centerResetCompletePage();
   void fullCalibrationPrompt(int stepNum);
@@ -138,8 +146,15 @@ private:
   LSTimer<void> _screenStateTimer;  // Timer with a callback function
   int _screenStateTimerId;          // Timer ID for screen
   int _screenTimeoutTimerId;        // Timer ID to trigger next screen based on time
-  unsigned long _inputFrozenUntil = 0;  // While millis() is before this, menu input is frozen (a scheduled transition owns the menu)
+  unsigned long _inputFrozenUntil = 0;  // While millis() is before this, menu input is frozen (a scheduled page transition owns the menu)
   int _transitionTimerId = -1;           // Pending scheduled page transition (LSTimer id), -1 = none
+  bool _usbErrorPageShown = false;       // The no-USB page has been drawn for the current error episode
+  bool _displayHealthy = true;               // Display answers on the I2C bus (mirrors the pressure-sensor health gate)
+  unsigned long _lastDisplayProbeMs = 0;     // Last cheap re-probe while the display was marked unhealthy
+  unsigned long _displayProbeIntervalMs = 2000;  // Re-probe cadence; doubles after each wedged push (flaky buses
+                                                 // ACK a probe during momentary releases, and every re-trusted
+                                                 // full push that then wedges costs seconds of bounded timeouts)
+  void flushDisplay();                   // The single choke point for framebuffer pushes to the I2C bus
 
   bool _isActive = false;
   bool _menuTimeoutEnabled = true;
@@ -289,7 +304,7 @@ void LSScreen::begin() {
 
   setupDisplay();  // Clear screen
   _display.setTextWrap(false);
-  _display.display();
+  flushDisplay();
 
   _operatingMode = getOperatingMode(false, false);  // TODO JDMc 2025-Jan-24 These should be moved to update function so they are updated if changed through serial API
   _communicationMode = getCommunicationMode(false, false);
@@ -346,6 +361,7 @@ void LSScreen::update() {
 //*********************************//
 void LSScreen::activateMenu() {
   if ((long)(millis() - _inputFrozenUntil) < 0) return;  // A scheduled page transition owns the menu right now
+  if (!Wire.busHealthy()) return;  // Held I2C bus — the menu could not draw anyway; don't feed the timeout tax
 
   _lastActivityMillis = millis();
   _isActive = true;
@@ -367,7 +383,7 @@ void LSScreen::activateMenu() {
 void LSScreen::deactivateMenu() {
   _isActive = false;
   clear();
-  _display.display();
+  flushDisplay();
 }
 
 //*********************************//
@@ -460,6 +476,78 @@ void LSScreen::factoryResetConfirm2Menu() {
   displayMenu();  //  Print items in current menu
 }
 
+void LSScreen::drawUsbErrorPageOnce() {
+  if (_usbErrorPageShown) return;
+  if (!g_displayConnected) {  // Nothing to draw on
+    _usbErrorPageShown = true;
+    return;
+  }
+  if (!Wire.busHealthy()) return;  // Bus is held — a draw would only feed the timeout tax; retried on the next connection check
+  if (!_isActive) {
+    noUsbPage();
+  }
+  _usbErrorPageShown = true;
+}
+
+void LSScreen::resetUsbErrorPage() {
+  _usbErrorPageShown = false;
+}
+
+//*********************************//
+// Function   : flushDisplay
+//
+// Description: The single choke point for pushing the framebuffer to the
+//              display. Text and clear calls only touch the RAM buffer;
+//              display() is what drives the I2C bus — and against a held
+//              bus (a failing display or sensor) each push costs seconds of
+//              bounded transaction timeouts. Skipping the push while the
+//              bus is wedged keeps boot sequences, the safe-mode menu and
+//              every page transition cheap; the page state machines still
+//              advance, and the next flush after the bus recovers catches
+//              the drawing up. Without this, chained boot-time draws could
+//              outrun the 30 s watchdog and reset the device in a loop.
+//
+// Arguments :  void
+//
+// Return     : void
+//*********************************//
+void LSScreen::flushDisplay() {
+  // Display health gate (mirrors the pressure sensors'): a full framebuffer
+  // push against a held or absent display costs seconds of bounded
+  // transaction timeouts — and a flaky bus ACKs probes during momentary
+  // releases, so every re-trusted push can wedge all over again. One wedged
+  // push demotes the display; re-probes are a single cheap address ACK on an
+  // exponentially backing-off cadence (2 s doubling to 60 s, reset by a clean
+  // push). This keeps boot sequences, readyToUse() pages and the safe-mode
+  // menu from stalling the main loop — or outrunning the 30 s watchdog at
+  // boot — when the display side of the shared I2C bus is dead or flaky.
+  if (!_displayHealthy) {
+    if (millis() - _lastDisplayProbeMs < _displayProbeIntervalMs) return;
+    _lastDisplayProbeMs = millis();
+    Wire.beginTransmission(SCREEN_ADDRESS);
+    if (Wire.endTransmission() != 0) return;  // Still not answering
+    _displayHealthy = true;                   // ACKed — the next flush pushes for real
+  }
+
+  if (!Wire.busHealthy()) return;  // Bus held by something else — retry on a later flush
+
+  uint32_t recoveriesBefore = Wire.recoveryCount();
+  unsigned long pushStartMs = millis();
+  _display.display();
+  unsigned long pushMs = millis() - pushStartMs;
+  if (Wire.recoveryCount() != recoveriesBefore || pushMs > 100) {
+    // This push wedged the bus, or crawled through it: a flaky device can
+    // drag every transfer until it completes slowly without ever tripping a
+    // timeout — a healthy push takes ~5-10 ms, anything past 100 ms means
+    // the shared bus is being dragged. One strike, and back off.
+    _displayHealthy = false;
+    _displayProbeIntervalMs = _displayProbeIntervalMs * 2;
+    if (_displayProbeIntervalMs > 60000) _displayProbeIntervalMs = 60000;
+  } else {
+    _displayProbeIntervalMs = 2000;  // Clean push — restore the base re-probe cadence
+  }
+}
+
 //*********************************//
 // Function   : isMenuActive
 //
@@ -493,7 +581,7 @@ void LSScreen::splashScreen() {
   drawCentreString(CONF_LIPSYNC_VERSION_STRING, 32);
   drawCentreString("Makers Making Change", 54);
 
-  _display.display();
+  flushDisplay();
 }
 
 //*********************************//
@@ -546,7 +634,7 @@ void LSScreen::splashScreen2() {
       _display.println("Error");
   }
 
-  _display.display();
+  flushDisplay();
 
   if (USB_DEBUG){
     //delay(2000);  //TODO - 2025-FEB-21 Why is this delay here?
@@ -647,7 +735,7 @@ void LSScreen::selectMenuItem() {
       } else {
         setupDisplay();
         _display.println("Exiting");
-        _display.display();
+        flushDisplay();
         scheduleTransition(500, screenExitTransitionDone);  // was delay(500) — the menu closes on the next ticks
       }
       break;
@@ -701,7 +789,7 @@ void LSScreen::selectMenuItem() {
           _cursorSpMenuText[0] = "Speed: " + String(_cursorSpeedLevel) + " ";
           _display.setCursor(0, 0);
           _display.print(_cursorSpMenuText[0]);
-          _display.display();
+          flushDisplay();
           break;
         case 1:  // Decrease
           decreaseCursorSpeed(true, false);
@@ -709,7 +797,7 @@ void LSScreen::selectMenuItem() {
           _cursorSpMenuText[0] = "Speed: " + String(_cursorSpeedLevel) + " ";
           _display.setCursor(0, 0);
           _display.print(_cursorSpMenuText[0]);
-          _display.display();
+          flushDisplay();
           break;
         case 2:  // Back
           _currentMenu = MAIN_MENU;
@@ -781,7 +869,7 @@ void LSScreen::selectMenuItem() {
           _lightBrightMenuText[0] = "Lights: " + String(_lightBrightLevel) + " ";
           _display.setCursor(0, 0);
           _display.print(_lightBrightMenuText[0]);
-          _display.display();
+          flushDisplay();
           break;
         case 1:  // Decrease
           _lightBrightLevel = getLightBrightnessLevel(false, false);
@@ -791,7 +879,7 @@ void LSScreen::selectMenuItem() {
           _lightBrightMenuText[0] = "Lights: " + String(_lightBrightLevel) + " ";
           _display.setCursor(0, 0);
           _display.print(_lightBrightMenuText[0]);
-          _display.display();
+          flushDisplay();
           break;
         case 2:  // Back
           _currentMenu = MORE_MENU;
@@ -811,7 +899,7 @@ void LSScreen::selectMenuItem() {
           _scrollSpMenuText[0] = "Speed: " + String(_scrollSpeedLevel) + " ";
           _display.setCursor(0, 0);
           _display.print(_scrollSpMenuText[0]);
-          _display.display();
+          flushDisplay();
           break;
         case 1:  // Decrease
           _scrollSpeedLevel = getScrollLevel(false, false);
@@ -821,7 +909,7 @@ void LSScreen::selectMenuItem() {
           _scrollSpMenuText[0] = "Speed: " + String(_scrollSpeedLevel) + " ";
           _display.setCursor(0, 0);
           _display.print(_scrollSpMenuText[0]);
-          _display.display();
+          flushDisplay();
           break;
         case 2:  // Back
           _currentMenu = MORE_MENU;
@@ -856,7 +944,7 @@ void LSScreen::selectMenuItem() {
           _adjustSipThreshMenuText[0] = "Sip: " + String(_sipPressThresh) + " ";
           _display.setCursor(0, 0);
           _display.print(_adjustSipThreshMenuText[0]);
-          _display.display();
+          flushDisplay();
           break;
         case 1:  // Decrease
           _sipPressThresh = getSipPressureThreshold(false, false);
@@ -866,7 +954,7 @@ void LSScreen::selectMenuItem() {
           _adjustSipThreshMenuText[0] = "Sip: " + String(_sipPressThresh) + " ";
           _display.setCursor(0, 0);
           _display.print(_adjustSipThreshMenuText[0]);
-          _display.display();
+          flushDisplay();
           break;
         case 2:  // Back
           _currentMenu = SIP_PUFF_MENU;
@@ -885,7 +973,7 @@ void LSScreen::selectMenuItem() {
           _adjustPuffThreshMenuText[0] = "Puff: " + String(_puffPressThresh) + " ";
           _display.setCursor(0, 0);
           _display.print(_adjustPuffThreshMenuText[0]);
-          _display.display();
+          flushDisplay();
           break;
         case 1:  // Decrease
           _puffPressThresh = getPuffPressureThreshold(false, false);
@@ -895,7 +983,7 @@ void LSScreen::selectMenuItem() {
           _adjustPuffThreshMenuText[0] = "Puff: " + String(_puffPressThresh) + " ";
           _display.setCursor(0, 0);
           _display.print(_adjustPuffThreshMenuText[0]);
-          _display.display();
+          flushDisplay();
           break;
         case 2:  // Back
           _currentMenu = SIP_PUFF_MENU;
@@ -1042,7 +1130,7 @@ void LSScreen::displayMenu() {
     modeMenuHighlight();
   }
 
-  _display.display();
+  flushDisplay();
 
   //_currentSelection = 0;
   displayCursor();
@@ -1082,7 +1170,7 @@ void LSScreen::displayCursor() {
     }
   }
 
-  _display.display();
+  flushDisplay();
 
   _selectedLine = _cursorStart + _currentSelection;
   _selectedText = _currentMenuText[_selectedLine];
@@ -1127,7 +1215,7 @@ void LSScreen::scrollLongText() {
 
     _display.setCursor(0, _cursorPos * CHAR_PIXEL_HEIGHT_S2);
     _display.print(">");
-    _display.display();
+    flushDisplay();
 
     _scrollPos = _scrollPos - scrollPixelsPerLoop;
     
@@ -1273,7 +1361,7 @@ void LSScreen::modeMenuHighlight() {
       break;
   }
 
-  _display.display();
+  flushDisplay();
   _display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);  // Reset text colour to white on black
 }
 
@@ -1312,7 +1400,7 @@ void LSScreen::changeMode() {
   _display.println("mode.");
   _display.println("Release");
   _display.println("joystick.");
-  _display.display();
+  flushDisplay();
   scheduleTransition(2000, screenChangeModeTransitionDone);  // was delay(2000) — finishChangeMode runs on the timer
 }
 
@@ -1404,7 +1492,7 @@ void LSScreen::centerResetPage(void) {
   _display.println("not move");
   _display.println("joystick");
 
-  _display.display();
+  flushDisplay();
 
   // Perform cursor center
   showCenterResetComplete = true;
@@ -1429,7 +1517,7 @@ void LSScreen::centerResetCompletePage(void) {
   _display.println("reset");
   _display.println("complete");
 
-  _display.display();
+  flushDisplay();
 
   scheduleTransition(2000, screenReturnToMenuTransitionDone);  // was delay(2000) — returnToMenu runs on the timer
 }
@@ -1450,7 +1538,7 @@ void LSScreen::fullCalibrationPage(void) {
   _display.println("on screen");
   _display.println("prompts");
 
-  _display.display();
+  flushDisplay();
 
   setJoystickCalibration(false, false);
 }
@@ -1499,7 +1587,7 @@ void LSScreen::fullCalibrationPrompt(int stepNum) {
     case 6:  // Complete
       _display.println("Joystick");
       _display.println("calibrated");
-      _display.display();
+      flushDisplay();
 
       scheduleTransition(1500, screenReturnToMenuTransitionDone);  // was delay(1500) — returnToMenu runs on the timer
       break;
@@ -1510,7 +1598,7 @@ void LSScreen::fullCalibrationPrompt(int stepNum) {
       _display.println("to default.");
   }
 
-  _display.display();
+  flushDisplay();
 }
 
 // ----- MORE SETTINGS MENUS ----- //
@@ -1651,7 +1739,7 @@ void LSScreen::fullCalibrationConfirmPage(void) {
   _display.println("full calib.");
   _display.println("may cause");
   _display.println("drift.");
-  _display.display();
+  flushDisplay();
   scheduleTransition(3000, screenFullCalibConfirmTransitionDone);  // was delay(3000) — the confirm menu registers on the timer
 }
 
@@ -1717,7 +1805,7 @@ void LSScreen::factoryResetConfirm2Page(void) {
   _display.println("erase all");
   _display.println("custom");
   _display.println("settings");
-  _display.display();
+  flushDisplay();
   scheduleTransition(2000, screenFactoryResetConfirm2TransitionDone);  // was delay(2000) — the confirm menu registers on the timer
 }
 
@@ -1782,7 +1870,7 @@ void LSScreen::testPage(unsigned int usbConnectDelay) {
   _display.println(_testScreenAttempt);
 
   _display.println(usbConnectDelay);
-  _display.display();
+  flushDisplay();
 }
 
 //*********************************//
@@ -1802,7 +1890,7 @@ void LSScreen::noUsbPage(void) {
   _display.println("Use menu");
   _display.println("to change");
   _display.println("modes.");
-  _display.display();
+  flushDisplay();
 }
 
 //*********************************//
@@ -1848,7 +1936,7 @@ void LSScreen::hardwareErrorPage() {
   sprintf(buffer, "ERROR-%03u", _hardwareErrorCode);
   _safeModeReasonText = String(buffer);
 
-  _display.display();
+  flushDisplay();
     
 }
 
@@ -1871,7 +1959,7 @@ void LSScreen::errorPageI2C() {
   _display.println("detected.");
   //_display.println("Contact Maker.");
   
-  _display.display();
+  flushDisplay();
 
   _screenStateTimerId = _screenStateTimer.setTimeout(CONF_SAFEMODE_MENU_TIMEOUT, &LSScreen::safeModeMenu, this);
 }
@@ -1897,7 +1985,7 @@ void LSScreen::errorPageCable() {
   _display.println("detected.");
   _display.println("Try cable.");
 
-  _display.display();
+  flushDisplay();
 
   _screenStateTimerId = _screenStateTimer.setTimeout(2*CONF_SAFEMODE_MENU_TIMEOUT, &LSScreen::safeModeMenu, this);
 
@@ -1921,7 +2009,7 @@ void LSScreen::warningUSBDebugOn(void) {
   _display.println("USB_DEBUG=1");
   _display.println("Set to 0");
   _display.println("for user.");
-  _display.display();
+  flushDisplay();
 
   _screenStateTimerId = _screenStateTimer.setTimeout(CONF_SPLASH_SCREEN_DURATION, clearSplashScreen);
 }
@@ -1944,7 +2032,7 @@ void LSScreen::restartPage() {
   _display.println("RESTARTING...");
   _display.println("");
 
-  _display.display();
+  flushDisplay();
 
   const int RESTART_TIMEOUT = 3000;
   _screenStateTimerId = _screenStateTimer.setTimeout(RESTART_TIMEOUT, clearSplashScreen);
@@ -1968,7 +2056,7 @@ void LSScreen::factoryResetPage() {
   _display.println("RESET...");
   _display.println("");
 
-  _display.display();
+  flushDisplay();
   const int RESET_TIMEOUT = 3000;
   _screenStateTimerId = _screenStateTimer.setTimeout(RESET_TIMEOUT, clearSplashScreen);
 }
@@ -1997,7 +2085,7 @@ void LSScreen::connectionTimingPage(unsigned long before, unsigned long after) {
   _display.setTextSize(2);
   _display.println(after);
 
-  _display.display();
+  flushDisplay();
 }
 
 
@@ -2050,7 +2138,7 @@ void LSScreen::safeModePage(int safeModeReason) {
   }
   _display.println("");
 
-  _display.display();
+  flushDisplay();
 }
 
 //*********************************//
@@ -2095,7 +2183,7 @@ void LSScreen::print4LineString(String s1, String s2, String s3, String s4) {
   _display.println(s2);
   _display.println(s3);
   _display.println(s4);
-  _display.display();
+  flushDisplay();
 }
 
 //*********************************//

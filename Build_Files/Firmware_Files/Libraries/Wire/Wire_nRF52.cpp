@@ -55,6 +55,26 @@ static volatile uint32_t* pincfg_reg(uint32_t pin)
 // duration of a full 100 kHz transaction, so healthy buses are unaffected.
 const uint32_t WIRE_TRANSACTION_TIMEOUT_MS = 50;
 
+// Bus-held reporting (LipSync patch): a transaction that hits the bounded
+// timeout + recovery path stamps the time; busHealthy() stays false for
+// WIRE_BUS_HOLD_DEBOUNCE_MS afterwards. Consumers that back off while the bus
+// is held naturally re-probe at this cadence (their first skipped-period
+// transaction after the debounce either succeeds — bus healthy again — or
+// times out and re-stamps, self-limiting the cost to ~one recovery per window).
+const uint32_t WIRE_BUS_HOLD_DEBOUNCE_MS = 1000;
+static volatile unsigned long wireLastRecoveryMs = 0;
+static volatile uint32_t wireRecoveryCount = 0;
+
+bool TwoWire::busHealthy()
+{
+  return wireRecoveryCount == 0 || (millis() - wireLastRecoveryMs) > WIRE_BUS_HOLD_DEBOUNCE_MS;
+}
+
+uint32_t TwoWire::recoveryCount()
+{
+  return wireRecoveryCount;
+}
+
 // Waits for *eventReg (or EVENTS_ERROR, which callers handle). Returns true
 // when the event fired; false on timeout.
 static bool wireWaitEvent(NRF_TWIM_Type * twim, volatile uint32_t * eventReg, uint32_t timeoutMs)
@@ -74,6 +94,8 @@ static bool wireWaitEvent(NRF_TWIM_Type * twim, volatile uint32_t * eventReg, ui
 // re-enable for the next transaction.
 static void wireRecoverBus(NRF_TWIM_Type * twim, uint32_t pinSDA, uint32_t pinSCL)
 {
+  wireLastRecoveryMs = millis();  // Stamp the bus-held window (see busHealthy())
+  wireRecoveryCount++;
   // A clean stop first — on a wedged bus even STOP may never complete, so bound it too
   twim->TASKS_STOP = 0x1UL;
   uint32_t start = millis();

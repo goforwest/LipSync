@@ -27,9 +27,14 @@ in older firmware.
 - The failing call then reports an error (`requestFrom` returns 0 bytes,
   `endTransmission` returns 4), which the firmware's sensor-health layer
   turns into "sensor unhealthy" — a slow re-probe cycle instead of a hang.
+- `TwoWire::busHealthy()` reports false for a 1 s window after any recovery,
+  letting firmware loops (joystick ticks, screen draws, the USB-retry page)
+  back off all I2C while the bus is held — a held bus then costs one bounded
+  recovery per window instead of a constant timeout tax.
 
-`Wire.h` is byte-identical to the core's copy; only `Wire_nRF52.cpp`
-carries the patch, marked with `LipSync patch` comment blocks.
+`Wire.h` differs from the core's copy only by the `busHealthy()` declaration
+and its comment; everything else lives in `Wire_nRF52.cpp`, marked with
+`LipSync patch` comment blocks.
 
 ## How the build uses it
 

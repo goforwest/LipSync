@@ -471,7 +471,11 @@ void errorScreen(void) {
 
   if (!screen.isMenuActive()) {
     if (g_errorCode == CONF_ERROR_USB) {
-      screen.noUsbPage();
+      // Only draw when there is a display on an answerable bus — a draw against
+      // held I2C hardware costs seconds of bounded timeouts (see usbCheckConnection)
+      if (g_displayConnected && Wire.busHealthy()) {
+        screen.noUsbPage();
+      }
     }
   }
 }
@@ -1000,9 +1004,7 @@ void usbCheckConnection(void) {
       gamepad.begin();
     }
 
-    if (!screen.isMenuActive()) {
-      screen.noUsbPage();  // Display USB error page
-    }
+    screen.drawUsbErrorPageOnce();  // Draw at most once per episode (LSScreen gates display/bus health)
 
     // increase variable g_usbConnectDelay
     if (g_usbConnectDelay < 120000) {
@@ -1014,19 +1016,16 @@ void usbCheckConnection(void) {
   } else if (((g_operatingMode == CONF_OPERATING_MODE_MOUSE) && (g_comMode == CONF_COM_MODE_USB) && (!usbmouse.isReady()))  // in usb mouse mode and usb mouse is not ready
       || ((g_operatingMode == CONF_OPERATING_MODE_GAMEPAD) && !gamepad.isReady())){                                         // in usb gamepad mode and usb gamepad is not ready
 
-    if (!screen.isMenuActive()) {
-      screen.noUsbPage();
-    }
+    screen.drawUsbErrorPageOnce();
 
     usbConnectTimerId[0] = usbConnectTimer.setTimeout(g_usbConnectDelay, usbCheckConnection);  // Keep retrying connection until USB connection is made
 
 
   } else if (usbmouse.timedOut) {
-    if (!screen.isMenuActive()) {
-      screen.noUsbPage();
-    }
+    screen.drawUsbErrorPageOnce();
     usbConnectTimerId[0] = usbConnectTimer.setTimeout(g_usbConnectDelay, usbCheckConnection);  // Keep retrying connection until USB connection is made
   } else {
+    screen.resetUsbErrorPage();  // Connection healthy again — allow the next episode to draw
     readyToUse();  // TODO
   }
 }
@@ -2543,6 +2542,12 @@ void setLedDefault() {
 void btFeedbackLoop() {
 
   //if (USB_DEBUG) { Serial.println("USBDEBUG: btFeedbackLoop"); }
+
+  // The BLE connection poll only matters in Bluetooth mode. In USB mode the
+  // call is wasted — and on safe-mode boots the Bluefruit stack may never
+  // have been initialized, where btmouse.isConnected() blocks the SoftDevice
+  // for a full second (observed live as a flat 1 s main-loop tax).
+  if (g_comMode != CONF_COM_MODE_BLE) return;
 
   // Get the current bluetooth connection state
   bool tempIsConnected = btmouse.isConnected();

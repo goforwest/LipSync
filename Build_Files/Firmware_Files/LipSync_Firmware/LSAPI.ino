@@ -1208,8 +1208,14 @@ void setJoystickOuterDeadzone(bool responseEnabled, bool apiEnabled, String opti
 // Return     : void
 //*********************************//
 void getJoystickValue(bool responseEnabled, bool apiEnabled) {
-  js.update();      // Request new values from joystick class
-  
+  // No synchronous sensor read here: the joystick poll tick keeps the buffers
+  // fresh, and an on-demand js.update() used to run a full TLV493D I2C
+  // transaction sequence inside the serial command path — on a flaky shared
+  // bus that could block for seconds and trip the watchdog (observed live:
+  // every JV exchange against a crawling bus silenced then reset the device).
+  // The buffers return the last good reading, which is exactly what this
+  // endpoint should report.
+   
   const int outputArraySize = 6; 
   float tempJoystickArray[outputArraySize];
   
