@@ -120,6 +120,13 @@ bool g_calibrationError = false;     // Global variable for error in full calibr
 
 bool settingsEnabled = false;  // Serial input settings command mode enabled or disabled
 
+// Input restriction state (roadmap item 11) — loaded from the stored settings
+// by initRestrictions(); the serial API setters keep them live.
+bool g_sapDisabled = false;        // SD — sip & puff inputs cannot fire actions
+bool g_menuButtonsOnly = false;    // MA — only the hub buttons may control the menu
+bool g_modeLocked = false;         // LK — inputs cannot change the operating mode
+bool g_freezeCursorDuringSap = false;  // CF — cursor output freezes while a sip/puff is in progress
+
 // Timing Variables for Debugging
 unsigned long beginMillis;
 unsigned long beforeComOpMillis;
@@ -167,6 +174,8 @@ void setup() {
   initBuzzer();  // Initialize Buzzer
 
   initInput();  // Initialize input buttons and input switches
+
+  initRestrictions();  // Load the input restriction settings (roadmap item 11) before any input can fire
 
 
   ledWaitFeedback();  // Turn on all LEDS
@@ -360,6 +369,11 @@ void initGlobals() {
   g_watchdogBootCount = 0;
   g_safeModeEnabled = false;
   g_safeModeReason = 0;
+
+  g_sapDisabled = false;
+  g_menuButtonsOnly = false;
+  g_modeLocked = false;
+  g_freezeCursorDuringSap = false;
 
 
 }
@@ -898,6 +912,21 @@ void buzzerSoundOff() {
   buzzer.disable();
 }
 
+//***BUZZER ERROR CUE FUNCTION***//
+// Function   : buzzerErrorCue
+//
+// Description: One short queued error tone for refused interactions (e.g.
+//              selecting a mode while the mode lock is on, roadmap item 11)
+//              — "that input is locked", not "the device is broken".
+//
+// Parameters : void
+//
+// Return     : void
+//****************************************//
+void buzzerErrorCue() {
+  buzzer.playErrorSound();
+}
+
 
 //*********************************//
 // Acceleration Functions
@@ -1146,8 +1175,68 @@ void initInput() {
 
   // Hub External Switch Inputs
   is.begin();                                                                      // Begin input switches
-  switchActionSize = sizeof(switchActionProperty) / sizeof(inputActionStruct);     // Size of total available input switch actions
+  switchActionSize = sizeof(switchActionProperty) / sizeof(inputActionStruct);     // Size of total available switch input actions
   switchActionMaxTime = getActionMaxTime(switchActionSize, switchActionProperty);  // Maximum switch action end time
+}
+
+//***INITIALIZE RESTRICTIONS FUNCTION***//
+// Function   : initRestrictions
+//
+// Description: Loads the input restriction settings (roadmap item 11) from
+//              flash memory into the live gates. Runs before any input can
+//              fire, so a locked-down configuration is in force from the
+//              first tick of the input timers.
+//
+// Parameters : void
+//
+// Return     : void
+//****************************************//
+void initRestrictions() {
+  if (USB_DEBUG) { Serial.println("USBDEBUG: initRestrictions()"); }
+  getSapDisabled(false, false);
+  getMenuButtonsOnly(false, false);
+  getModeLocked(false, false);
+  getCursorHoldDuringSap(false, false);
+}
+
+//***APPLY INPUT RESTRICTIONS FUNCTION***//
+// Function   : applyInputRestrictions
+//
+// Description: The single seam where a resolved input action meets the
+//              restriction settings (roadmap item 11 — the 4.2.0
+//              sensor-health gating occupies the same place in spirit: a
+//              gate between "an input happened" and "the device acts").
+//              Gated actions become CONF_ACTION_NOTHING, which the caller
+//              already treats as "no feedback, no output" — a phantom or
+//              forbidden input produces nothing at all, not a half-action.
+//
+// Parameters : actionIndex : int : The resolved output action number
+//              inputClass : int : INPUT_CLASS_SAP / _BUTTON / _SWITCH
+//
+// Return     : int : The action to actually perform (CONF_ACTION_NOTHING when restricted)
+//****************************************//
+int applyInputRestrictions(int actionIndex, int inputClass) {
+  if (actionIndex == CONF_ACTION_NOTHING) return actionIndex;
+
+  // Mode lock: no input path may change the operating mode. The serial API
+  // stays open on purpose — a caregiver must be able to unlock or adjust the
+  // device through LipSync Connect even while the device user cannot.
+  if (g_modeLocked && actionIndex == CONF_ACTION_CHANGE_MODE) return CONF_ACTION_NOTHING;
+
+  // Menu restricted to hub buttons: sip & puff and external switches can
+  // neither open/close the menu nor navigate it. Only the hub buttons
+  // (inputClass BUTTON) keep menu control.
+  if (g_menuButtonsOnly && inputClass != INPUT_CLASS_BUTTON) {
+    switch (actionIndex) {
+      case CONF_ACTION_START_MENU:
+      case CONF_ACTION_STOP_MENU:
+      case CONF_ACTION_NEXT_MENU_ITEM:
+      case CONF_ACTION_SELECT_MENU_ITEM:
+        return CONF_ACTION_NOTHING;
+    }
+  }
+
+  return actionIndex;
 }
 
 //***INPUT LOOP FUNCTION***//
@@ -1171,8 +1260,8 @@ void inputLoop() {
   switchState = is.getInputState();
 
   // Evaluate Output Actions
-  evaluateOutputAction(buttonState, buttonActionMaxTime, buttonActionSize, buttonActionProperty);
-  evaluateOutputAction(switchState, switchActionMaxTime, switchActionSize, switchActionProperty);
+  evaluateOutputAction(buttonState, buttonActionMaxTime, buttonActionSize, buttonActionProperty, INPUT_CLASS_BUTTON);
+  evaluateOutputAction(switchState, switchActionMaxTime, switchActionSize, switchActionProperty, INPUT_CLASS_SWITCH);
 
 }
 
@@ -1238,8 +1327,9 @@ void pressureLoop() {
   // Get the last state change
   sapActionState = ps.getState();
 
-  // Output action logic
-  evaluateOutputAction(sapActionState, sapActionMaxTime, sapActionSize, sapActionProperty);
+  // Output action logic — INPUT_CLASS_SAP lets the restriction gates tell a
+  // mouthpiece input from a button/switch one (roadmap item 11).
+  evaluateOutputAction(sapActionState, sapActionMaxTime, sapActionSize, sapActionProperty, INPUT_CLASS_SAP);
 }
 
 //***RELEASE OUTPUT FUNCTION***//
@@ -1271,11 +1361,17 @@ void releaseOutputAction() {
 //              actionMaxEndTime : unsigned long : maximum end action time
 //              actionSize : int : size of available actions
 //              actionProperty : const inputActionStruct : array of all possible actions
+//              inputClass : int : INPUT_CLASS_SAP / _BUTTON / _SWITCH — which
+//                          physical input the state came from (restriction
+//                          gates, roadmap item 11)
 //
 // Return     : void
 //****************************************//
-void evaluateOutputAction(inputStateStruct actionState, unsigned long actionMaxEndTime, int actionSize, const inputActionStruct actionProperty[]) {
-  bool canEvaluateAction = true;
+void evaluateOutputAction(inputStateStruct actionState, unsigned long actionMaxEndTime, int actionSize, const inputActionStruct actionProperty[], int inputClass) {
+  // Sip & puff disabled (SD): no new sap action may fire. The hold-release
+  // and timer bookkeeping below still runs, so a drag/scroll engaged before
+  // the restriction was applied still ends cleanly instead of sticking.
+  bool canEvaluateAction = (inputClass != INPUT_CLASS_SAP || !g_sapDisabled);
 
   // Output action logic
   int tempActionIndex = 0;
@@ -1328,6 +1424,10 @@ void evaluateOutputAction(inputStateStruct actionState, unsigned long actionMaxE
         }
       }
 
+      // Restriction gates (roadmap item 11): a forbidden action resolves to
+      // NOTHING here — no LED feedback, no output, no trace of the input.
+      tempActionIndex = applyInputRestrictions(tempActionIndex, inputClass);
+
       // Set Led color to default
       //setLedDefault();
       // Set Led state
@@ -1374,6 +1474,10 @@ void evaluateOutputAction(inputStateStruct actionState, unsigned long actionMaxE
             break;
         }
       }
+
+      // Restriction gates (roadmap item 11): the started-phase LED cue is
+      // suppressed too — a forbidden input must not light anything up.
+      tempActionIndex = applyInputRestrictions(tempActionIndex, inputClass);
 
       // Set Led color to default
       //setLedDefault();
@@ -1963,11 +2067,18 @@ void joystickLoop() {
 
   pointIntType joyOutPoint = js.getXYOut();  // Read the filtered values
 
-  if (g_resetCenterComplete) {     // Don't output joystick movement until the center position has been reset
-    performJoystick(joyOutPoint);  // Perform joystick move action
+  // Cursor hold during sip & puff (CF, roadmap item 11 / upstream #44): the
+  // cursor freezes while a mouthpiece input is in progress, so deflecting
+  // the stick mid-sip cannot drag the pointer around. Only an ENABLED sip &
+  // puff freezes — with SD set there is no mouthpiece input at all, and a
+  // sip must not have any observable effect.
+  bool sapInProgress = !g_sapDisabled && g_freezeCursorDuringSap && (ps.getState().mainState != PRESS_SAP_MAIN_STATE_NONE);
+
+  if (g_resetCenterComplete && !sapInProgress) {  // Don't output joystick movement until the center position has been reset
+    performJoystick(joyOutPoint);                 // Perform joystick move action
   }
 
-  //if (USB_DEBUG) { Serial.println("USBDEBUG: End of joystickLoop");  }
+  //if (USB_DEBUG) { Serial.println("USBDEBUG: End of joystickLoop"); }
 }
 
 //***PERFORM JOYSTICK FUNCTION***//

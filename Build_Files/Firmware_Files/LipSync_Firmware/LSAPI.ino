@@ -68,6 +68,15 @@ _functionList setLightModeFunction =              {"LM", "1", "",  &setLightMode
 _functionList getLightBrightnessLevelFunction =   {"LL", "0", "0", &getLightBrightnessLevel};
 _functionList setLightBrightnessLevelFunction =   {"LL", "1", "",  &setLightBrightnessLevel};
 
+_functionList getSapDisabledFunction =             {"SD", "0", "0", &getSapDisabled};
+_functionList setSapDisabledFunction =             {"SD", "1", "",  &setSapDisabled};
+_functionList getMenuButtonsOnlyFunction =         {"MA", "0", "0", &getMenuButtonsOnly};
+_functionList setMenuButtonsOnlyFunction =         {"MA", "1", "",  &setMenuButtonsOnly};
+_functionList getModeLockedFunction =              {"LK", "0", "0", &getModeLocked};
+_functionList setModeLockedFunction =              {"LK", "1", "",  &setModeLocked};
+_functionList getCursorHoldFunction =              {"CF", "0", "0", &getCursorHoldDuringSap};
+_functionList setCursorHoldFunction =              {"CF", "1", "",  &setCursorHoldDuringSap};
+
 _functionList controlHubMenuFunction =            {"CH", "1", "",  &controlHubMenu};
 
 _functionList getDebugModeFunction =              {"DM", "0", "0", &getDebugMode};
@@ -118,6 +127,14 @@ _functionList apiFunction[] = { //Let compiler determine number of functions
   setLightModeFunction,
   getLightBrightnessLevelFunction,
   setLightBrightnessLevelFunction,
+  getSapDisabledFunction,
+  setSapDisabledFunction,
+  getMenuButtonsOnlyFunction,
+  setMenuButtonsOnlyFunction,
+  getModeLockedFunction,
+  setModeLockedFunction,
+  getCursorHoldFunction,
+  setCursorHoldFunction,
   controlHubMenuFunction,
   getDebugModeFunction,
   setDebugModeFunction,
@@ -2146,6 +2163,236 @@ void setLightBrightnessLevel(bool responseEnabled, bool apiEnabled, String optio
   setLightBrightnessLevel(responseEnabled, apiEnabled, optionalParameter.toInt());
 }
 
+//***INPUT RESTRICTION SETTINGS (roadmap item 11)***//
+// Four boolean settings, one coherent family (SD/MA/LK/CF), each exposed as
+// a get/set pair like every other setting. All four default to 0 — the
+// unrestricted legacy behavior — which is also what a settings file written
+// by older firmware reads for the missing keys, so an update can never
+// silently lock a device down. The getters also refresh the live gate
+// globals, so reading is always safe and keeps the gates honest.
+
+//***GET SAP DISABLED FUNCTION***//
+// Function   : getSapDisabled
+//
+// Description: Returns the sip & puff disable state (SD; upstream #21).
+//              1 = mouthpiece inputs cannot fire actions; the pressure
+//              state machine and its diagnostics keep running.
+//
+// Parameters :  responseEnabled : bool : The response for serial printing is enabled if it's set to true.
+//                                        The serial printing is ignored if it's set to false.
+//               apiEnabled : bool : The api response is sent if it's set to true.
+//                                   Manual response is sent if it's set to false.
+//
+// Return     : sapDisabled : int : 1 when sip & puff are disabled
+//*********************************//
+int getSapDisabled(bool responseEnabled, bool apiEnabled) {
+  String commandKey = "SD";
+  int tempSapDisabled = CONF_SAP_DISABLED_DEFAULT;
+  if (CONF_API_ENABLED) {
+    tempSapDisabled = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+    if ((tempSapDisabled != 0) && (tempSapDisabled != 1)) {
+      tempSapDisabled = CONF_SAP_DISABLED_DEFAULT;
+      mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempSapDisabled);
+    }
+  }
+  g_sapDisabled = (tempSapDisabled == 1);
+  printResponseInt(responseEnabled, apiEnabled, true, 0, "SD,0", true, tempSapDisabled);
+  return tempSapDisabled;
+}
+//***GET SAP DISABLED API FUNCTION***//
+void getSapDisabled(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 0) {
+    getSapDisabled(responseEnabled, apiEnabled);
+  }
+}
+
+//***SET SAP DISABLED FUNCTION***//
+// Function   : setSapDisabled
+//
+// Description: Sets the sip & puff disable state (SD; upstream #21).
+//
+// Parameters :  inputSapDisabled : int : 0 = sip & puff enabled (default), 1 = disabled
+//
+// Return     : void
+//*********************************//
+void setSapDisabled(bool responseEnabled, bool apiEnabled, int inputSapDisabled) {
+  String commandKey = "SD";
+  if (inputSapDisabled == 0 || inputSapDisabled == 1) {
+    mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputSapDisabled);
+    g_sapDisabled = (inputSapDisabled == 1);
+    printResponseInt(responseEnabled, apiEnabled, true, 0, "SD,1", true, inputSapDisabled);
+  } else {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "SD,1", true, inputSapDisabled);
+  }
+}
+//***SET SAP DISABLED API FUNCTION***//
+void setSapDisabled(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  setSapDisabled(responseEnabled, apiEnabled, optionalParameter.toInt());
+}
+
+//***GET MENU BUTTONS ONLY FUNCTION***//
+// Function   : getMenuButtonsOnly
+//
+// Description: Returns the menu-access restriction state (MA; upstream #77).
+//              1 = only the hub buttons may open/close/navigate the menu;
+//              sip & puff and external switches lose menu control.
+//
+// Return     : menuButtonsOnly : int : 1 when the menu is restricted to hub buttons
+//*********************************//
+int getMenuButtonsOnly(bool responseEnabled, bool apiEnabled) {
+  String commandKey = "MA";
+  int tempMenuButtonsOnly = CONF_MENU_BUTTONS_ONLY_DEFAULT;
+  if (CONF_API_ENABLED) {
+    tempMenuButtonsOnly = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+    if ((tempMenuButtonsOnly != 0) && (tempMenuButtonsOnly != 1)) {
+      tempMenuButtonsOnly = CONF_MENU_BUTTONS_ONLY_DEFAULT;
+      mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempMenuButtonsOnly);
+    }
+  }
+  g_menuButtonsOnly = (tempMenuButtonsOnly == 1);
+  printResponseInt(responseEnabled, apiEnabled, true, 0, "MA,0", true, tempMenuButtonsOnly);
+  return tempMenuButtonsOnly;
+}
+//***GET MENU BUTTONS ONLY API FUNCTION***//
+void getMenuButtonsOnly(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 0) {
+    getMenuButtonsOnly(responseEnabled, apiEnabled);
+  }
+}
+
+//***SET MENU BUTTONS ONLY FUNCTION***//
+// Function   : setMenuButtonsOnly
+//
+// Description: Sets the menu-access restriction state (MA; upstream #77).
+//
+// Parameters :  inputMenuButtonsOnly : int : 0 = all inputs may control the menu (default), 1 = hub buttons only
+//
+// Return     : void
+//*********************************//
+void setMenuButtonsOnly(bool responseEnabled, bool apiEnabled, int inputMenuButtonsOnly) {
+  String commandKey = "MA";
+  if (inputMenuButtonsOnly == 0 || inputMenuButtonsOnly == 1) {
+    mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputMenuButtonsOnly);
+    g_menuButtonsOnly = (inputMenuButtonsOnly == 1);
+    printResponseInt(responseEnabled, apiEnabled, true, 0, "MA,1", true, inputMenuButtonsOnly);
+  } else {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "MA,1", true, inputMenuButtonsOnly);
+  }
+}
+//***SET MENU BUTTONS ONLY API FUNCTION***//
+void setMenuButtonsOnly(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  setMenuButtonsOnly(responseEnabled, apiEnabled, optionalParameter.toInt());
+}
+
+//***GET MODE LOCKED FUNCTION***//
+// Function   : getModeLocked
+//
+// Description: Returns the operating-mode lock state (LK; upstream #68).
+//              1 = input paths cannot change the operating mode; the serial
+//              API stays open so a caregiver can still adjust the device.
+//
+// Return     : modeLocked : int : 1 when the operating mode is locked
+//*********************************//
+int getModeLocked(bool responseEnabled, bool apiEnabled) {
+  String commandKey = "LK";
+  int tempModeLocked = CONF_MODE_LOCK_DEFAULT;
+  if (CONF_API_ENABLED) {
+    tempModeLocked = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+    if ((tempModeLocked != 0) && (tempModeLocked != 1)) {
+      tempModeLocked = CONF_MODE_LOCK_DEFAULT;
+      mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempModeLocked);
+    }
+  }
+  g_modeLocked = (tempModeLocked == 1);
+  printResponseInt(responseEnabled, apiEnabled, true, 0, "LK,0", true, tempModeLocked);
+  return tempModeLocked;
+}
+//***GET MODE LOCKED API FUNCTION***//
+void getModeLocked(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 0) {
+    getModeLocked(responseEnabled, apiEnabled);
+  }
+}
+
+//***SET MODE LOCKED FUNCTION***//
+// Function   : setModeLocked
+//
+// Description: Sets the operating-mode lock state (LK; upstream #68).
+//
+// Parameters :  inputModeLocked : int : 0 = inputs may change the mode (default), 1 = locked
+//
+// Return     : void
+//*********************************//
+void setModeLocked(bool responseEnabled, bool apiEnabled, int inputModeLocked) {
+  String commandKey = "LK";
+  if (inputModeLocked == 0 || inputModeLocked == 1) {
+    mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputModeLocked);
+    g_modeLocked = (inputModeLocked == 1);
+    printResponseInt(responseEnabled, apiEnabled, true, 0, "LK,1", true, inputModeLocked);
+  } else {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "LK,1", true, inputModeLocked);
+  }
+}
+//***SET MODE LOCKED API FUNCTION***//
+void setModeLocked(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  setModeLocked(responseEnabled, apiEnabled, optionalParameter.toInt());
+}
+
+//***GET CURSOR HOLD FUNCTION***//
+// Function   : getCursorHoldDuringSap
+//
+// Description: Returns the cursor-hold state (CF; upstream #44).
+//              1 = cursor movement freezes while a sip or puff is in
+//              progress, so deflecting the stick mid-input cannot drag the
+//              pointer around.
+//
+// Return     : cursorHold : int : 1 when the cursor freezes during sip & puff
+//*********************************//
+int getCursorHoldDuringSap(bool responseEnabled, bool apiEnabled) {
+  String commandKey = "CF";
+  int tempCursorHold = CONF_CURSOR_HOLD_DEFAULT;
+  if (CONF_API_ENABLED) {
+    tempCursorHold = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+    if ((tempCursorHold != 0) && (tempCursorHold != 1)) {
+      tempCursorHold = CONF_CURSOR_HOLD_DEFAULT;
+      mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempCursorHold);
+    }
+  }
+  g_freezeCursorDuringSap = (tempCursorHold == 1);
+  printResponseInt(responseEnabled, apiEnabled, true, 0, "CF,0", true, tempCursorHold);
+  return tempCursorHold;
+}
+//***GET CURSOR HOLD API FUNCTION***//
+void getCursorHoldDuringSap(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 0) {
+    getCursorHoldDuringSap(responseEnabled, apiEnabled);
+  }
+}
+
+//***SET CURSOR HOLD FUNCTION***//
+// Function   : setCursorHoldDuringSap
+//
+// Description: Sets the cursor-hold state (CF; upstream #44).
+//
+// Parameters :  inputCursorHold : int : 0 = cursor moves during sip & puff (default), 1 = frozen during input
+//
+// Return     : void
+//*********************************//
+void setCursorHoldDuringSap(bool responseEnabled, bool apiEnabled, int inputCursorHold) {
+  String commandKey = "CF";
+  if (inputCursorHold == 0 || inputCursorHold == 1) {
+    mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputCursorHold);
+    g_freezeCursorDuringSap = (inputCursorHold == 1);
+    printResponseInt(responseEnabled, apiEnabled, true, 0, "CF,1", true, inputCursorHold);
+  } else {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "CF,1", true, inputCursorHold);
+  }
+}
+//***SET CURSOR HOLD API FUNCTION***//
+void setCursorHoldDuringSap(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  setCursorHoldDuringSap(responseEnabled, apiEnabled, optionalParameter.toInt());
+}
+
 // *********************************************************************************
 
 //***OPEN HUB MENU FUNCTION***//
@@ -2348,6 +2595,10 @@ void exportSettings(bool responseEnabled, bool apiEnabled) {
   getLightMode(responseEnabled, apiEnabled);
   getLightBrightnessLevel(responseEnabled, apiEnabled);
   getDebugMode(responseEnabled, apiEnabled);
+  getSapDisabled(responseEnabled, apiEnabled);
+  getMenuButtonsOnly(responseEnabled, apiEnabled);
+  getModeLocked(responseEnabled, apiEnabled);
+  getCursorHoldDuringSap(responseEnabled, apiEnabled);
 
   printResponseString(responseEnabled, apiEnabled, true, 0, "EX,0", true, "END");
 }
@@ -2513,6 +2764,10 @@ void doFactoryReset(bool responseEnabled, bool apiEnabled) {
   setScrollLevel(false, false, CONF_SCROLL_LEVEL_DEFAULT);
   setLightBrightnessLevel(false, false, CONF_LED_BRIGHTNESS_LEVEL_DEFAULT);
   setJoystickAcceleration(false, false, CONF_JOY_ACCELERATION_LEVEL_DEFAULT);
+  setSapDisabled(false, false, CONF_SAP_DISABLED_DEFAULT);          // Restrictions reset to the
+  setMenuButtonsOnly(false, false, CONF_MENU_BUTTONS_ONLY_DEFAULT);  // unrestricted defaults —
+  setModeLocked(false, false, CONF_MODE_LOCK_DEFAULT);              // a factory reset can never
+  setCursorHoldDuringSap(false, false, CONF_CURSOR_HOLD_DEFAULT);   // lock a device out
   printResponseInt(responseEnabled, apiEnabled, true, 0, "FR,1", true, 1);
 
   // Clear all LEDs to indicate factory reset process is finished 

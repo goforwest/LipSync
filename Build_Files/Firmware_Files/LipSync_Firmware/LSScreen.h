@@ -60,6 +60,7 @@
 #define FACTORY_RESET_CONFIRM2_PAGE 571
 #define INFO_MENU 58
 #define ACCEL_MENU 59
+#define RESTRICTIONS_MENU 60
 
 #define SCROLL_DELAY_MILLIS 100 // [ms] This controls the scroll speed of long menu items //TODO 2025-Feb-28 Make this user adjustable
 
@@ -83,6 +84,7 @@ extern bool g_joystickSensorConnected;            // Joystick sensor connection 
 extern bool g_mouthpiecePressureSensorConnected;  // Mouthpiece pressure sensor connection state
 extern bool g_ambientPressureSensorConnected;     // Ambient pressure sensor connection state
 extern int g_safeModeReason;                      // Reason safe mode is triggered.
+extern bool g_modeLocked;                         // Operating-mode lock (roadmap item 11, LK setting)
 extern String g_deviceUID;                        // Unique Device ID
 
 class LSScreen {
@@ -237,6 +239,7 @@ private:
   void adjustSipThreshMenu();
   void adjustPuffThreshMenu();
   void accelMenu();
+  void restrictionsMenu();
   void restartConfirmPage();
   void factoryResetConfirm1Page();
   void factoryResetConfirm2Page();
@@ -251,7 +254,7 @@ private:
   String _modeMenuText[4] = { "MOUSE USB", "MOUSE BT", "GAMEPAD ", "... Back" };
   String _modeConfirmText[4] = { "Change", "mode?", "Confirm", "... Back" };
   String _cursorSpMenuText[4] = { "Speed: ", "Increase", "Decrease", "... Back" };
-  String _moreMenuText[10] = { "Sound",  "Light Brightness", "Scroll Speed",   "Sip & Puff",  "Full Calibration",   "Restart LipSync",  "Factory Reset",  "Info", "Acceleration", "... Back",  };
+  String _moreMenuText[11] = { "Sound",  "Light Brightness", "Scroll Speed",   "Sip & Puff",  "Full Calibration",   "Restart LipSync",  "Factory Reset",  "Info", "Acceleration", "Restrictions", "... Back",  };
   String _soundMenuText[4] = { "Sound:", "<>", "Turn <>", "... Back" };
   String _lightBrightMenuText[4] = { "Lights: ", "Increase", "Decrease", "... Back" };
   String _scrollSpMenuText[4] = { "Speed: ", "Increase", "Decrease", "... Back" };
@@ -259,6 +262,9 @@ private:
   String _sipPuffThreshMenuText[4] = { "Sip Threshold", "Puff Threshold", "... Back" };
   String _adjustSipThreshMenuText[4] = { "Sip: ", "Increase", "Decrease", "... Back" };
   String _adjustPuffThreshMenuText[4] = { "Puff: ", "Increase", "Decrease", "... Back" };
+  // Input restrictions (roadmap item 11): one line per toggle, state shown
+  // inline; selecting a line flips that restriction.
+  String _restrictionsMenuText[5] = { "Sip&Puff: On", "Menu: All", "Mode lock: Off", "Cursor hold: Off", "... Back" };
   String _restartConfirmText[4] = { "Restart", "LipSync?", "Confirm", "... Back" };
   String _factoryResetConfirm1Text[4] = { "Reset to", "defaults?", "Confirm", "... Back" };
   String _factoryResetConfirm2Text[4] = { "Are you", "sure?", "Confirm", "... Back" };
@@ -272,7 +278,7 @@ private:
   const int _calibMenuLen = 2;
   const int _modeMenuLen = 4;
   const int _cursorSpMenuLen = 3;
-  const int _moreMenuLen = 10;
+  const int _moreMenuLen = 11;
   const int _soundMenuLen = 2;
   const int _lightBrightMenuLen = 3;
   const int _scrollSpMenuLen = 3;
@@ -280,6 +286,7 @@ private:
   const int _sipPuffThreshMenuLen = 3;
   const int _adjustSipThreshMenuLen = 3;
   const int _adjustPuffThreshMenuLen = 3;
+  const int _restrictionsMenuLen = 5;
   const int _restartConfirmLen = 2;
   const int _factoryResetConfirm1Len = 2;
   const int _factoryResetConfirm2Len = 2;
@@ -803,6 +810,14 @@ void LSScreen::selectMenuItem() {
       }
       break;
     case MODE_MENU:
+      // Operating-mode lock (roadmap item 11, upstream #68): a locked device
+      // refuses mode changes from its own menu — one short error cue, no
+      // confirm page. The serial API (and so LipSync Connect) can still
+      // change the mode deliberately.
+      if (g_modeLocked) {
+        buzzerErrorCue();
+        break;
+      }
       if (_currentSelection < (_modeMenuLen - 1)) {
         // Confirm mode change
         switch (_currentSelection + 1) {
@@ -890,7 +905,10 @@ void LSScreen::selectMenuItem() {
         case 8: // Acceleration (roadmap item 9, upstream #86)
           accelMenu();
           break;
-        case 9: // Back
+        case 9: // Restrictions (roadmap item 11)
+          restrictionsMenu();
+          break;
+        case 10: // Back
           mainMenu();
           break;
       }
@@ -1019,6 +1037,43 @@ void LSScreen::selectMenuItem() {
           break;
         }
         case 2:  // Back
+          _currentMenu = MORE_MENU;
+          moreMenu();
+          break;
+      }
+      break;
+
+    case RESTRICTIONS_MENU:
+      // Input restrictions (roadmap item 11): each line toggles one
+      // restriction and re-renders its state label. The re-read keeps the
+      // label truthful even when the setter clamps or the stored value
+      // changed underneath us.
+      switch (_currentSelection) {
+        case 0: {  // Sip & puff enable
+          int sapDisabled = getSapDisabled(false, false);
+          setSapDisabled(true, false, sapDisabled == 1 ? 0 : 1);
+          restrictionsMenu();
+          break;
+        }
+        case 1: {  // Menu access: all inputs / hub buttons only
+          int buttonsOnly = getMenuButtonsOnly(false, false);
+          setMenuButtonsOnly(true, false, buttonsOnly == 1 ? 0 : 1);
+          restrictionsMenu();
+          break;
+        }
+        case 2: {  // Operating-mode lock
+          int modeLocked = getModeLocked(false, false);
+          setModeLocked(true, false, modeLocked == 1 ? 0 : 1);
+          restrictionsMenu();
+          break;
+        }
+        case 3: {  // Cursor hold during sip & puff
+          int cursorHold = getCursorHoldDuringSap(false, false);
+          setCursorHoldDuringSap(true, false, cursorHold == 1 ? 0 : 1);
+          restrictionsMenu();
+          break;
+        }
+        case 4:  // Back
           _currentMenu = MORE_MENU;
           moreMenu();
           break;
@@ -1566,6 +1621,34 @@ void LSScreen::accelMenu(void) {
   _currentSelection = 0;
 
   displayMenu();
+}
+
+//*********************************//
+// Function   : restrictionsMenu
+//
+// Description: Format and display the input restrictions menu (roadmap
+//              item 11). One line per restriction, state shown inline —
+//              the line both reads and toggles.
+//
+// Arguments :  void
+//
+// Return     : void
+//*********************************//
+void LSScreen::restrictionsMenu(void) {
+  _currentMenu = RESTRICTIONS_MENU;
+
+  _restrictionsMenuText[0] = String("Sip&Puff: ") + ((getSapDisabled(false, false) == 1) ? "Off" : "On");
+  _restrictionsMenuText[1] = String("Menu: ") + ((getMenuButtonsOnly(false, false) == 1) ? "Buttons" : "All");
+  _restrictionsMenuText[2] = String("Mode lock: ") + ((getModeLocked(false, false) == 1) ? "On" : "Off");
+  _restrictionsMenuText[3] = String("Cursor hold: ") + ((getCursorHoldDuringSap(false, false) == 1) ? "On" : "Off");
+
+  _currentMenuLength = _restrictionsMenuLen;
+  _currentMenuText = _restrictionsMenuText;
+  _cursorStart = 0;
+  _currentSelection = 0;
+  _countMenuScroll = 0;
+
+  displayMenu();  //  Print items in current menu
 }
 
 //*********************************//

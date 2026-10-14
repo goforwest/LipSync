@@ -119,6 +119,26 @@ int getLightBrightnessLevel(bool responseEnabled, bool apiEnabled);
 void setLightBrightnessLevel(bool responseEnabled, bool apiEnabled, int inputLightLevel);
 void setLightBrightnessLevel(bool responseEnabled, bool apiEnabled, String optionalParameter);
 
+// Input restrictions (roadmap item 11): four boolean settings, all defaulting
+// to the unrestricted legacy behavior. The getters refresh the live gate
+// globals; the gates live in the input evaluation path.
+int getSapDisabled(bool responseEnabled, bool apiEnabled);
+void getSapDisabled(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void setSapDisabled(bool responseEnabled, bool apiEnabled, int inputSapDisabled);
+void setSapDisabled(bool responseEnabled, bool apiEnabled, String optionalParameter);
+int getMenuButtonsOnly(bool responseEnabled, bool apiEnabled);
+void getMenuButtonsOnly(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void setMenuButtonsOnly(bool responseEnabled, bool apiEnabled, int inputMenuButtonsOnly);
+void setMenuButtonsOnly(bool responseEnabled, bool apiEnabled, String optionalParameter);
+int getModeLocked(bool responseEnabled, bool apiEnabled);
+void getModeLocked(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void setModeLocked(bool responseEnabled, bool apiEnabled, int inputModeLocked);
+void setModeLocked(bool responseEnabled, bool apiEnabled, String optionalParameter);
+int getCursorHoldDuringSap(bool responseEnabled, bool apiEnabled);
+void getCursorHoldDuringSap(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void setCursorHoldDuringSap(bool responseEnabled, bool apiEnabled, int inputCursorHold);
+void setCursorHoldDuringSap(bool responseEnabled, bool apiEnabled, String optionalParameter);
+
 // Hub menu, diagnostics and device actions
 void controlHubMenu(bool responseEnabled, bool apiEnabled, int inputMenuControl);
 void controlHubMenu(bool responseEnabled, bool apiEnabled, String optionalParameter);
@@ -152,6 +172,13 @@ void errorScreen();
 // Buzzer mode helpers called by the Hub menu (LSScreen.h)
 void buzzerSoundOn();
 void buzzerSoundOff();
+void buzzerErrorCue();
+
+// Input restriction machinery (roadmap item 11): boot-time load of the four
+// restriction settings, and the single gate every resolved input action passes
+// through (inputClass is INPUT_CLASS_SAP/_BUTTON/_SWITCH from LSConfig.h).
+void initRestrictions();
+int applyInputRestrictions(int actionIndex, int inputClass);
 
 // Screen page-transition continuations passed to LSScreen::scheduleTransition()
 void clearSplashScreen();

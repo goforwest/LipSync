@@ -29,8 +29,8 @@
 #define CONF_LIPSYNC_MODEL 1                // 1: Lipsync w/ Hub
 
 #define CONF_LIPSYNC_VERSION_MAJOR  4
-#define CONF_LIPSYNC_VERSION_MINOR  3
-#define CONF_LIPSYNC_VERSION_REV  0
+#define CONF_LIPSYNC_VERSION_MINOR  4
+#define CONF_LIPSYNC_VERSION_REV    0
 
 const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + "." + String(CONF_LIPSYNC_VERSION_MINOR) + "." + String(CONF_LIPSYNC_VERSION_REV);
 
@@ -157,9 +157,22 @@ const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + 
 #define CONF_ACTION_FACTORY_RESET 24       // Factory Reset
 
 
-// Flash Memory settings - Don't change  
+// Flash Memory settings - Don't change
 #define CONF_SETTINGS_FILE    "/settings.txt"
-#define CONF_SETTINGS_JSON    "{\"MN\":0,\"VN1\":4,\"VN2\":1,\"VN3\":0,\"ID\":0,\"OM\":1,\"CM\":1,\"SS\":5,\"SL\":5,\"ST\":3.0,\"PT\":3.0,\"AV\":0,\"IZ\":0.07,\"OZ\":0.95,\"CA0\":[0.0,0.0],\"CA1\":[-13.0,13.0],\"CA2\":[13.0,13.0],\"CA3\":[13.0,-13.0],\"CA4\":[-13.0,-13.0],\"SM\":1,\"LM\":1,\"LL\":5,\"DM\":0}"
+#define CONF_SETTINGS_JSON    "{\"MN\":0,\"VN1\":4,\"VN2\":1,\"VN3\":0,\"ID\":0,\"OM\":1,\"CM\":1,\"SS\":5,\"SL\":5,\"ST\":3.0,\"PT\":3.0,\"AV\":0,\"IZ\":0.07,\"OZ\":0.95,\"CA0\":[0.0,0.0],\"CA1\":[-13.0,13.0],\"CA2\":[13.0,13.0],\"CA3\":[13.0,-13.0],\"CA4\":[-13.0,-13.0],\"SM\":1,\"LM\":1,\"LL\":5,\"DM\":0,\"SD\":0,\"MA\":0,\"LK\":0,\"CF\":0}"
+
+// Input restriction settings (roadmap item 11) — every one defaults to 0 =
+// the unrestricted legacy behavior, so a settings file written by older
+// firmware (missing the keys) reads 0 and keeps working exactly as before.
+#define CONF_SAP_DISABLED_DEFAULT      0  // SD: 1 = sip & puff inputs disabled (upstream #21)
+#define CONF_MENU_BUTTONS_ONLY_DEFAULT 0  // MA: 1 = only the hub buttons may open/navigate the menu (upstream #77)
+#define CONF_MODE_LOCK_DEFAULT         0  // LK: 1 = the operating mode is locked; inputs cannot change it (upstream #68)
+#define CONF_CURSOR_HOLD_DEFAULT       0  // CF: 1 = cursor movement freezes while a sip or puff is in progress (upstream #44)
+
+// Input source classes for evaluateOutputAction()'s restriction gates
+#define INPUT_CLASS_SAP     0  // Mouthpiece sip & puff
+#define INPUT_CLASS_BUTTON  1  // Hub buttons S1/S2
+#define INPUT_CLASS_SWITCH  2  // External assistive switches
 
 // Polling rates for each module
 #define CONF_JOYSTICK_POLL_RATE 20          // 20 ms 
