@@ -448,10 +448,18 @@ void LSScreen::returnToMenu() {
   _transitionTimerId = -1;
   if (_calibrationClosesMenu) {
     // #36: this calibration run was started over the serial API — the menu
-    // was not how the flow started, so it must not be how it ends. Close
-    // (clear) instead of parking the Hub on a main menu nothing opened.
+    // was not how the flow started, so it must not be how it ends. Close it,
+    // then show the ready page: a merely blank screen reads as "dead" and
+    // invites a long wake-puff — which is START_MENU (3-8 s) and puts the
+    // menu right back (observed on hardware, 2026-10-14). The ready page
+    // tells the user the device is finished and usable, then clears itself.
     _calibrationClosesMenu = false;
-    deactivateMenu();
+    _isActive = false;
+    clear();
+    flushDisplay();
+    if (g_displayConnected && Wire.busHealthy()) {
+      splashScreen2();
+    }
     return;
   }
   if (_isActive) {

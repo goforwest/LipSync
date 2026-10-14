@@ -47,7 +47,7 @@ _functionList setJoystickInnerDeadzoneFunction =  {"IZ", "1", "",  &setJoystickI
 _functionList getJoystickOuterDeadzoneFunction =  {"OZ", "0", "0", &getJoystickOuterDeadzone};
 _functionList setJoystickUpperDeadzoneFunction =  {"OZ", "1", "",  &setJoystickOuterDeadzone};
 _functionList getJoystickAccelerationFunction =   {"AV", "0", "0", &getJoystickAcceleration};
-_functionList setJoystickAccelerationFunction =   {"AV", "1", "0", &setJoystickAcceleration};
+_functionList setJoystickAccelerationFunction =   {"AV", "1", "",  &setJoystickAcceleration};
 
 _functionList getCursorSpeedFunction =            {"SS", "0", "0", &getCursorSpeed};
 _functionList setCursorSpeedFunction =            {"SS", "1", "",  &setCursorSpeed};
