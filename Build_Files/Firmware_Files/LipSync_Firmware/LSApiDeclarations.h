@@ -139,6 +139,22 @@ void getCursorHoldDuringSap(bool responseEnabled, bool apiEnabled, String option
 void setCursorHoldDuringSap(bool responseEnabled, bool apiEnabled, int inputCursorHold);
 void setCursorHoldDuringSap(bool responseEnabled, bool apiEnabled, String optionalParameter);
 
+// Input timing windows (roadmap item 15, upstream #62/#9): three boundaries
+// in ms, stored 0 = the compiled default. Getters return the window in force;
+// setters keep short < long < max ordering.
+int getInputWindowShort(bool responseEnabled, bool apiEnabled);
+void getInputWindowShort(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void setInputWindowShort(bool responseEnabled, bool apiEnabled, unsigned long inputWindowMs);
+void setInputWindowShort(bool responseEnabled, bool apiEnabled, String optionalParameter);
+int getInputWindowLong(bool responseEnabled, bool apiEnabled);
+void getInputWindowLong(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void setInputWindowLong(bool responseEnabled, bool apiEnabled, unsigned long inputWindowMs);
+void setInputWindowLong(bool responseEnabled, bool apiEnabled, String optionalParameter);
+int getInputWindowMax(bool responseEnabled, bool apiEnabled);
+void getInputWindowMax(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void setInputWindowMax(bool responseEnabled, bool apiEnabled, unsigned long inputWindowMs);
+void setInputWindowMax(bool responseEnabled, bool apiEnabled, String optionalParameter);
+
 // Hub menu, diagnostics and device actions
 void controlHubMenu(bool responseEnabled, bool apiEnabled, int inputMenuControl);
 void controlHubMenu(bool responseEnabled, bool apiEnabled, String optionalParameter);
@@ -179,6 +195,14 @@ void buzzerErrorCue();
 // through (inputClass is INPUT_CLASS_SAP/_BUTTON/_SWITCH from LSConfig.h).
 void initRestrictions();
 int applyInputRestrictions(int actionIndex, int inputClass);
+
+// Input timing machinery (roadmap item 15): maps an action-table row's
+// compiled window boundary onto the user's stored windows, and the coarse
+// threshold-level scale the Hub menu steps through (upstream #22).
+unsigned long effectiveWindowMs(unsigned long defaultWindowMs);
+float pressThresholdLevelUp(float currentThreshold);
+float pressThresholdLevelDown(float currentThreshold);
+int pressThresholdLevelFor(float currentThreshold);
 
 // Screen page-transition continuations passed to LSScreen::scheduleTransition()
 void clearSplashScreen();

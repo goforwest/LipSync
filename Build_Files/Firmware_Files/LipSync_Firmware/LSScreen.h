@@ -61,6 +61,8 @@
 #define INFO_MENU 58
 #define ACCEL_MENU 59
 #define RESTRICTIONS_MENU 60
+#define TIMING_MENU 61
+#define TIMING_ADJUST_MENU 611
 
 #define SCROLL_DELAY_MILLIS 100 // [ms] This controls the scroll speed of long menu items //TODO 2025-Feb-28 Make this user adjustable
 
@@ -209,6 +211,7 @@ private:
 
   float _sipPressThresh;
   float _puffPressThresh;
+  int _timingWindowSel = 0;  // Timing adjust page target: 0 = short (W1), 1 = long (W2), 2 = max (W3)
 
   unsigned long _lastActivityMillis;
 
@@ -240,6 +243,8 @@ private:
   void adjustPuffThreshMenu();
   void accelMenu();
   void restrictionsMenu();
+  void timingMenu();
+  void adjustTimingMenu();
   void restartConfirmPage();
   void factoryResetConfirm1Page();
   void factoryResetConfirm2Page();
@@ -259,9 +264,13 @@ private:
   String _lightBrightMenuText[4] = { "Lights: ", "Increase", "Decrease", "... Back" };
   String _scrollSpMenuText[4] = { "Speed: ", "Increase", "Decrease", "... Back" };
   String _accelMenuText[4] = { "Accel: ", "Increase", "Decrease", "... Back" };
-  String _sipPuffThreshMenuText[4] = { "Sip Threshold", "Puff Threshold", "... Back" };
+  String _sipPuffThreshMenuText[4] = { "Sip Threshold", "Puff Threshold", "Timing", "... Back" };
   String _adjustSipThreshMenuText[4] = { "Sip: ", "Increase", "Decrease", "... Back" };
   String _adjustPuffThreshMenuText[4] = { "Puff: ", "Increase", "Decrease", "... Back" };
+  // Input timing (roadmap item 15, upstream #62): the three window
+  // boundaries, each adjusted on its own page in 250 ms steps.
+  String _timingMenuText[4] = { "Short: ", "Long: ", "Max: ", "... Back" };
+  String _timingAdjustMenuText[4] = { "Short: ", "Increase", "Decrease", "... Back" };
   // Input restrictions (roadmap item 11): one line per toggle, state shown
   // inline; selecting a line flips that restriction.
   String _restrictionsMenuText[5] = { "Sip&Puff: On", "Menu: All", "Mode lock: Off", "Cursor hold: Off", "... Back" };
@@ -283,10 +292,12 @@ private:
   const int _lightBrightMenuLen = 3;
   const int _scrollSpMenuLen = 3;
   const int _accelMenuLen = 3;
-  const int _sipPuffThreshMenuLen = 3;
+  const int _sipPuffThreshMenuLen = 4;
   const int _adjustSipThreshMenuLen = 3;
   const int _adjustPuffThreshMenuLen = 3;
   const int _restrictionsMenuLen = 5;
+  const int _timingMenuLen = 4;
+  const int _timingAdjustMenuLen = 3;
   const int _restartConfirmLen = 2;
   const int _factoryResetConfirm1Len = 2;
   const int _factoryResetConfirm2Len = 2;
@@ -1002,7 +1013,10 @@ void LSScreen::selectMenuItem() {
         case 1:  // Puff
           adjustPuffThreshMenu();
           break;
-        case 2:
+        case 2:  // Timing (roadmap item 15, upstream #62)
+          timingMenu();
+          break;
+        case 3:
           _currentMenu = MORE_MENU;
           moreMenu();
           break;
@@ -1081,27 +1095,32 @@ void LSScreen::selectMenuItem() {
       break;
 
     case SIP_THRESH_MENU:
+      // The Hub menu steps through the coarse 10-level threshold scale
+      // (roadmap item 15, upstream #22) instead of ±1 hPa — the fine hPa
+      // granularity stays on the serial API and in LipSync Connect.
       switch (_currentSelection) {
-        case 0:  // Increase
+        case 0: {  // Increase
           _sipPressThresh = getSipPressureThreshold(false, false);
-          _sipPressThresh++;  // Increase sip threshold by 1 ** TODO: CHANGE THIS, What values are we expecting? By how much to increase?
-          setSipPressureThreshold(false, false, _sipPressThresh);
-          _sipPressThresh = getSipPressureThreshold(false, false);          
-          _adjustSipThreshMenuText[0] = "Sip: " + String(_sipPressThresh) + " ";
+          setSipPressureThreshold(false, false, pressThresholdLevelUp(_sipPressThresh));
+          _sipPressThresh = getSipPressureThreshold(false, false);
+          _adjustSipThreshMenuText[0] =
+            "Sip: L" + String(pressThresholdLevelFor(_sipPressThresh)) + " " + String(_sipPressThresh) + " ";
           _display.setCursor(0, 0);
           _display.print(_adjustSipThreshMenuText[0]);
           flushDisplay();
           break;
-        case 1:  // Decrease
+        }
+        case 1: {  // Decrease
           _sipPressThresh = getSipPressureThreshold(false, false);
-          _sipPressThresh--;  // Decrease sip threshold by 1 ** TODO: CHANGE THIS, What values are we expecting? By how much to increase?
-          setSipPressureThreshold(false, false, _sipPressThresh);
+          setSipPressureThreshold(false, false, pressThresholdLevelDown(_sipPressThresh));
           _sipPressThresh = getSipPressureThreshold(false, false);
-          _adjustSipThreshMenuText[0] = "Sip: " + String(_sipPressThresh) + " ";
+          _adjustSipThreshMenuText[0] =
+            "Sip: L" + String(pressThresholdLevelFor(_sipPressThresh)) + " " + String(_sipPressThresh) + " ";
           _display.setCursor(0, 0);
           _display.print(_adjustSipThreshMenuText[0]);
           flushDisplay();
           break;
+        }
         case 2:  // Back
           _currentMenu = SIP_PUFF_MENU;
           sipPuffThreshMenu();
@@ -1110,33 +1129,93 @@ void LSScreen::selectMenuItem() {
       break;
 
     case PUFF_THRESH_MENU:
+      // Level scale, same as the sip page (roadmap item 15, upstream #22).
       switch (_currentSelection) {
-        case 0:  // Increase
+        case 0: {  // Increase
           _puffPressThresh = getPuffPressureThreshold(false, false);
-          _puffPressThresh++;  //  Increase puff threshold by one ** TODO: CHANGE THIS, What values are we expecting? By how much to increase?
-          setPuffPressureThreshold(false, false, _puffPressThresh);
+          setPuffPressureThreshold(false, false, pressThresholdLevelUp(_puffPressThresh));
           _puffPressThresh = getPuffPressureThreshold(false, false);
-          _adjustPuffThreshMenuText[0] = "Puff: " + String(_puffPressThresh) + " ";
+          _adjustPuffThreshMenuText[0] =
+            "Puff: L" + String(pressThresholdLevelFor(_puffPressThresh)) + " " + String(_puffPressThresh) + " ";
           _display.setCursor(0, 0);
           _display.print(_adjustPuffThreshMenuText[0]);
           flushDisplay();
           break;
-        case 1:  // Decrease
+        }
+        case 1: {  // Decrease
           _puffPressThresh = getPuffPressureThreshold(false, false);
-          _puffPressThresh--;  // Decrease puff threshold by one ** TODO: CHANGE THIS, What values are we expecting? By how much to increase?       
-          setPuffPressureThreshold(false, false, _puffPressThresh);
-          _puffPressThresh = getPuffPressureThreshold(false, false);          
-          _adjustPuffThreshMenuText[0] = "Puff: " + String(_puffPressThresh) + " ";
+          setPuffPressureThreshold(false, false, pressThresholdLevelDown(_puffPressThresh));
+          _puffPressThresh = getPuffPressureThreshold(false, false);
+          _adjustPuffThreshMenuText[0] =
+            "Puff: L" + String(pressThresholdLevelFor(_puffPressThresh)) + " " + String(_puffPressThresh) + " ";
           _display.setCursor(0, 0);
           _display.print(_adjustPuffThreshMenuText[0]);
           flushDisplay();
           break;
+        }
         case 2:  // Back
           _currentMenu = SIP_PUFF_MENU;
           sipPuffThreshMenu();
           break;
       }
       break;
+
+    case TIMING_MENU:
+      // Input timing windows (roadmap item 15, upstream #62): one page per
+      // boundary; selecting a line opens its adjust page.
+      switch (_currentSelection) {
+        case 0:  // Short window (W1)
+        case 1:  // Long window (W2)
+        case 2:  // Max window (W3)
+          _timingWindowSel = _currentSelection;
+          adjustTimingMenu();
+          break;
+        case 3:  // Back
+          _currentMenu = SIP_PUFF_MENU;
+          sipPuffThreshMenu();
+          break;
+      }
+      break;
+
+    case TIMING_ADJUST_MENU: {
+      // 250 ms steps; the API setter clamps range and keeps short < long <
+      // max ordering, and the re-read keeps the label truthful.
+      if (_currentSelection == 2) {  // Back
+        _currentMenu = TIMING_MENU;
+        timingMenu();
+        break;
+      }
+      const int stepMs = 250;
+      int currentMs = 0;
+      switch (_timingWindowSel) {
+        case 0: {
+          currentMs = getInputWindowShort(false, false);
+          int nextMs = (_currentSelection == 0) ? currentMs + stepMs : currentMs - stepMs;
+          setInputWindowShort(true, false, (unsigned long)nextMs);
+          currentMs = getInputWindowShort(false, false);
+          break;
+        }
+        case 1: {
+          currentMs = getInputWindowLong(false, false);
+          int nextMs = (_currentSelection == 0) ? currentMs + stepMs : currentMs - stepMs;
+          setInputWindowLong(true, false, (unsigned long)nextMs);
+          currentMs = getInputWindowLong(false, false);
+          break;
+        }
+        default: {
+          currentMs = getInputWindowMax(false, false);
+          int nextMs = (_currentSelection == 0) ? currentMs + stepMs : currentMs - stepMs;
+          setInputWindowMax(true, false, (unsigned long)nextMs);
+          currentMs = getInputWindowMax(false, false);
+          break;
+        }
+      }
+      _timingAdjustMenuText[0] = String(_timingWindowSel == 0 ? "Short: " : _timingWindowSel == 1 ? "Long: " : "Max: ") + String(currentMs) + "ms ";
+      _display.setCursor(0, 0);
+      _display.print(_timingAdjustMenuText[0]);
+      flushDisplay();
+      break;
+    }
 
     case FULL_CALIB_CONFIRM_PAGE:
       switch (_currentSelection) {
@@ -1652,6 +1731,66 @@ void LSScreen::restrictionsMenu(void) {
 }
 
 //*********************************//
+// Function   : timingMenu
+//
+// Description: Format and display the input timing windows menu (roadmap
+//              item 15, upstream #62): one line per window boundary,
+//              current value in ms shown inline.
+//
+// Arguments :  void
+//
+// Return     : void
+//*********************************//
+void LSScreen::timingMenu(void) {
+  _currentMenu = TIMING_MENU;
+
+  _timingMenuText[0] = String("Short: ") + String(getInputWindowShort(false, false)) + "ms";
+  _timingMenuText[1] = String("Long: ") + String(getInputWindowLong(false, false)) + "ms";
+  _timingMenuText[2] = String("Max: ") + String(getInputWindowMax(false, false)) + "ms";
+
+  _currentMenuLength = _timingMenuLen;
+  _currentMenuText = _timingMenuText;
+  _cursorStart = 0;
+  _currentSelection = 0;
+  _countMenuScroll = 0;
+
+  displayMenu();  //  Print items in current menu
+}
+
+//*********************************//
+// Function   : adjustTimingMenu
+//
+// Description: Format and display the adjust page for the selected input
+//              timing window (_timingWindowSel: 0 = short/W1, 1 = long/W2,
+//              2 = max/W3). Increase/Decrease step 250 ms; the API setter
+//              clamps range and ordering, so a refused step re-reads as the
+//              unchanged value.
+//
+// Arguments :  void
+//
+// Return     : void
+//*********************************//
+void LSScreen::adjustTimingMenu(void) {
+  _currentMenu = TIMING_ADJUST_MENU;
+
+  int currentMs = 0;
+  if (_timingWindowSel == 0) currentMs = getInputWindowShort(false, false);
+  else if (_timingWindowSel == 1) currentMs = getInputWindowLong(false, false);
+  else currentMs = getInputWindowMax(false, false);
+
+  _timingAdjustMenuText[0] =
+    String(_timingWindowSel == 0 ? "Short: " : _timingWindowSel == 1 ? "Long: " : "Max: ") + String(currentMs) + "ms ";
+
+  _currentMenuLength = _timingAdjustMenuLen;
+  _currentMenuText = _timingAdjustMenuText;
+  _cursorStart = 1;
+  _currentSelection = 0;
+  _countMenuScroll = 0;
+
+  displayMenu();  //  Print items in current menu
+}
+
+//*********************************//
 // Function   : moreMenu
 //
 // Description: Format and display More Menu
@@ -1888,7 +2027,8 @@ void LSScreen::adjustSipThreshMenu(void) {
   _currentMenu = SIP_THRESH_MENU;
   _sipPressThresh = getSipPressureThreshold(false, false);
 
-  _adjustSipThreshMenuText[0] = "Sip: " + String(_sipPressThresh) + " ";
+  _adjustSipThreshMenuText[0] =
+    "Sip: L" + String(pressThresholdLevelFor(_sipPressThresh)) + " " + String(_sipPressThresh) + " ";
 
   _currentMenuLength = _adjustSipThreshMenuLen;
   _currentMenuText = _adjustSipThreshMenuText;
@@ -1912,7 +2052,8 @@ void LSScreen::adjustPuffThreshMenu(void) {
   _currentMenu = PUFF_THRESH_MENU;
   _puffPressThresh = getPuffPressureThreshold(false, false);
 
-  _adjustPuffThreshMenuText[0] = "Puff: " + String(_puffPressThresh) + " ";
+  _adjustPuffThreshMenuText[0] =
+    "Puff: L" + String(pressThresholdLevelFor(_puffPressThresh)) + " " + String(_puffPressThresh) + " ";
 
   _currentMenuLength = _adjustPuffThreshMenuLen;
   _currentMenuText = _adjustPuffThreshMenuText;

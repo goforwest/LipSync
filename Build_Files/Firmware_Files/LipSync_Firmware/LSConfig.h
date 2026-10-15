@@ -159,7 +159,7 @@ const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + 
 
 // Flash Memory settings - Don't change
 #define CONF_SETTINGS_FILE    "/settings.txt"
-#define CONF_SETTINGS_JSON    "{\"MN\":0,\"VN1\":4,\"VN2\":1,\"VN3\":0,\"ID\":0,\"OM\":1,\"CM\":1,\"SS\":5,\"SL\":5,\"ST\":3.0,\"PT\":3.0,\"AV\":0,\"IZ\":0.07,\"OZ\":0.95,\"CA0\":[0.0,0.0],\"CA1\":[-13.0,13.0],\"CA2\":[13.0,13.0],\"CA3\":[13.0,-13.0],\"CA4\":[-13.0,-13.0],\"SM\":1,\"LM\":1,\"LL\":5,\"DM\":0,\"SD\":0,\"MA\":0,\"LK\":0,\"CF\":0}"
+#define CONF_SETTINGS_JSON    "{\"MN\":0,\"VN1\":4,\"VN2\":1,\"VN3\":0,\"ID\":0,\"OM\":1,\"CM\":1,\"SS\":5,\"SL\":5,\"ST\":3.0,\"PT\":3.0,\"AV\":0,\"IZ\":0.07,\"OZ\":0.95,\"CA0\":[0.0,0.0],\"CA1\":[-13.0,13.0],\"CA2\":[13.0,13.0],\"CA3\":[13.0,-13.0],\"CA4\":[-13.0,-13.0],\"SM\":1,\"LM\":1,\"LL\":5,\"DM\":0,\"SD\":0,\"MA\":0,\"LK\":0,\"CF\":0,\"W1\":0,\"W2\":0,\"W3\":0}"
 
 // Input restriction settings (roadmap item 11) — every one defaults to 0 =
 // the unrestricted legacy behavior, so a settings file written by older
@@ -168,6 +168,28 @@ const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + 
 #define CONF_MENU_BUTTONS_ONLY_DEFAULT 0  // MA: 1 = only the hub buttons may open/navigate the menu (upstream #77)
 #define CONF_MODE_LOCK_DEFAULT         0  // LK: 1 = the operating mode is locked; inputs cannot change it (upstream #68)
 #define CONF_CURSOR_HOLD_DEFAULT       0  // CF: 1 = cursor movement freezes while a sip or puff is in progress (upstream #44)
+
+// Input timing windows (roadmap item 15, upstream #62/#9): the short/long/
+// very-long input window boundaries in ms. Stored 0 = the compiled default
+// below — which is also what a settings file written by older firmware reads
+// for the missing keys, so an update keeps the factory feel exactly.
+#define CONF_INPUT_WINDOW_SHORT_DEFAULT_MS 1000
+#define CONF_INPUT_WINDOW_LONG_DEFAULT_MS  3000
+#define CONF_INPUT_WINDOW_MAX_DEFAULT_MS   8000
+// Settable ranges (the setter also enforces short < long < max ordering).
+#define CONF_INPUT_WINDOW_SHORT_MIN_MS 200
+#define CONF_INPUT_WINDOW_SHORT_MAX_MS 2500
+#define CONF_INPUT_WINDOW_LONG_MIN_MS  400
+#define CONF_INPUT_WINDOW_LONG_MAX_MS  6000
+#define CONF_INPUT_WINDOW_MAX_MIN_MS   1000
+#define CONF_INPUT_WINDOW_MAX_MAX_MS  10000
+
+// Sip & puff threshold level scale (roadmap item 15, upstream #22): the Hub
+// menu steps through these coarse levels instead of ±1 hPa, so the
+// mouthpiece-driven menu path is practical; the serial API and app keep the
+// fine hPa granularity.
+const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.0, 22.0, 32.0, 45.0 };
+#define PRESS_THRESHOLD_LEVEL_NUM 10
 
 // Input source classes for evaluateOutputAction()'s restriction gates
 #define INPUT_CLASS_SAP     0  // Mouthpiece sip & puff

@@ -77,6 +77,13 @@ _functionList setModeLockedFunction =              {"LK", "1", "",  &setModeLock
 _functionList getCursorHoldFunction =              {"CF", "0", "0", &getCursorHoldDuringSap};
 _functionList setCursorHoldFunction =              {"CF", "1", "",  &setCursorHoldDuringSap};
 
+_functionList getInputWindowShortFunction =        {"W1", "0", "0", &getInputWindowShort};
+_functionList setInputWindowShortFunction =        {"W1", "1", "",  &setInputWindowShort};
+_functionList getInputWindowLongFunction =         {"W2", "0", "0", &getInputWindowLong};
+_functionList setInputWindowLongFunction =         {"W2", "1", "",  &setInputWindowLong};
+_functionList getInputWindowMaxFunction =          {"W3", "0", "0", &getInputWindowMax};
+_functionList setInputWindowMaxFunction =          {"W3", "1", "",  &setInputWindowMax};
+
 _functionList controlHubMenuFunction =            {"CH", "1", "",  &controlHubMenu};
 
 _functionList getDebugModeFunction =              {"DM", "0", "0", &getDebugMode};
@@ -135,6 +142,12 @@ _functionList apiFunction[] = { //Let compiler determine number of functions
   setModeLockedFunction,
   getCursorHoldFunction,
   setCursorHoldFunction,
+  getInputWindowShortFunction,
+  setInputWindowShortFunction,
+  getInputWindowLongFunction,
+  setInputWindowLongFunction,
+  getInputWindowMaxFunction,
+  setInputWindowMaxFunction,
   controlHubMenuFunction,
   getDebugModeFunction,
   setDebugModeFunction,
@@ -2393,6 +2406,176 @@ void setCursorHoldDuringSap(bool responseEnabled, bool apiEnabled, String option
   setCursorHoldDuringSap(responseEnabled, apiEnabled, optionalParameter.toInt());
 }
 
+//***INPUT TIMING WINDOW SETTINGS (roadmap item 15, upstream #62/#9)***//
+// Three window boundaries in ms — W1 short|long, W2 long|very-long, W3 max —
+// each stored as 0 = the compiled default (which is also what a settings
+// file written by older firmware reads for the missing keys). The getters
+// return the window IN FORCE (the default when stored 0); the setters accept
+// 0 (reset to default) or a value in range that keeps short < long < max.
+
+//***GET INPUT WINDOW SHORT FUNCTION***//
+// Function   : getInputWindowShort
+//
+// Description: Returns the short/long input window boundary in force (W1).
+//
+// Return     : windowMs : int : the boundary in ms
+//*********************************//
+int getInputWindowShort(bool responseEnabled, bool apiEnabled) {
+  String commandKey = "W1";
+  int tempWindow = CONF_INPUT_WINDOW_SHORT_DEFAULT_MS;
+  if (CONF_API_ENABLED) {
+    int stored = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+    if (stored > 0) tempWindow = stored;
+    g_inputWindowShortMs = (stored > 0) ? (unsigned long)stored : 0;
+  }
+  printResponseInt(responseEnabled, apiEnabled, true, 0, "W1,0", true, tempWindow);
+  return tempWindow;
+}
+//***GET INPUT WINDOW SHORT API FUNCTION***//
+void getInputWindowShort(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 0) {
+    getInputWindowShort(responseEnabled, apiEnabled);
+  }
+}
+
+//***SET INPUT WINDOW SHORT FUNCTION***//
+// Function   : setInputWindowShort
+//
+// Description: Sets the short/long input window boundary (W1). 0 resets to
+//              the compiled default. The value must stay below the long
+//              window in force.
+//
+// Parameters :  inputWindowMs : unsigned long : the boundary in ms (0 = default)
+//
+// Return     : void
+//*********************************//
+void setInputWindowShort(bool responseEnabled, bool apiEnabled, unsigned long inputWindowMs) {
+  String commandKey = "W1";
+  unsigned long longEff = (g_inputWindowLongMs > 0) ? g_inputWindowLongMs : CONF_INPUT_WINDOW_LONG_DEFAULT_MS;
+  unsigned long newEff = (inputWindowMs > 0) ? inputWindowMs : CONF_INPUT_WINDOW_SHORT_DEFAULT_MS;
+  if ((inputWindowMs == 0) ||
+      (inputWindowMs >= CONF_INPUT_WINDOW_SHORT_MIN_MS && inputWindowMs <= CONF_INPUT_WINDOW_SHORT_MAX_MS && newEff < longEff)) {
+    mem.writeInt(CONF_SETTINGS_FILE, commandKey, (int)inputWindowMs);
+    g_inputWindowShortMs = (inputWindowMs > 0) ? inputWindowMs : 0;
+    printResponseInt(responseEnabled, apiEnabled, true, 0, "W1,1", true, (int)newEff);
+  } else {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "W1,1", true, (int)inputWindowMs);
+  }
+}
+//***SET INPUT WINDOW SHORT API FUNCTION***//
+void setInputWindowShort(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  setInputWindowShort(responseEnabled, apiEnabled, (unsigned long)optionalParameter.toInt());
+}
+
+//***GET INPUT WINDOW LONG FUNCTION***//
+// Function   : getInputWindowLong
+//
+// Description: Returns the long/very-long input window boundary in force (W2).
+//
+// Return     : windowMs : int : the boundary in ms
+//*********************************//
+int getInputWindowLong(bool responseEnabled, bool apiEnabled) {
+  String commandKey = "W2";
+  int tempWindow = CONF_INPUT_WINDOW_LONG_DEFAULT_MS;
+  if (CONF_API_ENABLED) {
+    int stored = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+    if (stored > 0) tempWindow = stored;
+    g_inputWindowLongMs = (stored > 0) ? (unsigned long)stored : 0;
+  }
+  printResponseInt(responseEnabled, apiEnabled, true, 0, "W2,0", true, tempWindow);
+  return tempWindow;
+}
+//***GET INPUT WINDOW LONG API FUNCTION***//
+void getInputWindowLong(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 0) {
+    getInputWindowLong(responseEnabled, apiEnabled);
+  }
+}
+
+//***SET INPUT WINDOW LONG FUNCTION***//
+// Function   : setInputWindowLong
+//
+// Description: Sets the long/very-long input window boundary (W2). 0 resets
+//              to the compiled default. The value must stay between the
+//              short window and the max window in force.
+//
+// Parameters :  inputWindowMs : unsigned long : the boundary in ms (0 = default)
+//
+// Return     : void
+//*********************************//
+void setInputWindowLong(bool responseEnabled, bool apiEnabled, unsigned long inputWindowMs) {
+  String commandKey = "W2";
+  unsigned long shortEff = (g_inputWindowShortMs > 0) ? g_inputWindowShortMs : CONF_INPUT_WINDOW_SHORT_DEFAULT_MS;
+  unsigned long maxEff = (g_inputWindowMaxMs > 0) ? g_inputWindowMaxMs : CONF_INPUT_WINDOW_MAX_DEFAULT_MS;
+  unsigned long newEff = (inputWindowMs > 0) ? inputWindowMs : CONF_INPUT_WINDOW_LONG_DEFAULT_MS;
+  if ((inputWindowMs == 0) ||
+      (inputWindowMs >= CONF_INPUT_WINDOW_LONG_MIN_MS && inputWindowMs <= CONF_INPUT_WINDOW_LONG_MAX_MS && newEff > shortEff && newEff < maxEff)) {
+    mem.writeInt(CONF_SETTINGS_FILE, commandKey, (int)inputWindowMs);
+    g_inputWindowLongMs = (inputWindowMs > 0) ? inputWindowMs : 0;
+    printResponseInt(responseEnabled, apiEnabled, true, 0, "W2,1", true, (int)newEff);
+  } else {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "W2,1", true, (int)inputWindowMs);
+  }
+}
+//***SET INPUT WINDOW LONG API FUNCTION***//
+void setInputWindowLong(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  setInputWindowLong(responseEnabled, apiEnabled, (unsigned long)optionalParameter.toInt());
+}
+
+//***GET INPUT WINDOW MAX FUNCTION***//
+// Function   : getInputWindowMax
+//
+// Description: Returns the very-long input window boundary in force (W3).
+//
+// Return     : windowMs : int : the boundary in ms
+//*********************************//
+int getInputWindowMax(bool responseEnabled, bool apiEnabled) {
+  String commandKey = "W3";
+  int tempWindow = CONF_INPUT_WINDOW_MAX_DEFAULT_MS;
+  if (CONF_API_ENABLED) {
+    int stored = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+    if (stored > 0) tempWindow = stored;
+    g_inputWindowMaxMs = (stored > 0) ? (unsigned long)stored : 0;
+  }
+  printResponseInt(responseEnabled, apiEnabled, true, 0, "W3,0", true, tempWindow);
+  return tempWindow;
+}
+//***GET INPUT WINDOW MAX API FUNCTION***//
+void getInputWindowMax(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 0) {
+    getInputWindowMax(responseEnabled, apiEnabled);
+  }
+}
+
+//***SET INPUT WINDOW MAX FUNCTION***//
+// Function   : setInputWindowMax
+//
+// Description: Sets the very-long input window boundary (W3). 0 resets to
+//              the compiled default. The value must stay above the long
+//              window in force.
+//
+// Parameters :  inputWindowMs : unsigned long : the boundary in ms (0 = default)
+//
+// Return     : void
+//*********************************//
+void setInputWindowMax(bool responseEnabled, bool apiEnabled, unsigned long inputWindowMs) {
+  String commandKey = "W3";
+  unsigned long longEff = (g_inputWindowLongMs > 0) ? g_inputWindowLongMs : CONF_INPUT_WINDOW_LONG_DEFAULT_MS;
+  unsigned long newEff = (inputWindowMs > 0) ? inputWindowMs : CONF_INPUT_WINDOW_MAX_DEFAULT_MS;
+  if ((inputWindowMs == 0) ||
+      (inputWindowMs >= CONF_INPUT_WINDOW_MAX_MIN_MS && inputWindowMs <= CONF_INPUT_WINDOW_MAX_MAX_MS && newEff > longEff)) {
+    mem.writeInt(CONF_SETTINGS_FILE, commandKey, (int)inputWindowMs);
+    g_inputWindowMaxMs = (inputWindowMs > 0) ? inputWindowMs : 0;
+    printResponseInt(responseEnabled, apiEnabled, true, 0, "W3,1", true, (int)newEff);
+  } else {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "W3,1", true, (int)inputWindowMs);
+  }
+}
+//***SET INPUT WINDOW MAX API FUNCTION***//
+void setInputWindowMax(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  setInputWindowMax(responseEnabled, apiEnabled, (unsigned long)optionalParameter.toInt());
+}
+
 // *********************************************************************************
 
 //***OPEN HUB MENU FUNCTION***//
@@ -2599,6 +2782,9 @@ void exportSettings(bool responseEnabled, bool apiEnabled) {
   getMenuButtonsOnly(responseEnabled, apiEnabled);
   getModeLocked(responseEnabled, apiEnabled);
   getCursorHoldDuringSap(responseEnabled, apiEnabled);
+  getInputWindowShort(responseEnabled, apiEnabled);
+  getInputWindowLong(responseEnabled, apiEnabled);
+  getInputWindowMax(responseEnabled, apiEnabled);
 
   printResponseString(responseEnabled, apiEnabled, true, 0, "EX,0", true, "END");
 }
@@ -2768,6 +2954,9 @@ void doFactoryReset(bool responseEnabled, bool apiEnabled) {
   setMenuButtonsOnly(false, false, CONF_MENU_BUTTONS_ONLY_DEFAULT);  // unrestricted defaults —
   setModeLocked(false, false, CONF_MODE_LOCK_DEFAULT);              // a factory reset can never
   setCursorHoldDuringSap(false, false, CONF_CURSOR_HOLD_DEFAULT);   // lock a device out
+  setInputWindowShort(false, false, 0);   // Timing windows reset to the
+  setInputWindowLong(false, false, 0);    // compiled factory feel
+  setInputWindowMax(false, false, 0);
   printResponseInt(responseEnabled, apiEnabled, true, 0, "FR,1", true, 1);
 
   // Clear all LEDs to indicate factory reset process is finished 

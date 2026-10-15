@@ -127,6 +127,13 @@ bool g_menuButtonsOnly = false;    // MA — only the hub buttons may control th
 bool g_modeLocked = false;         // LK — inputs cannot change the operating mode
 bool g_freezeCursorDuringSap = false;  // CF — cursor output freezes while a sip/puff is in progress
 
+// Input timing windows (roadmap item 15, upstream #62/#9) — stored 0 means
+// the compiled default; the getters/setters keep these live. These are the
+// STORED values; effectiveWindowMs() maps them onto the action tables.
+unsigned long g_inputWindowShortMs = 0;  // W1 — short | long boundary
+unsigned long g_inputWindowLongMs = 0;   // W2 — long | very-long boundary
+unsigned long g_inputWindowMaxMs = 0;    // W3 — very-long boundary
+
 // Timing Variables for Debugging
 unsigned long beginMillis;
 unsigned long beforeComOpMillis;
@@ -375,6 +382,9 @@ void initGlobals() {
   g_modeLocked = false;
   g_freezeCursorDuringSap = false;
 
+  g_inputWindowShortMs = 0;
+  g_inputWindowLongMs = 0;
+  g_inputWindowMaxMs = 0;
 
 }
 
@@ -1197,6 +1207,71 @@ void initRestrictions() {
   getMenuButtonsOnly(false, false);
   getModeLocked(false, false);
   getCursorHoldDuringSap(false, false);
+  // Input timing windows (roadmap item 15) load with the same stroke so the
+  // first tick of the input timers already sees the user's windows.
+  getInputWindowShort(false, false);
+  getInputWindowLong(false, false);
+  getInputWindowMax(false, false);
+}
+
+//***EFFECTIVE WINDOW FUNCTION***//
+// Function   : effectiveWindowMs
+//
+// Description: Maps an action-table row's compiled window boundary
+//              (1000 / 3000 / 8000 ms — the shorts/longs/very-longs the
+//              tables are written against) onto the user's stored input
+//              timing windows (roadmap item 15, upstream #62): a stored 0
+//              is the compiled default, so the factory feel is exact.
+//              Any other boundary value passes through unchanged.
+//
+// Parameters : defaultWindowMs : unsigned long : The compiled boundary value
+//
+// Return     : unsigned long : The boundary in force
+//****************************************//
+unsigned long effectiveWindowMs(unsigned long defaultWindowMs) {
+  switch (defaultWindowMs) {
+    case CONF_INPUT_WINDOW_SHORT_DEFAULT_MS:
+      return (g_inputWindowShortMs > 0) ? g_inputWindowShortMs : CONF_INPUT_WINDOW_SHORT_DEFAULT_MS;
+    case CONF_INPUT_WINDOW_LONG_DEFAULT_MS:
+      return (g_inputWindowLongMs > 0) ? g_inputWindowLongMs : CONF_INPUT_WINDOW_LONG_DEFAULT_MS;
+    case CONF_INPUT_WINDOW_MAX_DEFAULT_MS:
+      return (g_inputWindowMaxMs > 0) ? g_inputWindowMaxMs : CONF_INPUT_WINDOW_MAX_DEFAULT_MS;
+    default:
+      return defaultWindowMs;  // 0 (row inert) or any custom boundary passes through
+  }
+}
+
+//***PRESSURE THRESHOLD LEVEL HELPERS***//
+// Function   : pressThresholdLevelUp / pressThresholdLevelDown / pressThresholdLevelFor
+//
+// Description: The coarse 10-level threshold scale (roadmap item 15,
+//              upstream #22): the Hub menu's Increase/Decrease step through
+//              PRESS_THRESHOLD_LEVEL_TABLE instead of ±1 hPa, so a
+//              mouthpiece-driven adjustment is practical. At the top/bottom
+//              of the scale the step is a no-op (the re-read shows the
+//              unchanged value).
+//
+// Return     : the stepped threshold in hPa (level index for the display)
+//****************************************//
+float pressThresholdLevelUp(float currentThreshold) {
+  for (int level = 0; level < PRESS_THRESHOLD_LEVEL_NUM; level++) {
+    if (PRESS_THRESHOLD_LEVEL_TABLE[level] > currentThreshold + 0.01f) return PRESS_THRESHOLD_LEVEL_TABLE[level];
+  }
+  return currentThreshold;  // already at the top level
+}
+
+float pressThresholdLevelDown(float currentThreshold) {
+  for (int level = PRESS_THRESHOLD_LEVEL_NUM - 1; level >= 0; level--) {
+    if (PRESS_THRESHOLD_LEVEL_TABLE[level] < currentThreshold - 0.01f) return PRESS_THRESHOLD_LEVEL_TABLE[level];
+  }
+  return currentThreshold;  // already at the bottom level
+}
+
+int pressThresholdLevelFor(float currentThreshold) {
+  for (int level = 0; level < PRESS_THRESHOLD_LEVEL_NUM; level++) {
+    if (PRESS_THRESHOLD_LEVEL_TABLE[level] >= currentThreshold - 0.01f) return level + 1;
+  }
+  return PRESS_THRESHOLD_LEVEL_NUM;
 }
 
 //***APPLY INPUT RESTRICTIONS FUNCTION***//
@@ -1383,7 +1458,7 @@ void evaluateOutputAction(inputStateStruct actionState, unsigned long actionMaxE
     releaseOutputAction();
     canEvaluateAction = false;
   }  // Detected input release after defined time limits.
-  else if (actionState.secondaryState == INPUT_SEC_STATE_RELEASED && actionState.elapsedTime > actionMaxEndTime) {
+  else if (actionState.secondaryState == INPUT_SEC_STATE_RELEASED && actionState.elapsedTime > effectiveWindowMs(actionMaxEndTime)) {
     // Set Led color to default
     setLedDefault();
   }
@@ -1404,8 +1479,8 @@ void evaluateOutputAction(inputStateStruct actionState, unsigned long actionMaxE
     // Detected input release in defined time limits. Perform output action based on action index
     if (actionState.mainState == actionProperty[actionIndex].inputActionState
         && actionState.secondaryState == INPUT_SEC_STATE_RELEASED
-        && actionState.elapsedTime >= actionProperty[actionIndex].inputActionStartTime
-        && actionState.elapsedTime < actionProperty[actionIndex].inputActionEndTime) {
+        && actionState.elapsedTime >= effectiveWindowMs(actionProperty[actionIndex].inputActionStartTime)
+        && actionState.elapsedTime < effectiveWindowMs(actionProperty[actionIndex].inputActionEndTime)) {
       
       // Get action index
       if (screen.isMenuActive()) {
@@ -1456,8 +1531,8 @@ void evaluateOutputAction(inputStateStruct actionState, unsigned long actionMaxE
     }  // Detected input start in defined time limits. Perform led action based on action index
     else if (actionState.mainState == actionProperty[actionIndex].inputActionState
              && actionState.secondaryState == INPUT_SEC_STATE_STARTED
-             && actionState.elapsedTime >= actionProperty[actionIndex].inputActionStartTime
-             && actionState.elapsedTime < actionProperty[actionIndex].inputActionEndTime) {
+             && actionState.elapsedTime >= effectiveWindowMs(actionProperty[actionIndex].inputActionStartTime)
+             && actionState.elapsedTime < effectiveWindowMs(actionProperty[actionIndex].inputActionEndTime)) {
       // Get action index
       if (screen.isMenuActive()) {
         tempActionIndex = actionProperty[actionIndex].menuOutputActionNumber;
