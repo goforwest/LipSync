@@ -55,12 +55,11 @@ jobs:
             "Adafruit Unified Sensor@1.1.15" \
             "ArduinoJson@7.4.3"
 
-      - name: Install the bundled TLV493D library
-        run: |
-          mkdir -p "$HOME/Arduino/libraries"
-          unzip -q -o Build_Files/Firmware_Files/Libraries/TLV493D-A1B6.zip -d "$HOME/Arduino/libraries/"
-          mv "$HOME/Arduino/libraries/TLV493D-A1B6-3DMagnetic-Sensor-master" \
-             "$HOME/Arduino/libraries/TLV493D-A1B6-3DMagnetic-Sensor"
+      # The TLV493D library is the vendored fork in
+      # Build_Files/Firmware_Files/Libraries/TLV493D-A1B6 — pinned into the
+      # build by the compile step's --libraries flag (like the vendored
+      # Wire), so CI, local builds and releases all compile the bounded
+      # copy. No user-library install needed.
 
       - name: Install adafruit-nrfutil (post-compile DFU packaging)
         run: pip3 install 'adafruit-nrfutil==0.5.3.post16'
