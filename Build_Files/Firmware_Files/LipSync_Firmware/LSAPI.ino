@@ -349,6 +349,7 @@ bool isValidCommandFormat(String inputCommandString) {
        inputCommandString.length() == (7) || // XX,d:dd
        inputCommandString.length() == (8) || // XX,d:ddd
        inputCommandString.length() == (9) || // XX,d:dddd
+       inputCommandString.length() == (10) || // XX,d:ddddd
        inputCommandString.length() == (11)) && inputCommandString.charAt(2) == ',' && inputCommandString.charAt(4) == ':') { // XX,d:dddddd
     isValidFormat = true;
   }
