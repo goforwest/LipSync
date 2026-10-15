@@ -308,10 +308,23 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 #define CONF_LIGHT_MODE_OFF     0   // LEDs off
 #define CONF_LIGHT_MODE_BASIC   1   // Minimal LEDs
 #define CONF_LIGHT_MODE_ALL     2   // All LEDs
+#define CONF_LIGHT_MODE_STATE   3   // LEDs keyed to input state, not action (roadmap item 16, upstream #43)
 
 #define CONF_LIGHT_MODE_MIN     0
-#define CONF_LIGHT_MODE_MAX     2
+#define CONF_LIGHT_MODE_MAX     3
 #define CONF_LIGHT_MODE_DEFAULT CONF_LIGHT_MODE_BASIC
+
+// Input-state LED feedback (the LM=3 tier): while any input is held, the
+// LEDs show WHICH WINDOW the hold is in — green in the short window,
+// yellow after crossing into the long window, red in the very-long
+// window — instead of the pending action's color. Actions are not
+// one-to-one with inputs (#43), so the window is the honest thing to
+// show; the traffic-light progression also tells the user what release
+// will do without memorizing any mapping.
+#define CONF_INPUT_STATE_LED_SHORT_COLOR LED_CLR_GREEN
+#define CONF_INPUT_STATE_LED_LONG_COLOR  LED_CLR_YELLOW
+#define CONF_INPUT_STATE_LED_MAX_COLOR    LED_CLR_RED
+#define CONF_INPUT_STATE_LED_NUMBER       CONF_LED_ALL
 
 // Light Brightness Levels
 #define CONF_LED_BRIGHTNESS_LEVEL_DEFAULT   5

@@ -1503,15 +1503,26 @@ void evaluateOutputAction(inputStateStruct actionState, unsigned long actionMaxE
       // NOTHING here — no LED feedback, no output, no trace of the input.
       tempActionIndex = applyInputRestrictions(tempActionIndex, inputClass);
 
-      // Set Led color to default
-      //setLedDefault();
-      // Set Led state
-      setLedState(ledActionProperty[tempActionIndex].ledEndAction,
-                  ledActionProperty[tempActionIndex].ledEndColor,
-                  ledActionProperty[tempActionIndex].ledNumber,
-                  CONF_INPUT_LED_BLINK,
-                  CONF_INPUT_LED_DELAY,
-                  led.getLedBrightness());
+      // Input-state LED mode (LM=3, roadmap item 16 / upstream #43): the
+      // window the hold was in already showed on the LEDs while it was
+      // held; the release restores the default LEDs instead of blinking
+      // the action — the window was the message. The action itself still
+      // fires; a gated (restricted) input shows nothing at all.
+      bool inputStateLeds = (tempActionIndex != CONF_ACTION_NOTHING && g_lightMode == CONF_LIGHT_MODE_STATE);
+
+      if (inputStateLeds) {
+        setLedDefault();
+      } else {
+        // Set Led color to default
+        //setLedDefault();
+        // Set Led state
+        setLedState(ledActionProperty[tempActionIndex].ledEndAction,
+                    ledActionProperty[tempActionIndex].ledEndColor,
+                    ledActionProperty[tempActionIndex].ledNumber,
+                    CONF_INPUT_LED_BLINK,
+                    CONF_INPUT_LED_DELAY,
+                    led.getLedBrightness());
+      }
       outputAction = tempActionIndex;
 
       // Engagement cue for the two hold modes (roadmap item 16, upstream
@@ -1522,7 +1533,9 @@ void evaluateOutputAction(inputStateStruct actionState, unsigned long actionMaxE
       }
 
       // Perform led action
-      performLedAction(ledCurrentState);
+      if (!inputStateLeds) {
+        performLedAction(ledCurrentState);
+      }
 
       // Perform output action
       performOutputAction(tempActionIndex);
@@ -1553,6 +1566,28 @@ void evaluateOutputAction(inputStateStruct actionState, unsigned long actionMaxE
       // Restriction gates (roadmap item 11): the started-phase LED cue is
       // suppressed too — a forbidden input must not light anything up.
       tempActionIndex = applyInputRestrictions(tempActionIndex, inputClass);
+
+      // Input-state LED mode (LM=3, roadmap item 16 / upstream #43): the
+      // LEDs show the window the hold is in — green in the short window,
+      // yellow after crossing into the long window, red in the very-long
+      // window — instead of the pending action's color. Actions are not
+      // one-to-one with inputs (#43), so the window is the honest signal,
+      // and the progression previews what a release will do without
+      // memorizing any mapping. Re-evaluated every tick, so the LEDs
+      // step through the traffic light as the hold crosses each boundary;
+      // a gated (restricted) input still shows nothing at all.
+      if (tempActionIndex != CONF_ACTION_NOTHING && g_lightMode == CONF_LIGHT_MODE_STATE) {
+        unsigned long holdMs = actionState.elapsedTime;
+        int stateColor = CONF_INPUT_STATE_LED_MAX_COLOR;
+        if (holdMs < effectiveWindowMs(CONF_INPUT_WINDOW_LONG_DEFAULT_MS)) {
+          stateColor = (holdMs < effectiveWindowMs(CONF_INPUT_WINDOW_SHORT_DEFAULT_MS))
+                           ? CONF_INPUT_STATE_LED_SHORT_COLOR
+                           : CONF_INPUT_STATE_LED_LONG_COLOR;
+        }
+        setLedState(LED_ACTION_ON, stateColor, CONF_INPUT_STATE_LED_NUMBER, 0, 0, led.getLedBrightness());
+        performLedAction(ledCurrentState);
+        break;
+      }
 
       // Set Led color to default
       //setLedDefault();

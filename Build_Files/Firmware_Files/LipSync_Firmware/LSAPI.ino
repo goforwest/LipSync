@@ -2007,6 +2007,11 @@ int getLightMode(bool responseEnabled, bool apiEnabled) {
     mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempLightMode);
   }
 
+  g_lightMode = tempLightMode;  // Keep the live global honest (the input-state
+                                // LED mode reads it; before this it was only
+                                // ever set by setLightMode, so a boot with a
+                                // stored mode read as 0/None until first write)
+
   printResponseInt(responseEnabled, apiEnabled, true, 0, "LM,0", true, tempLightMode);
 
   return tempLightMode;
