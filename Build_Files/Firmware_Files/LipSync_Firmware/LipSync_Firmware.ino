@@ -134,6 +134,15 @@ unsigned long g_inputWindowShortMs = 0;  // WS — short | long boundary
 unsigned long g_inputWindowLongMs = 0;   // WL — long | very-long boundary
 unsigned long g_inputWindowMaxMs = 0;    // WM — very-long boundary
 
+// External switch action remapping (roadmap item 11's #20 follow-up,
+// firmware 4.5.0): the live copy of switchActionProperty the input loop
+// evaluates against. initInput() seeds it from the compiled table and
+// initSwitchActions() (called from initRestrictions, with the other
+// input-related stored settings) overlays any stored remaps — so a device
+// with no stored mapping (every settings file written by older firmware)
+// behaves byte-for-byte like the compiled table.
+inputActionStruct g_switchActionTable[sizeof(switchActionProperty) / sizeof(inputActionStruct)];
+
 // Timing Variables for Debugging
 unsigned long beginMillis;
 unsigned long beforeComOpMillis;
@@ -1187,6 +1196,9 @@ void initInput() {
   is.begin();                                                                      // Begin input switches
   switchActionSize = sizeof(switchActionProperty) / sizeof(inputActionStruct);     // Size of total available switch input actions
   switchActionMaxTime = getActionMaxTime(switchActionSize, switchActionProperty);  // Maximum switch action end time
+  // Seed the live switch action table from the compiled one — remappable
+  // cells (roadmap item 11's #20 follow-up) are overlaid by initSwitchActions()
+  memcpy(g_switchActionTable, switchActionProperty, sizeof(switchActionProperty));
 }
 
 //***INITIALIZE RESTRICTIONS FUNCTION***//
@@ -1212,6 +1224,74 @@ void initRestrictions() {
   getInputWindowShort(false, false);
   getInputWindowLong(false, false);
   getInputWindowMax(false, false);
+  // External switch action remaps (#20) join the same stroke — the getters
+  // apply any stored mapping onto the live table before the first tick.
+  initSwitchActions();
+}
+
+//***INITIALIZE SWITCH ACTIONS FUNCTION***//
+// Function   : initSwitchActions
+//
+// Description: Loads the external-switch action remaps (roadmap item 11's
+//              #20 follow-up, firmware 4.5.0) from flash memory onto the
+//              live switch action table. Reads go through the SA/SB/SC/GA/
+//              GB/GC getters so the boot path and the serial API share one
+//              apply implementation; a device with no stored mapping keeps
+//              the compiled table exactly.
+//
+// Parameters : void
+//
+// Return     : void
+//****************************************//
+void initSwitchActions() {
+  if (USB_DEBUG) { Serial.println("USBDEBUG: initSwitchActions()"); }
+  getSwitchAction(false, false, "SA");
+  getSwitchAction(false, false, "SB");
+  getSwitchAction(false, false, "SC");
+  getSwitchAction(false, false, "GA");
+  getSwitchAction(false, false, "GB");
+  getSwitchAction(false, false, "GC");
+}
+
+//***SWITCH REMAP HELPER FUNCTIONS***//
+// Function   : switchRemapAllowed / switchRemapApplyCell
+//
+// Description: The validation and apply helpers shared by every remap
+//              endpoint. switchRemapAllowed pins a cell value to the
+//              caregiver-safe allowlist (LSConfig.h — one accidental switch
+//              press must never be able to reset or factory-reset the
+//              device). switchRemapApplyCell writes one remapped cell into
+//              the live table; the jack index runs 0-2, the window index
+//              0-2 (short/long/max), gamepad selects the action column.
+//
+// Parameters : actionNumber : int : an output action number
+//              jack / window : int : cell coordinates
+//              gamepad : bool : true = gamepad-mode column
+//
+// Return     : bool : allowlist membership
+//              void : (apply)
+//****************************************//
+bool switchRemapAllowed(int actionNumber) {
+  for (unsigned int i = 0; i < CONF_SWITCH_REMAP_ALLOWED_NUM; i++) {
+    if (CONF_SWITCH_REMAP_ALLOWED[i] == actionNumber) return true;
+  }
+  return false;
+}
+
+void switchRemapApplyCell(int jack, int window, bool gamepad, int actionNumber) {
+  int row = CONF_SWITCH_REMAP_FIRST_ROW + jack * CONF_SWITCH_REMAP_ROWS_PER_JACK + window;
+  if (row < 0 || row >= (int)(sizeof(switchActionProperty) / sizeof(inputActionStruct))) return;
+  if (gamepad) {
+    g_switchActionTable[row].gamepadOutputActionNumber = (uint8_t)actionNumber;
+  } else {
+    g_switchActionTable[row].mouseOutputActionNumber = (uint8_t)actionNumber;
+  }
+}
+
+int switchRemapDefaultCell(int jack, int window, bool gamepad) {
+  int row = CONF_SWITCH_REMAP_FIRST_ROW + jack * CONF_SWITCH_REMAP_ROWS_PER_JACK + window;
+  if (gamepad) return (int)switchActionProperty[row].gamepadOutputActionNumber;
+  return (int)switchActionProperty[row].mouseOutputActionNumber;
 }
 
 //***EFFECTIVE WINDOW FUNCTION***//
@@ -1336,7 +1416,7 @@ void inputLoop() {
 
   // Evaluate Output Actions
   evaluateOutputAction(buttonState, buttonActionMaxTime, buttonActionSize, buttonActionProperty, INPUT_CLASS_BUTTON);
-  evaluateOutputAction(switchState, switchActionMaxTime, switchActionSize, switchActionProperty, INPUT_CLASS_SWITCH);
+  evaluateOutputAction(switchState, switchActionMaxTime, switchActionSize, g_switchActionTable, INPUT_CLASS_SWITCH);
 
 }
 

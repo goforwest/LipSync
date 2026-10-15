@@ -155,6 +155,26 @@ void getInputWindowMax(bool responseEnabled, bool apiEnabled, String optionalPar
 void setInputWindowMax(bool responseEnabled, bool apiEnabled, unsigned long inputWindowMs);
 void setInputWindowMax(bool responseEnabled, bool apiEnabled, String optionalParameter);
 
+// External switch action remapping (roadmap item 11's #20 follow-up,
+// firmware 4.5.0): one endpoint per (jack, mode) — SA/SB/SC = jacks 1/2/3
+// mouse mode, GA/GB/GC = gamepad mode. The shared core getter answers and
+// applies "short,long,max"; the setter takes 0 (compiled default) or
+// CONF_SWITCH_ACTION_PACK_BASE + packed triple with allowlisted cells.
+String getSwitchAction(bool responseEnabled, bool apiEnabled, String commandKey);
+void setSwitchAction(bool responseEnabled, bool apiEnabled, String commandKey, int packedWireValue);
+void getSwitchActionSA(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void setSwitchActionSA(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void getSwitchActionSB(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void setSwitchActionSB(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void getSwitchActionSC(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void setSwitchActionSC(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void getSwitchActionGA(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void setSwitchActionGA(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void getSwitchActionGB(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void setSwitchActionGB(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void getSwitchActionGC(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void setSwitchActionGC(bool responseEnabled, bool apiEnabled, String optionalParameter);
+
 // Hub menu, diagnostics and device actions
 void controlHubMenu(bool responseEnabled, bool apiEnabled, int inputMenuControl);
 void controlHubMenu(bool responseEnabled, bool apiEnabled, String optionalParameter);
@@ -203,6 +223,15 @@ unsigned long effectiveWindowMs(unsigned long defaultWindowMs);
 float pressThresholdLevelUp(float currentThreshold);
 float pressThresholdLevelDown(float currentThreshold);
 int pressThresholdLevelFor(float currentThreshold);
+
+// External switch action remap machinery (roadmap item 11's #20 follow-up):
+// boot-time load of the six stored mappings onto the live switch table, the
+// allowlist check every remapped cell passes, and the cell apply/default
+// helpers shared by the SA/SB/SC/GA/GB/GC endpoints.
+void initSwitchActions();
+bool switchRemapAllowed(int actionNumber);
+void switchRemapApplyCell(int jack, int window, bool gamepad, int actionNumber);
+int switchRemapDefaultCell(int jack, int window, bool gamepad);
 
 // Screen page-transition continuations passed to LSScreen::scheduleTransition()
 void clearSplashScreen();

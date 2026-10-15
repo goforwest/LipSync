@@ -29,7 +29,7 @@
 #define CONF_LIPSYNC_MODEL 1                // 1: Lipsync w/ Hub
 
 #define CONF_LIPSYNC_VERSION_MAJOR  4
-#define CONF_LIPSYNC_VERSION_MINOR  4
+#define CONF_LIPSYNC_VERSION_MINOR  5
 #define CONF_LIPSYNC_VERSION_REV    0
 
 const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + "." + String(CONF_LIPSYNC_VERSION_MINOR) + "." + String(CONF_LIPSYNC_VERSION_REV);
@@ -159,7 +159,7 @@ const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + 
 
 // Flash Memory settings - Don't change
 #define CONF_SETTINGS_FILE    "/settings.txt"
-#define CONF_SETTINGS_JSON    "{\"MN\":0,\"VN1\":4,\"VN2\":1,\"VN3\":0,\"ID\":0,\"OM\":1,\"CM\":1,\"SS\":5,\"SL\":5,\"ST\":3.0,\"PT\":3.0,\"AV\":0,\"IZ\":0.07,\"OZ\":0.95,\"CA0\":[0.0,0.0],\"CA1\":[-13.0,13.0],\"CA2\":[13.0,13.0],\"CA3\":[13.0,-13.0],\"CA4\":[-13.0,-13.0],\"SM\":1,\"LM\":1,\"LL\":5,\"DM\":0,\"SD\":0,\"MA\":0,\"LK\":0,\"CF\":0,\"WS\":0,\"WL\":0,\"WM\":0}"
+#define CONF_SETTINGS_JSON    "{\"MN\":0,\"VN1\":4,\"VN2\":1,\"VN3\":0,\"ID\":0,\"OM\":1,\"CM\":1,\"SS\":5,\"SL\":5,\"ST\":3.0,\"PT\":3.0,\"AV\":0,\"IZ\":0.07,\"OZ\":0.95,\"CA0\":[0.0,0.0],\"CA1\":[-13.0,13.0],\"CA2\":[13.0,13.0],\"CA3\":[13.0,-13.0],\"CA4\":[-13.0,-13.0],\"SM\":1,\"LM\":1,\"LL\":5,\"DM\":0,\"SD\":0,\"MA\":0,\"LK\":0,\"CF\":0,\"WS\":0,\"WL\":0,\"WM\":0,\"SA\":0,\"SB\":0,\"SC\":0,\"GA\":0,\"GB\":0,\"GC\":0}"
 
 // Input restriction settings (roadmap item 11) — every one defaults to 0 =
 // the unrestricted legacy behavior, so a settings file written by older
@@ -510,11 +510,63 @@ const inputActionStruct switchActionProperty[]{
   { INPUT_MAIN_STATE_S2_PRESSED,      CONF_ACTION_CURSOR_CENTER, CONF_ACTION_CURSOR_CENTER, CONF_ACTION_NOTHING,  CONF_ACTION_NOTHING,        3000,  8000 },
   
   { INPUT_MAIN_STATE_S3_PRESSED,      CONF_ACTION_RIGHT_CLICK,  CONF_ACTION_B2_PRESS,       CONF_ACTION_NEXT_MENU_ITEM,  CONF_ACTION_NEXT_MENU_ITEM,    0,  1000 },
-  { INPUT_MAIN_STATE_S3_PRESSED,      CONF_ACTION_SCROLL,       CONF_ACTION_B4_PRESS,       CONF_ACTION_NOTHING,   CONF_ACTION_NOTHING,       1000,  3000 },
-  { INPUT_MAIN_STATE_S3_PRESSED,      CONF_ACTION_MIDDLE_CLICK, CONF_ACTION_NOTHING,        CONF_ACTION_NOTHING,  CONF_ACTION_NOTHING,        3000,  8000 },
+  { INPUT_MAIN_STATE_S3_PRESSED,      CONF_ACTION_SCROLL,        CONF_ACTION_B4_PRESS,       CONF_ACTION_NOTHING,   CONF_ACTION_NOTHING,       1000,  3000 },
+  { INPUT_MAIN_STATE_S3_PRESSED,      CONF_ACTION_MIDDLE_CLICK,  CONF_ACTION_NOTHING,        CONF_ACTION_NOTHING,   CONF_ACTION_NOTHING,       3000,  8000 },
   
   { INPUT_MAIN_STATE_S13_PRESSED,      CONF_ACTION_START_MENU,  CONF_ACTION_START_MENU,     CONF_ACTION_STOP_MENU,  CONF_ACTION_NOTHING,          0, 3000 },
 };
+
+// External switch action remapping (roadmap item 11's #20 follow-up, firmware
+// 4.5.0): the MOUSE- and GAMEPAD-mode action cells of the three switch jacks
+// are user-mappable settings (a clinician's ask — switches mapped to functions
+// DIFFERENT from sip & puff, and separately mappable per host). The menu- and
+// safe-mode columns stay compiled (menu navigation is a fixed language, and
+// remapping it could strand a user outside the menu), the S13 combination row
+// stays compiled, and the time windows stay the routing language (item 15).
+//
+// Wire/storage form: one settings key per (jack, mode) — SA/SB/SC = jacks
+// 1/2/3 mouse mode, GA/GB/GC = gamepad mode — each holding the three window
+// actions packed as short*10000 + long*100 + max. Stored 0 = the compiled
+// default triple (which is also what a settings file written by older
+// firmware reads for the missing keys, so an update keeps the factory
+// mapping). The SET wire value carries CONF_SWITCH_ACTION_PACK_BASE plus the
+// packed triple so it always lands on the 6-digit command shape the serial
+// format validator accepts (5-digit values are not in the whitelist).
+#define CONF_SWITCH_ACTION_PACK_BASE 100000
+
+// Row indices in switchActionProperty for the remappable cells: rows 1-3 are
+// jack 1 (short/long/max), 4-6 jack 2, 7-9 jack 3. (Row 0 is NONE, row 10 is
+// the S13 combination — both stay compiled.)
+#define CONF_SWITCH_REMAP_FIRST_ROW 1
+#define CONF_SWITCH_REMAP_ROWS_PER_JACK 3
+
+// Actions a switch cell may be remapped to — the caregiver-safe subset of the
+// output vocabulary: nothing, the clicks/drag/scroll, the gamepad buttons B1-B8,
+// cursor centering, the speed steps, mode change (already gated by LK) and
+// menu open. Deliberately excluded: calibration (15), menu navigation
+// (20-22), software reset (23) and factory reset (24) — one accidental press
+// of a remapped switch must never be able to erase settings or restart the
+// device.
+const int CONF_SWITCH_REMAP_ALLOWED[] = { CONF_ACTION_NOTHING,
+                                          CONF_ACTION_LEFT_CLICK,
+                                          CONF_ACTION_RIGHT_CLICK,
+                                          CONF_ACTION_MIDDLE_CLICK,
+                                          CONF_ACTION_DRAG,
+                                          CONF_ACTION_SCROLL,
+                                          CONF_ACTION_B1_PRESS,
+                                          CONF_ACTION_B2_PRESS,
+                                          CONF_ACTION_B3_PRESS,
+                                          CONF_ACTION_B4_PRESS,
+                                          CONF_ACTION_B5_PRESS,
+                                          CONF_ACTION_B6_PRESS,
+                                          CONF_ACTION_B7_PRESS,
+                                          CONF_ACTION_B8_PRESS,
+                                          CONF_ACTION_CURSOR_CENTER,
+                                          CONF_ACTION_DEC_SPEED,
+                                          CONF_ACTION_INC_SPEED,
+                                          CONF_ACTION_CHANGE_MODE,
+                                          CONF_ACTION_START_MENU };
+#define CONF_SWITCH_REMAP_ALLOWED_NUM (sizeof(CONF_SWITCH_REMAP_ALLOWED) / sizeof(CONF_SWITCH_REMAP_ALLOWED[0]))
 
 // LED Action for all available output actions. This maps what happens with the lights when different actions are triggered.
 // ledOutputActionNumber, ledNumber, ledStartColor, ledEndColor, ledEndAction

@@ -84,6 +84,19 @@ _functionList setInputWindowLongFunction =         {"WL", "1", "",  &setInputWin
 _functionList getInputWindowMaxFunction =          {"WM", "0", "0", &getInputWindowMax};
 _functionList setInputWindowMaxFunction =          {"WM", "1", "",  &setInputWindowMax};
 
+_functionList getSwitchActionSAFunction =          {"SA", "0", "0", &getSwitchActionSA};
+_functionList setSwitchActionSAFunction =          {"SA", "1", "",  &setSwitchActionSA};
+_functionList getSwitchActionSBFunction =          {"SB", "0", "0", &getSwitchActionSB};
+_functionList setSwitchActionSBFunction =          {"SB", "1", "",  &setSwitchActionSB};
+_functionList getSwitchActionSCFunction =          {"SC", "0", "0", &getSwitchActionSC};
+_functionList setSwitchActionSCFunction =          {"SC", "1", "",  &setSwitchActionSC};
+_functionList getSwitchActionGAFunction =          {"GA", "0", "0", &getSwitchActionGA};
+_functionList setSwitchActionGAFunction =          {"GA", "1", "",  &setSwitchActionGA};
+_functionList getSwitchActionGBFunction =          {"GB", "0", "0", &getSwitchActionGB};
+_functionList setSwitchActionGBFunction =          {"GB", "1", "",  &setSwitchActionGB};
+_functionList getSwitchActionGCFunction =          {"GC", "0", "0", &getSwitchActionGC};
+_functionList setSwitchActionGCFunction =          {"GC", "1", "",  &setSwitchActionGC};
+
 _functionList controlHubMenuFunction =            {"CH", "1", "",  &controlHubMenu};
 
 _functionList getDebugModeFunction =              {"DM", "0", "0", &getDebugMode};
@@ -148,6 +161,18 @@ _functionList apiFunction[] = { //Let compiler determine number of functions
   setInputWindowLongFunction,
   getInputWindowMaxFunction,
   setInputWindowMaxFunction,
+  getSwitchActionSAFunction,
+  setSwitchActionSAFunction,
+  getSwitchActionSBFunction,
+  setSwitchActionSBFunction,
+  getSwitchActionSCFunction,
+  setSwitchActionSCFunction,
+  getSwitchActionGAFunction,
+  setSwitchActionGAFunction,
+  getSwitchActionGBFunction,
+  setSwitchActionGBFunction,
+  getSwitchActionGCFunction,
+  setSwitchActionGCFunction,
   controlHubMenuFunction,
   getDebugModeFunction,
   setDebugModeFunction,
@@ -2583,6 +2608,138 @@ void setInputWindowMax(bool responseEnabled, bool apiEnabled, String optionalPar
 
 // *********************************************************************************
 
+// External switch action remapping (roadmap item 11's #20 follow-up, firmware
+// 4.5.0): the MOUSE- and GAMEPAD-mode action cells of the three switch jacks
+// are settings — SA/SB/SC are jacks 1/2/3 in mouse mode, GA/GB/GC the same
+// jacks in gamepad mode. The GET answers "short,long,max" (the action each
+// hold window triggers, in force); the SET takes
+// CONF_SWITCH_ACTION_PACK_BASE + short*10000 + long*100 + max (the base keeps
+// every non-reset value a 6-digit number, the one shape the serial format
+// validator accepts at that magnitude), where every cell must be on the
+// caregiver-safe allowlist; 0 resets that jack/mode to the compiled factory
+// mapping. Menu- and safe-mode actions, the S13 combination row and the time
+// windows themselves stay compiled — see LSConfig.h's remap block.
+
+//***GET SWITCH ACTION FUNCTION***//
+// Function   : getSwitchAction
+//
+// Description: Reads one jack/mode's three window actions (short,long,max),
+//              applies them onto the live switch action table, and answers
+//              them as a comma triple. Stored values below the pack base
+//              (0 = a settings file written by older firmware) mean the
+//              compiled defaults — and the live cells are re-applied either
+//              way, so a read always leaves the table consistent with what
+//              it answers.
+//
+// Parameters : commandKey : String : SA / SB / SC / GA / GB / GC
+//
+// Return     : String : "short,long,max" as answered
+//*********************************//
+String getSwitchAction(bool responseEnabled, bool apiEnabled, String commandKey) {
+  bool gamepad = (commandKey.charAt(0) == 'G');
+  int jack = (int)(commandKey.charAt(1) - 'A');
+  int cells[3] = { 0, 0, 0 };
+  if (CONF_API_ENABLED) {
+    int stored = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+    if (stored >= CONF_SWITCH_ACTION_PACK_BASE) {
+      int packed = stored - CONF_SWITCH_ACTION_PACK_BASE;
+      cells[0] = packed / 10000;
+      cells[1] = (packed / 100) % 100;
+      cells[2] = packed % 100;
+    } else {
+      for (int w = 0; w < CONF_SWITCH_REMAP_ROWS_PER_JACK; w++) cells[w] = switchRemapDefaultCell(jack, w, gamepad);
+    }
+  } else {
+    for (int w = 0; w < CONF_SWITCH_REMAP_ROWS_PER_JACK; w++) cells[w] = switchRemapDefaultCell(jack, w, gamepad);
+  }
+  for (int w = 0; w < CONF_SWITCH_REMAP_ROWS_PER_JACK; w++) switchRemapApplyCell(jack, w, gamepad, cells[w]);
+  String triple = String(cells[0]) + "," + String(cells[1]) + "," + String(cells[2]);
+  printResponseString(responseEnabled, apiEnabled, true, 0, commandKey + ",0", true, triple);
+  return triple;
+}
+
+//***SET SWITCH ACTION FUNCTION***//
+// Function   : setSwitchAction
+//
+// Description: Writes one jack/mode's three window actions. 0 resets to the
+//              compiled factory mapping; otherwise the value must be
+//              CONF_SWITCH_ACTION_PACK_BASE + short*10000 + long*100 + max
+//              with every cell on the remap allowlist. The stored value is
+//              the wire value verbatim (0 = default), the live table takes
+//              the cells immediately, and the response echoes what the
+//              device actually took.
+//
+// Parameters : commandKey : String : SA / SB / SC / GA / GB / GC
+//              packedWireValue : int : 0 or base + packed triple
+//
+// Return     : void
+//*********************************//
+void setSwitchAction(bool responseEnabled, bool apiEnabled, String commandKey, int packedWireValue) {
+  bool gamepad = (commandKey.charAt(0) == 'G');
+  int jack = (int)(commandKey.charAt(1) - 'A');
+  bool accepted = false;
+  int cells[3] = { 0, 0, 0 };
+  if (packedWireValue == 0) {
+    for (int w = 0; w < CONF_SWITCH_REMAP_ROWS_PER_JACK; w++) cells[w] = switchRemapDefaultCell(jack, w, gamepad);
+    accepted = true;
+  } else if (packedWireValue >= CONF_SWITCH_ACTION_PACK_BASE &&
+             packedWireValue <= CONF_SWITCH_ACTION_PACK_BASE + 19 * 10000 + 19 * 100 + 19) {
+    int packed = packedWireValue - CONF_SWITCH_ACTION_PACK_BASE;
+    cells[0] = packed / 10000;
+    cells[1] = (packed / 100) % 100;
+    cells[2] = packed % 100;
+    accepted = switchRemapAllowed(cells[0]) && switchRemapAllowed(cells[1]) && switchRemapAllowed(cells[2]);
+  }
+  if (accepted) {
+    mem.writeInt(CONF_SETTINGS_FILE, commandKey, packedWireValue);
+    for (int w = 0; w < CONF_SWITCH_REMAP_ROWS_PER_JACK; w++) switchRemapApplyCell(jack, w, gamepad, cells[w]);
+    printResponseInt(responseEnabled, apiEnabled, true, 0, commandKey + ",1", true, packedWireValue);
+  } else {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey + ",1", true, packedWireValue);
+  }
+}
+
+// Per-endpoint API wrappers: the dispatch table calls the (bool, bool, String)
+// overload of each of the six endpoints.
+void getSwitchActionSA(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 0) getSwitchAction(responseEnabled, apiEnabled, "SA");
+}
+void setSwitchActionSA(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  setSwitchAction(responseEnabled, apiEnabled, "SA", optionalParameter.toInt());
+}
+void getSwitchActionSB(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 0) getSwitchAction(responseEnabled, apiEnabled, "SB");
+}
+void setSwitchActionSB(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  setSwitchAction(responseEnabled, apiEnabled, "SB", optionalParameter.toInt());
+}
+void getSwitchActionSC(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 0) getSwitchAction(responseEnabled, apiEnabled, "SC");
+}
+void setSwitchActionSC(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  setSwitchAction(responseEnabled, apiEnabled, "SC", optionalParameter.toInt());
+}
+void getSwitchActionGA(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 0) getSwitchAction(responseEnabled, apiEnabled, "GA");
+}
+void setSwitchActionGA(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  setSwitchAction(responseEnabled, apiEnabled, "GA", optionalParameter.toInt());
+}
+void getSwitchActionGB(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 0) getSwitchAction(responseEnabled, apiEnabled, "GB");
+}
+void setSwitchActionGB(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  setSwitchAction(responseEnabled, apiEnabled, "GB", optionalParameter.toInt());
+}
+void getSwitchActionGC(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 0) getSwitchAction(responseEnabled, apiEnabled, "GC");
+}
+void setSwitchActionGC(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  setSwitchAction(responseEnabled, apiEnabled, "GC", optionalParameter.toInt());
+}
+
+// *********************************************************************************
+
 //***OPEN HUB MENU FUNCTION***//
 // Function   : openHubMenu
 //
@@ -2790,6 +2947,12 @@ void exportSettings(bool responseEnabled, bool apiEnabled) {
   getInputWindowShort(responseEnabled, apiEnabled);
   getInputWindowLong(responseEnabled, apiEnabled);
   getInputWindowMax(responseEnabled, apiEnabled);
+  getSwitchAction(responseEnabled, apiEnabled, "SA");
+  getSwitchAction(responseEnabled, apiEnabled, "SB");
+  getSwitchAction(responseEnabled, apiEnabled, "SC");
+  getSwitchAction(responseEnabled, apiEnabled, "GA");
+  getSwitchAction(responseEnabled, apiEnabled, "GB");
+  getSwitchAction(responseEnabled, apiEnabled, "GC");
 
   printResponseString(responseEnabled, apiEnabled, true, 0, "EX,0", true, "END");
 }
@@ -2962,6 +3125,12 @@ void doFactoryReset(bool responseEnabled, bool apiEnabled) {
   setInputWindowShort(false, false, 0);   // Timing windows reset to the
   setInputWindowLong(false, false, 0);    // compiled factory feel
   setInputWindowMax(false, false, 0);
+  setSwitchAction(false, false, "SA", 0);  // Switch action remaps reset
+  setSwitchAction(false, false, "SB", 0);  // to the compiled factory
+  setSwitchAction(false, false, "SC", 0);  // mapping — a factory reset can
+  setSwitchAction(false, false, "GA", 0);  // never leave a caregiver
+  setSwitchAction(false, false, "GB", 0);  // mapping behind
+  setSwitchAction(false, false, "GC", 0);
   printResponseInt(responseEnabled, apiEnabled, true, 0, "FR,1", true, 1);
 
   // Clear all LEDs to indicate factory reset process is finished 
