@@ -130,9 +130,9 @@ bool g_freezeCursorDuringSap = false;  // CF — cursor output freezes while a s
 // Input timing windows (roadmap item 15, upstream #62/#9) — stored 0 means
 // the compiled default; the getters/setters keep these live. These are the
 // STORED values; effectiveWindowMs() maps them onto the action tables.
-unsigned long g_inputWindowShortMs = 0;  // W1 — short | long boundary
-unsigned long g_inputWindowLongMs = 0;   // W2 — long | very-long boundary
-unsigned long g_inputWindowMaxMs = 0;    // W3 — very-long boundary
+unsigned long g_inputWindowShortMs = 0;  // WS — short | long boundary
+unsigned long g_inputWindowLongMs = 0;   // WL — long | very-long boundary
+unsigned long g_inputWindowMaxMs = 0;    // WM — very-long boundary
 
 // Timing Variables for Debugging
 unsigned long beginMillis;

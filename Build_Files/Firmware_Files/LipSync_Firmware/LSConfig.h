@@ -159,7 +159,7 @@ const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + 
 
 // Flash Memory settings - Don't change
 #define CONF_SETTINGS_FILE    "/settings.txt"
-#define CONF_SETTINGS_JSON    "{\"MN\":0,\"VN1\":4,\"VN2\":1,\"VN3\":0,\"ID\":0,\"OM\":1,\"CM\":1,\"SS\":5,\"SL\":5,\"ST\":3.0,\"PT\":3.0,\"AV\":0,\"IZ\":0.07,\"OZ\":0.95,\"CA0\":[0.0,0.0],\"CA1\":[-13.0,13.0],\"CA2\":[13.0,13.0],\"CA3\":[13.0,-13.0],\"CA4\":[-13.0,-13.0],\"SM\":1,\"LM\":1,\"LL\":5,\"DM\":0,\"SD\":0,\"MA\":0,\"LK\":0,\"CF\":0,\"W1\":0,\"W2\":0,\"W3\":0}"
+#define CONF_SETTINGS_JSON    "{\"MN\":0,\"VN1\":4,\"VN2\":1,\"VN3\":0,\"ID\":0,\"OM\":1,\"CM\":1,\"SS\":5,\"SL\":5,\"ST\":3.0,\"PT\":3.0,\"AV\":0,\"IZ\":0.07,\"OZ\":0.95,\"CA0\":[0.0,0.0],\"CA1\":[-13.0,13.0],\"CA2\":[13.0,13.0],\"CA3\":[13.0,-13.0],\"CA4\":[-13.0,-13.0],\"SM\":1,\"LM\":1,\"LL\":5,\"DM\":0,\"SD\":0,\"MA\":0,\"LK\":0,\"CF\":0,\"WS\":0,\"WL\":0,\"WM\":0}"
 
 // Input restriction settings (roadmap item 11) — every one defaults to 0 =
 // the unrestricted legacy behavior, so a settings file written by older

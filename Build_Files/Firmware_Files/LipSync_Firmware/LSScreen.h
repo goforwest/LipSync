@@ -211,7 +211,7 @@ private:
 
   float _sipPressThresh;
   float _puffPressThresh;
-  int _timingWindowSel = 0;  // Timing adjust page target: 0 = short (W1), 1 = long (W2), 2 = max (W3)
+  int _timingWindowSel = 0;  // Timing adjust page target: 0 = short (WS), 1 = long (WL), 2 = max (WM)
 
   unsigned long _lastActivityMillis;
 
@@ -1164,9 +1164,9 @@ void LSScreen::selectMenuItem() {
       // Input timing windows (roadmap item 15, upstream #62): one page per
       // boundary; selecting a line opens its adjust page.
       switch (_currentSelection) {
-        case 0:  // Short window (W1)
-        case 1:  // Long window (W2)
-        case 2:  // Max window (W3)
+        case 0:  // Short window (WS)
+        case 1:  // Long window (WL)
+        case 2:  // Max window (WM)
           _timingWindowSel = _currentSelection;
           adjustTimingMenu();
           break;
@@ -1761,7 +1761,7 @@ void LSScreen::timingMenu(void) {
 // Function   : adjustTimingMenu
 //
 // Description: Format and display the adjust page for the selected input
-//              timing window (_timingWindowSel: 0 = short/W1, 1 = long/W2,
+//              timing window (_timingWindowSel: 0 = short/WS, 1 = long/WL,
 //              2 = max/W3). Increase/Decrease step 250 ms; the API setter
 //              clamps range and ordering, so a refused step re-reads as the
 //              unchanged value.
