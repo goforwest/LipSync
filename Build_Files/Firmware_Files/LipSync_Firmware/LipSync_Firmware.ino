@@ -177,6 +177,18 @@ void setup() {
 
   beginMillis = millis();  // Intialize timer
 
+  // Keep the bus dark until the composite descriptor is complete. The core
+  // pulls D+ (so the host can start enumerating) before setup() runs, and
+  // the slow parts of boot (LittleFS mount, settings load) leave a long
+  // window where only the CDC interface is registered: a host that is
+  // actively hunting for the post-flash port can enumerate that CDC-only
+  // device and never re-enumerate, leaving the HID interface down for the
+  // whole boot (bench 2026-10-16: BH showed usbMounted=1, hidReady=0,
+  // attempts climbing, successes=0 until a manual restart). Detaching here
+  // makes every premature enumeration attempt fail; beginComOpMode()
+  // attaches once the full descriptor exists.
+  USBDevice.detach();
+
   Serial.begin(115200);
 
   initMemory();  // Initialize Memory
@@ -1172,6 +1184,15 @@ void beginComOpMode() {
 
   initCommunicationMode();  // Retrieve communication mode from memory (None, USB, Bluetooth)
   initOperatingMode();      // Retrieve operating mode from memory (USB Mouse, Bluetooth Mouse, Gamepad)
+
+  // Bus up only now: setup() detached at the top, so no host could have
+  // locked in a CDC-only enumeration during boot. CDC has been registered
+  // since Serial.begin(); the mode interface registers microseconds below.
+  // A host needs at least a connect-detect + bus-reset cycle (ms) after
+  // attach before it can fetch a descriptor, so every enumeration now sees
+  // the complete composite. Safe mode intentionally comes up CDC-only:
+  // serial recovery is the whole point.
+  USBDevice.attach();
 
   switch (g_operatingMode) {
     case CONF_OPERATING_MODE_MOUSE:
