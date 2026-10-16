@@ -131,7 +131,7 @@ public:
   // — against held I2C hardware each draw cost seconds of bounded transaction
   // timeouts, so the retry loop alone dragged every serial exchange to ~2 s.
   void drawUsbErrorPageOnce();
-  void resetUsbErrorPage();
+  bool resetUsbErrorPage();
 
   // Display-health gate state for the bus-health diagnostic endpoint (BH):
   // false means the last framebuffer push wedged or crawled and the display
@@ -167,6 +167,8 @@ private:
   unsigned long _inputFrozenUntil = 0;  // While millis() is before this, menu input is frozen (a scheduled page transition owns the menu)
   int _transitionTimerId = -1;           // Pending scheduled page transition (LSTimer id), -1 = none
   bool _usbErrorPageShown = false;       // The no-USB page has been drawn for the current error episode
+  bool _usbErrorPagePainted = false;     // The no-USB page actually reached the OLED this episode (the latch
+                                         // can be set on a headless unit where nothing was painted)
   bool _calibrationClosesMenu = false;   // The running calibration was started over the serial API — its end pages close the menu (#36)
   bool _displayHealthy = true;               // Display answers on the I2C bus (mirrors the pressure-sensor health gate)
   unsigned long _lastDisplayProbeMs = 0;     // Last cheap re-probe while the display was marked unhealthy
@@ -542,23 +544,33 @@ void LSScreen::drawUsbErrorPageOnce() {
   if (!Wire.busHealthy()) return;  // Bus is held — a draw would only feed the timeout tax; retried on the next connection check
   if (!_isActive) {
     noUsbPage();
+    _usbErrorPagePainted = true;
   }
   _usbErrorPageShown = true;
 }
 
-void LSScreen::resetUsbErrorPage() {
-  bool wasShown = _usbErrorPageShown;
-  _usbErrorPageShown = false;
-  // #63 residual: the "No USB" page lingered after the host came back — the
-  // device worked normally but the screen still said otherwise, because the
-  // latch reset never redrew anything. The reset IS the moment the default
-  // screen should return: draw it once, and only when an episode actually
-  // painted something on a live display that no menu owns (an open menu
-  // keeps the screen; a held bus costs nothing — flushDisplay gates the push
-  // and the next flush catches up, but skipping the draw is cheaper).
-  if (wasShown && !_isActive && g_displayConnected && Wire.busHealthy()) {
-    splashScreen2();
+bool LSScreen::resetUsbErrorPage() {
+  // #63 residual, round 2 (bench 2026-10-16, reproduced twice): the clear is
+  // ONE-SHOT — usbCheckConnection's healthy branch never re-arms — and it
+  // cleared the episode latch unconditionally while gating the actual draw
+  // behind bus/display health. One healthy tick landing while the bus was in
+  // its 1 s post-recovery window (or the display in a re-probe backoff)
+  // consumed the only clear: latch gone, timer dead, and the No-USB page
+  // stayed on the OLED for the rest of the boot on a fully working device —
+  // the user had to restart by hand. The clear now succeeds only when the
+  // ready page can actually land; the caller re-arms while it cannot.
+  if (!_usbErrorPageShown) return true;
+  if (!_usbErrorPagePainted) {
+    // The latch was set but nothing ever reached the OLED (headless unit, or
+    // every draw was gated) — nothing on screen needs fixing.
+    _usbErrorPageShown = false;
+    return true;
   }
+  if (_isActive || !g_displayConnected || !Wire.busHealthy() || !_displayHealthy) return false;
+  _usbErrorPageShown = false;
+  _usbErrorPagePainted = false;
+  splashScreen2();
+  return true;
 }
 
 bool LSScreen::isDisplayHealthy() {

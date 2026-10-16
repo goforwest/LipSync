@@ -1081,12 +1081,32 @@ void usbCheckConnection(void) {
     usbConnectTimerId[0] = usbConnectTimer.setTimeout(g_usbConnectDelay, usbCheckConnection);  // Keep retrying connection until USB connection is made
 
 
-  } else if (usbmouse.timedOut) {
+  } else if (usbmouse.timedOut && !usbmouse.isReady()) {
+    // A report was attempted and the interface is genuinely still down —
+    // keep the page and keep checking. A latched timedOut with a READY
+    // interface (mouse reports suspended in gamepad/debug mode never clear
+    // the latch themselves) falls through to the healthy branch instead of
+    // parking here forever.
     screen.drawUsbErrorPageOnce();
     usbConnectTimerId[0] = usbConnectTimer.setTimeout(g_usbConnectDelay, usbCheckConnection);  // Keep retrying connection until USB connection is made
   } else {
-    screen.resetUsbErrorPage();  // Connection healthy again — allow the next episode to draw
-    readyToUse();  // TODO
+    usbmouse.timedOut = false;  // Stale latch: the interface is ready, the episode is over
+
+    // Connection healthy. The page clear used to be one-shot — this branch
+    // never re-armed — and resetUsbErrorPage cleared the episode latch even
+    // when its draw was gated off, so a single tick landing while the bus
+    // sat in its post-recovery window stranded the No-USB page on the OLED
+    // for the rest of the boot (bench 2026-10-16, twice: stuck until a
+    // manual restart on a device whose serial session worked the whole
+    // time). The clear now reports success only when the ready page actually
+    // landed; while it has not, re-arm and try again. The retry is cheap
+    // (a gate check, at most one draw) and ends for good once the page
+    // clears or there was never anything painted.
+    if (screen.resetUsbErrorPage()) {
+      readyToUse();
+    } else {
+      usbConnectTimerId[0] = usbConnectTimer.setTimeout(1000, usbCheckConnection);
+    }
   }
 }
 
