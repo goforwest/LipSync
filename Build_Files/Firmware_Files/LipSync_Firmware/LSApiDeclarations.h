@@ -252,6 +252,7 @@ void screenChangeModeTransitionDone();
 void screenReturnToMenuTransitionDone();
 void screenFullCalibConfirmTransitionDone();
 void screenFactoryResetConfirm2TransitionDone();
+void screenModeLockedTransitionDone();
 
 // Calibration state machine callbacks (timer continuations, referenced by
 // the calibration timers and by setJoystickCalibration / setJoystickInitialization)

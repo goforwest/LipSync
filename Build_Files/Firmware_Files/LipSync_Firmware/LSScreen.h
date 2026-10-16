@@ -124,6 +124,8 @@ public:
   void finishChangeMode();
   void fullCalibrationConfirmMenu();
   void factoryResetConfirm2Menu();
+  void modeLockedPage();
+  void finishModeLocked();
 
   // The USB-retry loop's error page: drawn at most once per error episode, and
   // only when there is a display on an answerable I2C bus. The old code redrew
@@ -840,7 +842,12 @@ void LSScreen::selectMenuItem() {
       // page and trapped the user inside it (bench 2026-10-16) — a lockout
       // must never strand the person it protects.
       if (_currentSelection < (_modeMenuLen - 1) && g_modeLocked) {
+        // Say why, not just beep (bench feedback 2026-10-16): a bare error
+        // cue is ambiguous — dead button, generic error, or locked? The
+        // locked page names the reason and the unlock path, then returns to
+        // the Mode page.
         buzzerErrorCue();
+        modeLockedPage();
         break;
       }
       if (_currentSelection < (_modeMenuLen - 1)) {
@@ -2161,6 +2168,43 @@ void LSScreen::factoryResetConfirm2Page(void) {
   _display.println("settings");
   flushDisplay();
   scheduleTransition(2000, screenFactoryResetConfirm2TransitionDone);  // was delay(2000) — the confirm menu registers on the timer
+}
+
+//*********************************//
+// Function   : modeLockedPage
+//
+// Description: The operating-mode lock's refusal page: names the reason and
+//              the unlock path instead of answering a mode selection with
+//              only an error cue (bench feedback 2026-10-16 — a bare beep
+//              reads as a dead button or generic failure). Shown for ~2 s
+//              with menu input frozen, then the continuation redraws the
+//              Mode page where "... Back" is always live.
+//
+// Arguments :  void
+//
+// Return     : void
+//*********************************//
+void LSScreen::modeLockedPage(void) {
+  setupDisplay();
+  _display.println("Mode is");
+  _display.println("locked.");
+  _display.println("Unlock via");
+  _display.println("the app");
+  flushDisplay();
+  scheduleTransition(2000, screenModeLockedTransitionDone);
+}
+
+//*********************************//
+// Function   : finishModeLocked
+//
+// Description: Scheduled end of the locked page: redraw the Mode options.
+//
+// Arguments :  void
+//
+// Return     : void
+//*********************************//
+void LSScreen::finishModeLocked(void) {
+  modeMenu();
 }
 
 //*********************************//

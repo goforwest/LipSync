@@ -837,6 +837,10 @@ void screenFactoryResetConfirm2TransitionDone() {
   screen.factoryResetConfirm2Menu();
 }
 
+void screenModeLockedTransitionDone() {
+  screen.finishModeLocked();
+}
+
 //***SHOW CENTER RESET COMPLETE PAGE SCREEN FUNCTION***//
 // Function   : showCenterResetComplete
 //
