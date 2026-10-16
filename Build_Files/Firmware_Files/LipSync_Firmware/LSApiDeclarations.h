@@ -229,6 +229,12 @@ int pressThresholdLevelFor(float currentThreshold);
 //  reportAttempts, reportSuccesses, nonzeroReports, maxAbsReport]
 void fillUsbHidDiagnostics(int out[9]);
 
+// Joystick pipeline diagnostics for the extended BH,0:0 line (bench
+// 2026-10-16, round 3): [processCount, skipState, radius*100, centerX*100,
+// centerY*100, dirX, dirY, rangeValue, lastInputX, lastInputY, rawX*100,
+// rawY*100, bufLastX*100, bufLastY*100]
+void fillJoystickPipelineDiagnostics(int out[14]);
+
 // External switch action remap machinery (roadmap item 11's #20 follow-up):
 // boot-time load of the six stored mappings onto the live switch table, the
 // allowlist check every remapped cell passes, and the cell apply/default

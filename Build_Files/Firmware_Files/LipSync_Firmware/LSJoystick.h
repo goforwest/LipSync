@@ -96,6 +96,16 @@ class LSJoystick {
     int mapRoundInt(int input, int inputStart, int inputEnd, int outputStart, int outputEnd);       // Custom map function that rounds the results instead of truncating
     bool isPollBackedOff();                                             // True while the slow-bus backoff is engaged (the joystick poll measured its own update crawling — see update())
 
+    // Pipeline diagnostics (bench 2026-10-16, cursor-dead-on-4.5.0 hunt).
+    // Dumps every internal the input→output pipeline depends on, so one
+    // BH,0:0 read while holding a corner answers what static analysis
+    // cannot: whether the skip gate opens, what the skip comparison sees,
+    // and whether the centering/scaling internals are what the settings
+    // claim. out[0..13] = [processCount, skipState, radius*100, centerX*100,
+    // centerY*100, dirX, dirY, rangeValue, lastInputX, lastInputY,
+    // rawX*100, rawY*100, bufLastX*100, bufLastY*100]
+    void fillPipelineDiagnostics(int out[14]);
+
   private:
     Tlv493d _Tlv493dSensor = Tlv493d();                                   // Create an object of Tlv493d class
     LSCircularBuffer <pointFloatType> _joystickRawBuffer;                 // Create a buffer of type pointFloatType to push raw readings 
@@ -139,6 +149,7 @@ class LSJoystick {
     int _operatingMode;                                                   // Operating mode, gamepad or mouse  //TODO 2025-Mar-06 Remove - Joystick class should be independent of operating mode
     unsigned long _busRetryAtMs = 0;                                      // I2C backoff: no reads until this time (a flaky device on the
     unsigned long _busRetryIntervalMs = 20;                               // shared bus drags transfers until they crawl — see update())
+    uint32_t _processCount = 0;                                           // Times the !skipInputChange block has run since boot (the frozen-pipeline smoking gun if 0)
 
 };
 
@@ -627,6 +638,7 @@ void LSJoystick::update() {
 
 
   if(!_skipInputChange){  // If latest measurement has changed more than the change threshold, process and add to output buffer 
+    _processCount++;
     _inputPoint = processInputReading(_rawPoint);             // Filtered and scaled input readings
     _joystickInputBuffer.pushElement(_inputPoint);            // Add new input point to _joystickInputBuffer
     _outputPoint = processOutputResponse(_inputPoint);        // Process output by applying deadzone, speed control, and linearization
@@ -682,6 +694,34 @@ int LSJoystick::getYOut() {
 //*********************************//
 bool LSJoystick::isPollBackedOff() {
   return _busRetryIntervalMs > 20;
+}
+
+//*********************************//
+// Function   : fillPipelineDiagnostics
+//
+// Description: Dumps the input→output pipeline's live internals for the
+//              extended BH,0:0 line (bench 2026-10-16). Static analysis
+//              traced every one of these healthy against the source —
+//              yet the corner-hold JV read raw≈-17,-23 with in/out at
+//              exact 0.00, so one of the assumptions is false on-device
+//              and only the live values can say which.
+//****************************************//
+void LSJoystick::fillPipelineDiagnostics(int out[14]) {
+  pointFloatType rawBufLast = _joystickRawBuffer.getLastElement();
+  out[0] = (int)(_processCount % 1000000007);  // 0 forever = the skip gate never opens (frozen pipeline)
+  out[1] = _skipInputChange ? 1 : 0;
+  out[2] = (int)(_inputRadius * 100.0f);        // Scaled ×100: huge or 0 both zero the mapping
+  out[3] = (int)(_magnetInputCalibration[0].x * 100.0f);
+  out[4] = (int)(_magnetInputCalibration[0].y * 100.0f);
+  out[5] = _joystickXDirection;
+  out[6] = _joystickYDirection;
+  out[7] = _rangeValue;
+  out[8] = _inputPoint.x;                       // The last point the pipeline actually computed
+  out[9] = _inputPoint.y;
+  out[10] = (int)(_rawPoint.x * 100.0f);        // The skip comparison's current operand, live
+  out[11] = (int)(_rawPoint.y * 100.0f);
+  out[12] = (int)(rawBufLast.x * 100.0f);       // The comparison's previous operand, live
+  out[13] = (int)(rawBufLast.y * 100.0f);
 }
 
 //*********************************//

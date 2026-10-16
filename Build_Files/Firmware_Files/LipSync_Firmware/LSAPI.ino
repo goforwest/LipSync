@@ -1414,15 +1414,22 @@ void getBusHealth(bool responseEnabled, bool apiEnabled) {
   int joystickHealth = 0;
   if (g_joystickSensorConnected) joystickHealth = js.isPollBackedOff() ? 2 : 1;
 
-  // HID-layer telemetry (bench 2026-10-16, cursor-dead-on-4.5.0 hunt):
+  // HID-layer + joystick-pipeline telemetry (bench 2026-10-16 hunt):
   // [6..14] = usbMounted, hidReady, hidRetrying, hidTimedOut,
   // centerComplete, reportAttempts, reportSuccesses, nonzeroReports,
-  // maxAbsReport. The app's health check reads the first six values and
-  // ignores the rest; a serial monitor sees everything.
+  // maxAbsReport; [15..28] = the pipeline internals (see
+  // fillJoystickPipelineDiagnostics). The app's health check reads the
+  // first six values and ignores the rest; a serial monitor sees everything.
   int hidDiagnostics[9];
   fillUsbHidDiagnostics(hidDiagnostics);
 
-  const int outputArraySize = 15;
+  // Round 3 (bench 2026-10-16): the input→output pipeline's live internals —
+  // the corner-hold JV read raw≈-17,-23 with in/out at exact 0.00, and every
+  // stage traces healthy in source, so the running values must speak.
+  int pipelineDiagnostics[14];
+  fillJoystickPipelineDiagnostics(pipelineDiagnostics);
+
+  const int outputArraySize = 29;
   int tempBusHealth[outputArraySize];
   tempBusHealth[0] = (int)recoveries;
   tempBusHealth[1] = Wire.busHealthy() ? 1 : 0;
@@ -1432,6 +1439,9 @@ void getBusHealth(bool responseEnabled, bool apiEnabled) {
   tempBusHealth[5] = ageSec;
   for (int diagIndex = 0; diagIndex < 9; diagIndex++) {
     tempBusHealth[6 + diagIndex] = hidDiagnostics[diagIndex];
+  }
+  for (int diagIndex = 0; diagIndex < 14; diagIndex++) {
+    tempBusHealth[15 + diagIndex] = pipelineDiagnostics[diagIndex];
   }
 
   printResponseIntArray(responseEnabled, apiEnabled, true, 0, "BH,0", true, "", outputArraySize, ',', tempBusHealth);

@@ -1378,6 +1378,22 @@ void fillUsbHidDiagnostics(int out[9]) {
   out[8] = usbmouse.maxAbsReport;
 }
 
+//***FILL JOYSTICK PIPELINE DIAGNOSTICS FUNCTION***//
+// Function   : fillJoystickPipelineDiagnostics
+//
+// Description: Free-function bridge for LSJoystick::fillPipelineDiagnostics
+//              (the .ino cannot call private members directly, but the
+//              merged-TU free function in LSApiDeclarations.h's pattern
+//              needs a callable from LSAPI.ino's BH handler).
+//
+// Parameters : out : int[14] : the live pipeline internals
+//
+// Return     : void
+//****************************************//
+void fillJoystickPipelineDiagnostics(int out[14]) {
+  js.fillPipelineDiagnostics(out);
+}
+
 //***PRESSURE THRESHOLD LEVEL HELPERS***//
 // Function   : pressThresholdLevelUp / pressThresholdLevelDown / pressThresholdLevelFor
 //
