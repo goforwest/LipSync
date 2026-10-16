@@ -224,6 +224,11 @@ float pressThresholdLevelUp(float currentThreshold);
 float pressThresholdLevelDown(float currentThreshold);
 int pressThresholdLevelFor(float currentThreshold);
 
+// HID-layer diagnostics for the extended BH,0:0 line (bench 2026-10-16):
+// [usbMounted, hidReady, hidRetrying, hidTimedOut, centerComplete,
+//  reportAttempts, reportSuccesses]
+void fillUsbHidDiagnostics(int out[7]);
+
 // External switch action remap machinery (roadmap item 11's #20 follow-up):
 // boot-time load of the six stored mappings onto the live switch table, the
 // allowlist check every remapped cell passes, and the cell apply/default

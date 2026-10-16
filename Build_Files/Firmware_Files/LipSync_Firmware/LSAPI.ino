@@ -1414,7 +1414,15 @@ void getBusHealth(bool responseEnabled, bool apiEnabled) {
   int joystickHealth = 0;
   if (g_joystickSensorConnected) joystickHealth = js.isPollBackedOff() ? 2 : 1;
 
-  const int outputArraySize = 6;
+  // HID-layer telemetry (bench 2026-10-16, cursor-dead-on-4.5.0 hunt):
+  // [6..12] = usbMounted, hidReady, hidRetrying, hidTimedOut,
+  // centerComplete, reportAttempts, reportSuccesses. The app's health check
+  // reads the first six values and ignores the rest; a serial monitor sees
+  // everything.
+  int hidDiagnostics[7];
+  fillUsbHidDiagnostics(hidDiagnostics);
+
+  const int outputArraySize = 13;
   int tempBusHealth[outputArraySize];
   tempBusHealth[0] = (int)recoveries;
   tempBusHealth[1] = Wire.busHealthy() ? 1 : 0;
@@ -1422,6 +1430,9 @@ void getBusHealth(bool responseEnabled, bool apiEnabled) {
   tempBusHealth[3] = pressureHealth;
   tempBusHealth[4] = joystickHealth;
   tempBusHealth[5] = ageSec;
+  for (int diagIndex = 0; diagIndex < 7; diagIndex++) {
+    tempBusHealth[6 + diagIndex] = hidDiagnostics[diagIndex];
+  }
 
   printResponseIntArray(responseEnabled, apiEnabled, true, 0, "BH,0", true, "", outputArraySize, ',', tempBusHealth);
 }

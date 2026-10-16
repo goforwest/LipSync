@@ -68,6 +68,14 @@ class LSUSBMouse {
     bool usbRetrying = false;
     bool showTestPage = false;
     bool timedOut = false;
+    // HID telemetry (bench 2026-10-16: cursor dead on 4.5.0 while the ready
+    // page showed, sensor read fine and serial worked — the one fact that
+    // splits "reports never attempted" from "reports attempted and refused"
+    // from "reports accepted by TinyUSB but ignored by the host"). Counted
+    // in mouseReport(), reported through BH,0:0.
+    uint32_t reportAttempts = 0;
+    uint32_t reportSuccesses = 0;
+    unsigned long _lastReportAttemptMs = 0;
   protected:
     uint8_t _buttons;
     bool _begun = false;   // HID interface registered on the USB configuration — must happen exactly once (see begin())
@@ -258,6 +266,8 @@ void LSUSBMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t 
   // improvements item 2). Skipping the report costs one lost cursor update
   // while the connect machinery recovers the interface.
 	wakeup();
+  _lastReportAttemptMs = millis();
+  reportAttempts++;
   if (!isReady()) {
     if (!timedOut) {
       // Episode start: latch the timeout state (consumed by errorCheck and
@@ -270,7 +280,9 @@ void LSUSBMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t 
     }
     return;
   }
-  usb_hid.mouseReport(RID_MOUSE,b,x,y,wheel,pan);
+  if (usb_hid.mouseReport(RID_MOUSE,b,x,y,wheel,pan)) {
+    reportSuccesses++;
+  }
   timedOut = false;
 }
 

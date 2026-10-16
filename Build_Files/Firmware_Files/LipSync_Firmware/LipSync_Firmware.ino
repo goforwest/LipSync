@@ -1349,6 +1349,32 @@ unsigned long effectiveWindowMs(unsigned long defaultWindowMs) {
   }
 }
 
+//***FILL USB HID DIAGNOSTICS FUNCTION***//
+// Function   : fillUsbHidDiagnostics
+//
+// Description: HID-layer telemetry for the BH,0:0 bus-health line (bench
+//              2026-10-16: the cursor stopped moving on 4.5.0 while the
+//              ready page showed, the joystick read fine and serial kept
+//              working — the ready page only draws when isReady() held, so
+//              the failure hides between "mouseReport never called",
+//              "called and refused by TinyUSB" and "accepted but ignored by
+//              the host". These seven numbers split exactly those cases).
+//
+// Parameters : out : int[7] : filled with [usbMounted, hidReady, hidRetrying,
+//              hidTimedOut, centerComplete, reportAttempts, reportSuccesses]
+//
+// Return     : void
+//****************************************//
+void fillUsbHidDiagnostics(int out[7]) {
+  out[0] = USBDevice.mounted() ? 1 : 0;
+  out[1] = usbmouse.isReady() ? 1 : 0;
+  out[2] = usbmouse.usbRetrying ? 1 : 0;
+  out[3] = usbmouse.timedOut ? 1 : 0;
+  out[4] = g_resetCenterComplete ? 1 : 0;
+  out[5] = (int)(usbmouse.reportAttempts % 1000000007);  // Wrap-safe read of a boot-long counter
+  out[6] = (int)(usbmouse.reportSuccesses % 1000000007);
+}
+
 //***PRESSURE THRESHOLD LEVEL HELPERS***//
 // Function   : pressThresholdLevelUp / pressThresholdLevelDown / pressThresholdLevelFor
 //
