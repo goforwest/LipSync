@@ -333,10 +333,24 @@ void LSJoystick::setMagnetDirection(int magnetXDirection, int magnetYDirection) 
   setMagnetXDirection(magnetXDirection);
   setMagnetYDirection(magnetYDirection);
   setMagnetZDirection();
-  
-  // Evaluate joystick x and y final magnet directions
-  _joystickXDirection = -1 * _magnetZDirection * _magnetXDirection; // Flip x- axis due to flipped sensor
-  _joystickYDirection = -1 * _magnetZDirection * _magnetYDirection; // Flip y- axis due to flipped sensor
+
+  // A FAULT latch must not zero the output directions for the rest of the
+  // boot (bench 2026-10-16: cursor dead on 4.5.0 while raw, calibration,
+  // reports and serial all worked — the BH pipeline dump showed
+  // dirX=dirY=0 with every other internal healthy, and the output math is
+  // (raw - center) * direction, so a latched 0 multiplies every reading to
+  // zero, forever). The Z sampling runs once at boot against a just-reset
+  // sensor; under the bounded vendored I2C stack those five samples can
+  // come back empty and the average lands inside the ±9 mT band. Guess the
+  // DEFAULT polarity for the derived directions instead — worst case the
+  // axes are briefly inverted until update()'s deferred re-derivation
+  // latches the true direction from the first live reading; a temporarily
+  // flipped axis beats a dead cursor, and a genuinely flipped-board unit
+  // still works (just inverted) instead of appearing broken.
+  int effectiveZDirection = _magnetZDirection;
+  if (effectiveZDirection == JOY_DIRECTION_FAULT) effectiveZDirection = JOY_DIRECTION_DEFAULT;
+  _joystickXDirection = -1 * effectiveZDirection * _magnetXDirection; // Flip x- axis due to flipped sensor
+  _joystickYDirection = -1 * effectiveZDirection * _magnetYDirection; // Flip y- axis due to flipped sensor
 }
 
 
@@ -639,6 +653,26 @@ void LSJoystick::update() {
 
   if(!_skipInputChange){  // If latest measurement has changed more than the change threshold, process and add to output buffer 
     _processCount++;
+
+    // Deferred Z-direction re-derivation (bench 2026-10-16): if the boot-time
+    // sampling latched FAULT (just-reset sensor, empty reads under the
+    // bounded I2C stack), the first processed LIVE reading carries a real Z
+    // — latch the true direction from it and refresh the derived output
+    // directions. Zero extra bus traffic: the Z is this very update's data.
+    // Runs at most once per processed tick and stops the moment it latches.
+    if (_magnetZDirection == JOY_DIRECTION_FAULT) {
+      float zReading = _Tlv493dSensor.getZ();
+      if (zReading < -1 * JOY_Z_DIRECTION_THRESHOLD) {
+        _magnetZDirection = JOY_DIRECTION_INVERSE;
+        _joystickXDirection = -1 * _magnetZDirection * _magnetXDirection;
+        _joystickYDirection = -1 * _magnetZDirection * _magnetYDirection;
+      } else if (zReading > JOY_Z_DIRECTION_THRESHOLD) {
+        _magnetZDirection = JOY_DIRECTION_DEFAULT;
+        _joystickXDirection = -1 * _magnetZDirection * _magnetXDirection;
+        _joystickYDirection = -1 * _magnetZDirection * _magnetYDirection;
+      }
+    }
+
     _inputPoint = processInputReading(_rawPoint);             // Filtered and scaled input readings
     _joystickInputBuffer.pushElement(_inputPoint);            // Add new input point to _joystickInputBuffer
     _outputPoint = processOutputResponse(_inputPoint);        // Process output by applying deadzone, speed control, and linearization
