@@ -1058,8 +1058,16 @@ void usbCheckConnection(void) {
 
     screen.drawUsbErrorPageOnce();  // Draw at most once per episode (LSScreen gates display/bus health)
 
-    // increase variable g_usbConnectDelay
-    if (g_usbConnectDelay < 120000) {
+    // increase variable g_usbConnectDelay. Capped at 10 s (bench-observed
+    // 2026-10-15): the ×1.2 growth used to run to 120 s to space an EXPENSIVE
+    // tick — the old retry branch re-ran begin() and redrew the full
+    // framebuffer every time (the 4.2.0 amplifier). Today's tick is cheap
+    // (isReady reads, at most one draw), so a long backoff only delays the
+    // ready screen behind actual host recovery: after a post-flash boot the
+    // first ticks land before the host finishes configuring the composite
+    // device, and by the time it is ready the next tick can be ~40 s out —
+    // the No-USB page lingers on a device that is already working.
+    if (g_usbConnectDelay < 10000) {
       g_usbConnectDelay = g_usbConnectDelay * 1.2;  // Increase time after each unsuccessfull attempt
     }
 
