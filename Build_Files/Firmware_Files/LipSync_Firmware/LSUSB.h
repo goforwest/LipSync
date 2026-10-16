@@ -30,6 +30,12 @@
 #define MOUSE_ALL (MOUSE_LEFT | MOUSE_RIGHT | MOUSE_MIDDLE)
 #define MOUSE_DESCRIPTOR "LipSync Mouse" // TODO 2025-Feb-21 Unused due to Tiny USB library hang
 
+// Consecutive not-ready report ticks before latching an error episode
+// (3 ticks = 60 ms at the 20 ms poll): a busy HID endpoint — a report in
+// flight, the host about to poll it — frees within a tick or two; only a
+// real outage persists. See LSUSBMouse::mouseReport.
+#define CONF_MOUSE_EP_BUSY_SKIP_LIMIT 3
+
 #define GAMEPAD_DESCRIPTOR "LipSync Gamepad" // TODO 2025-Feb-21 Unused due to Tiny USB library hang
 
 extern unsigned int g_usbAttempt;  // global variable to keep track of USB connection attempts
@@ -76,7 +82,8 @@ class LSUSBMouse {
     uint32_t reportAttempts = 0;
     uint32_t reportSuccesses = 0;
     uint32_t nonzeroReports = 0;      // Reports that carried actual movement (x or y != 0)
-    int16_t maxAbsReport = 0;         // Largest |x|/|y| ever sent — 0 forever means the report PIPELINE sends zeros
+    int16_t maxAbsReport = 0;         // Largest |x|/y| ever sent — 0 forever means the report PIPELINE sends zeros
+    uint8_t consecutiveSkips = 0;     // Not-ready ticks in a row — persistence separates a transient busy endpoint from a real outage
     unsigned long _lastReportAttemptMs = 0;
   protected:
     uint8_t _buttons;
@@ -271,6 +278,16 @@ void LSUSBMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t 
   _lastReportAttemptMs = millis();
   reportAttempts++;
   if (!isReady()) {
+    // A not-ready endpoint is not always an outage: a report still in flight
+    // (the host a millisecond from polling the interrupt endpoint) reads
+    // busy too, and a serial burst can stretch that window by a tick — the
+    // old 4.1.0 spin waited it out invisibly, but the 4.4.0 skip latched
+    // every transient busy tick into an error episode and drew the No-USB
+    // page mid-health-check while the cursor kept working (bench 2026-10-16).
+    // Latch only on persistence: a busy endpoint frees within a tick or two,
+    // a real outage never does. Skipped busy ticks still cost nothing — the
+    // pending report already carries the movement.
+    if (++consecutiveSkips < CONF_MOUSE_EP_BUSY_SKIP_LIMIT) return;
     if (!timedOut) {
       // Episode start: latch the timeout state (consumed by errorCheck and
       // usbCheckConnection) and hand recovery to the connect machinery once —
@@ -282,6 +299,7 @@ void LSUSBMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t 
     }
     return;
   }
+  consecutiveSkips = 0;
   if (usb_hid.mouseReport(RID_MOUSE,b,x,y,wheel,pan)) {
     reportSuccesses++;
     if (x != 0 || y != 0) {
