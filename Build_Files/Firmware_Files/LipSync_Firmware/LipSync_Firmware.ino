@@ -106,6 +106,8 @@ LSTimer<int> usbConnectTimer;
 
 unsigned int g_usbAttempt = 0;
 unsigned int g_usbConnectDelay = CONF_USB_HID_INIT_DELAY;
+unsigned long g_usbNotReadySinceMs = 0;  // When the current HID-not-ready stretch began; 0 = none in progress
+unsigned int g_usbReenumCount = 0;        // Forced re-enumerations spent on the current episode
 
 // Joystick module variables and structures
 int acceleration = 0;
@@ -387,6 +389,8 @@ void initGlobals() {
   g_btIsConnected = false;
   g_errorCode = 0;
   g_debugMode = 0;
+  g_usbNotReadySinceMs = 0;
+  g_usbReenumCount = 0;
   //g_lightMode = 1;  //  Currently unused
   //g_soundMode = 1; //  Currently unused
   g_operatingMode = 1;
@@ -1057,6 +1061,55 @@ void usbConnectionLoop() {
 void usbCheckConnection(void) {
   if (USB_DEBUG) { Serial.println("USBDEBUG: usbCheckConnection()"); }
 
+  // Self-healing re-enumeration (bench 2026-10-16, second stuck-boot capture):
+  // twice now a post-flash 4.5.0 boot came up CONFIGURED but permanently
+  // HID-less — serial alive (the host completed SET_CONFIGURATION; TinyUSB's
+  // tud_mounted() is cfg_num != 0 in this stack), every mouse report refused
+  // (attempts climbing, successes 0) until a manual restart, and the
+  // detach-until-descriptor-complete boot order did not prevent it. Whatever
+  // the host's exact misstep (locking in a HID-less configuration, or wedging
+  // the interrupt endpoint), it does not recover on its own, so the device
+  // must force the issue: after CONF_USB_REENUM_AFTER_MS of continuous
+  // not-ready, drop and re-raise the bus once — a fresh enumeration rebuilds
+  // both the host's configuration and TinyUSB's endpoint state. Bounded at
+  // CONF_USB_REENUM_MAX per episode, tracked only in the modes where a USB
+  // HID interface is expected (BLE mouse and safe mode legitimately have
+  // none). The detach drops the CDC session with it — but a device in this
+  // state is already unusable, and on the post-flash boots where it strikes
+  // the cycle lands within seconds of boot, before the app reconnects.
+  bool usbHidExpected = ((g_operatingMode == CONF_OPERATING_MODE_MOUSE) && (g_comMode == CONF_COM_MODE_USB))
+                     || (g_operatingMode == CONF_OPERATING_MODE_GAMEPAD);
+  if (usbHidExpected) {
+    bool hidReadyNow = ((g_operatingMode == CONF_OPERATING_MODE_MOUSE) && usbmouse.isReady())
+                    || ((g_operatingMode == CONF_OPERATING_MODE_GAMEPAD) && gamepad.isReady());
+    if (hidReadyNow) {
+      if (g_usbReenumCount > 0) {
+        Serial.print("USB recovered after forced re-enumeration #");
+        Serial.println(g_usbReenumCount);
+      }
+      g_usbNotReadySinceMs = 0;  // Episode over
+      g_usbReenumCount = 0;
+    } else {
+      if (g_usbNotReadySinceMs == 0) {
+        g_usbNotReadySinceMs = millis();  // Episode begins
+      } else if ((millis() - g_usbNotReadySinceMs >= CONF_USB_REENUM_AFTER_MS) && (g_usbReenumCount < CONF_USB_REENUM_MAX)) {
+        g_usbReenumCount++;
+        Serial.print("USB forced re-enumeration #");
+        Serial.print(g_usbReenumCount);
+        Serial.print(" at ");
+        Serial.println(millis());
+        USBDevice.detach();
+        delay(100);  // Long enough for the host to register the disconnect
+        USBDevice.attach();
+        g_usbConnectDelay = CONF_USB_HID_INIT_DELAY;  // Resume fast checks while the fresh enumeration settles
+        g_usbNotReadySinceMs = millis();              // Fresh budget for the fresh enumeration
+      }
+    }
+  } else {
+    g_usbNotReadySinceMs = 0;
+    g_usbReenumCount = 0;
+  }
+
 
   if (usbmouse.usbRetrying || gamepad.usbRetrying) {
 
@@ -1124,6 +1177,34 @@ void usbCheckConnection(void) {
       usbConnectTimerId[0] = usbConnectTimer.setTimeout(1000, usbCheckConnection);
     }
   }
+}
+
+//***TINYUSB MOUNT/UNMOUNT WITNESS CALLBACKS***//
+// Function   : tud_mount_cb / tud_umount_cb
+//
+// Description: TinyUSB calls tud_mount_cb once the host has completed
+//              SET_CONFIGURATION (in this stack tud_mounted() is cfg_num != 0)
+//              and tud_umount_cb when the bus resets away from that state.
+//              These hooks print one line per event so an exported session log
+//              carries the host's configure/unconfigure timeline — the missing
+//              witness in the post-flash stuck-boot forensics (bench
+//              2026-10-16: BH showed "configured but HID never ready" with no
+//              way to see WHEN the host configured or whether it ever tried
+//              twice). extern "C" is required: TinyUSB looks for these as C
+//              symbols and the sketch compiles as C++.
+//
+// Parameters : void
+//
+// Return     : void
+//****************************************//
+extern "C" void tud_mount_cb(void) {
+  Serial.print("USB-EVT: configured at ");
+  Serial.println(millis());
+}
+
+extern "C" void tud_umount_cb(void) {
+  Serial.print("USB-EVT: unconfigured at ");
+  Serial.println(millis());
 }
 
 

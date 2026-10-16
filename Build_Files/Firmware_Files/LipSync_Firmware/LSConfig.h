@@ -235,6 +235,10 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 
 #define CONF_USB_HID_TIMEOUT  5000           // 5 seconds - timeout for connecting to USB and continuing with the program
 #define CONF_USB_HID_INIT_DELAY 2000         // initial delay before attempting to reconnect to usb again
+#define CONF_USB_REENUM_AFTER_MS 3000        // a persistent HID outage this old gets a forced re-enumeration (bench
+                                             // 2026-10-16: post-flash boots come up configured-but-HID-dead — serial
+                                             // alive, every mouse report refused — and the host never fixes it itself)
+#define CONF_USB_REENUM_MAX 3                // forced re-enumerations per episode; further ticks only keep the page
 
 #define CONF_UPDATE_MODE_DWELL_MS 500  // Bounded dwell in enterUpdateMode() between the ack, the "Update mode" splash
                                         // and the reset into the bootloader: long enough for the ack to reach the host
