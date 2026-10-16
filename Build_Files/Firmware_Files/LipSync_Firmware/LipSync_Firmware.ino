@@ -1360,12 +1360,13 @@ unsigned long effectiveWindowMs(unsigned long defaultWindowMs) {
 //              "called and refused by TinyUSB" and "accepted but ignored by
 //              the host". These seven numbers split exactly those cases).
 //
-// Parameters : out : int[7] : filled with [usbMounted, hidReady, hidRetrying,
-//              hidTimedOut, centerComplete, reportAttempts, reportSuccesses]
+// Parameters : out : int[9] : filled with [usbMounted, hidReady, hidRetrying,
+//              hidTimedOut, centerComplete, reportAttempts, reportSuccesses,
+//              nonzeroReports, maxAbsReport]
 //
 // Return     : void
 //****************************************//
-void fillUsbHidDiagnostics(int out[7]) {
+void fillUsbHidDiagnostics(int out[9]) {
   out[0] = USBDevice.mounted() ? 1 : 0;
   out[1] = usbmouse.isReady() ? 1 : 0;
   out[2] = usbmouse.usbRetrying ? 1 : 0;
@@ -1373,6 +1374,8 @@ void fillUsbHidDiagnostics(int out[7]) {
   out[4] = g_resetCenterComplete ? 1 : 0;
   out[5] = (int)(usbmouse.reportAttempts % 1000000007);  // Wrap-safe read of a boot-long counter
   out[6] = (int)(usbmouse.reportSuccesses % 1000000007);
+  out[7] = (int)(usbmouse.nonzeroReports % 1000000007);
+  out[8] = usbmouse.maxAbsReport;
 }
 
 //***PRESSURE THRESHOLD LEVEL HELPERS***//

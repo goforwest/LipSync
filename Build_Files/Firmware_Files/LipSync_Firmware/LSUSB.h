@@ -75,6 +75,8 @@ class LSUSBMouse {
     // in mouseReport(), reported through BH,0:0.
     uint32_t reportAttempts = 0;
     uint32_t reportSuccesses = 0;
+    uint32_t nonzeroReports = 0;      // Reports that carried actual movement (x or y != 0)
+    int16_t maxAbsReport = 0;         // Largest |x|/|y| ever sent — 0 forever means the report PIPELINE sends zeros
     unsigned long _lastReportAttemptMs = 0;
   protected:
     uint8_t _buttons;
@@ -282,6 +284,13 @@ void LSUSBMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t 
   }
   if (usb_hid.mouseReport(RID_MOUSE,b,x,y,wheel,pan)) {
     reportSuccesses++;
+    if (x != 0 || y != 0) {
+      nonzeroReports++;
+      int16_t absX = (int16_t)abs(x);
+      int16_t absY = (int16_t)abs(y);
+      if (absX > maxAbsReport) maxAbsReport = absX;
+      if (absY > maxAbsReport) maxAbsReport = absY;
+    }
   }
   timedOut = false;
 }
