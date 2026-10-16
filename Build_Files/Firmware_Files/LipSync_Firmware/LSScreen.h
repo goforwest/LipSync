@@ -833,11 +833,13 @@ void LSScreen::selectMenuItem() {
       }
       break;
     case MODE_MENU:
-      // Operating-mode lock (roadmap item 11, upstream #68): a locked device
-      // refuses mode changes from its own menu — one short error cue, no
-      // confirm page. The serial API (and so LipSync Connect) can still
-      // change the mode deliberately.
-      if (g_modeLocked) {
+      // Operating-mode lock (roadmap item 11, upstream #68): the three mode
+      // rows refuse with the short error cue — no confirm page — while the
+      // serial API (and so LipSync Connect) can still change the mode
+      // deliberately. "... Back" stays live: the first pass gated the whole
+      // page and trapped the user inside it (bench 2026-10-16) — a lockout
+      // must never strand the person it protects.
+      if (_currentSelection < (_modeMenuLen - 1) && g_modeLocked) {
         buzzerErrorCue();
         break;
       }
