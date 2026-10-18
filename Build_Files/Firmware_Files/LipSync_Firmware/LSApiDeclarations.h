@@ -178,6 +178,14 @@ void setSwitchActionGC(bool responseEnabled, bool apiEnabled, String optionalPar
 // Hub menu, diagnostics and device actions
 void controlHubMenu(bool responseEnabled, bool apiEnabled, int inputMenuControl);
 void controlHubMenu(bool responseEnabled, bool apiEnabled, String optionalParameter);
+
+// Live Hub-menu state read (CH,0:0, firmware 4.5.1+): [active, pageId, row]
+// from LSScreen::fillMenuState — the device-truth source the app's remote
+// re-syncs its mirror against after every press (refused selects and
+// frozen-window drops both ack SUCCESS, so the state line is the only
+// honest answer to "where is the Hub now?").
+void getHubMenuState(bool responseEnabled, bool apiEnabled);
+void getHubMenuState(bool responseEnabled, bool apiEnabled, String optionalParameter);
 int getDebugMode(bool responseEnabled, bool apiEnabled);
 void setDebugMode(bool responseEnabled, bool apiEnabled, int inputDebugMode);
 void setDebugMode(bool responseEnabled, bool apiEnabled, String optionalParameter);

@@ -45,6 +45,13 @@
 
 // Mode pages
 #define CONFIRM_MODE_CHANGE 31
+// The LK refusal interstitial (bench follow-up 2026-10-18, CH,0:0): the
+// locked page previously left _currentMenu at MODE_MENU, so a remote could
+// not tell "refused, showing why" from "still on the Mode page" — exactly
+// the state the menu-sync endpoint exists to disambiguate. Input stays
+// frozen for the page's dwell; finishModeLocked's modeMenu() restores
+// MODE_MENU.
+#define MODE_LOCKED_PAGE 32
 
 // More Menus
 #define SOUND_MENU 51
@@ -107,6 +114,17 @@ public:
   bool isMenuActive();
   void activateMenu();
   void deactivateMenu();
+
+  // Live menu-state read for the serial menu-sync endpoint (CH,0:0, bench
+  // follow-up 2026-10-18): fills [active, currentPageId, currentSelection].
+  // The remote's drift problem was that a refused select (LK locked → the
+  // ~2 s locked page) or a press dropped in a scheduled transition's frozen
+  // window acked SUCCESS while the real menu went somewhere the client-side
+  // model did not predict — device truth is the only cure. Selection is the
+  // RAW row index into the page's text array (the same index
+  // selectMenuItem() switches on), which the app maps past each page's
+  // _cursorStart header rows.
+  void fillMenuState(int out[3]);
 
   // Non-blocking page transitions (see scheduleTransition): the continuations
   // run on the screen timer when the informational page's dwell time ends,
@@ -2171,6 +2189,27 @@ void LSScreen::factoryResetConfirm2Page(void) {
 }
 
 //*********************************//
+// Function   : fillMenuState
+//
+// Description: Reports the live menu state for the CH,0:0 menu-sync
+//              endpoint: menu active flag, current page id (the
+//              MAIN_MENU/…/TIMING_ADJUST_MENU defines), and the current
+//              row selection (raw index into the page's text array — the
+//              app applies the page's _cursorStart offset). Read-only, so
+//              it is safe mid-transition: during a scheduled page's frozen
+//              window the values still name what the Hub is showing.
+//
+// Arguments :  out : int[3] : filled with [active, pageId, row]
+//
+// Return     : void
+//*********************************//
+void LSScreen::fillMenuState(int out[3]) {
+  out[0] = _isActive ? 1 : 0;
+  out[1] = _currentMenu;
+  out[2] = _currentSelection;
+}
+
+//*********************************//
 // Function   : modeLockedPage
 //
 // Description: The operating-mode lock's refusal page: names the reason and
@@ -2185,6 +2224,11 @@ void LSScreen::factoryResetConfirm2Page(void) {
 // Return     : void
 //*********************************//
 void LSScreen::modeLockedPage(void) {
+  // Name the page in the menu state (CH,0:0 reads it): a remote pressing
+  // a locked mode row must be able to tell "refused, reason showing" apart
+  // from "still on the Mode options" — this is the drift case that built
+  // the endpoint. finishModeLocked → modeMenu() restores MODE_MENU.
+  _currentMenu = MODE_LOCKED_PAGE;
   setupDisplay();
   _display.println("Mode is");
   _display.println("locked.");

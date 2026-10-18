@@ -98,6 +98,7 @@ _functionList getSwitchActionGCFunction =          {"GC", "0", "0", &getSwitchAc
 _functionList setSwitchActionGCFunction =          {"GC", "1", "",  &setSwitchActionGC};
 
 _functionList controlHubMenuFunction =            {"CH", "1", "",  &controlHubMenu};
+_functionList getHubMenuStateFunction =           {"CH", "0", "0", &getHubMenuState};
 
 _functionList getDebugModeFunction =              {"DM", "0", "0", &getDebugMode};
 _functionList setDebugModeFunction =              {"DM", "1", "",  &setDebugMode};
@@ -174,6 +175,7 @@ _functionList apiFunction[] = { //Let compiler determine number of functions
   getSwitchActionGCFunction,
   setSwitchActionGCFunction,
   controlHubMenuFunction,
+  getHubMenuStateFunction,
   getDebugModeFunction,
   setDebugModeFunction,
   exportSettingsFunction,
@@ -2857,6 +2859,59 @@ void controlHubMenu(bool responseEnabled, bool apiEnabled, int inputMenuControl)
 // Return     : void
 void controlHubMenu(bool responseEnabled, bool apiEnabled, String optionalParameter) {
   controlHubMenu(responseEnabled, apiEnabled, optionalParameter.toInt());
+}
+
+//***GET HUB MENU STATE FUNCTION***//
+// Function   : getHubMenuState
+//
+// Description: The read half of Hub remote control (firmware 4.5.1+, bench
+//              follow-up 2026-10-18): the app's remote sends relative
+//              presses (CH,1:1/2/3/4) and models the Hub's menu position
+//              client-side — but a refused select (LK locked → the ~2 s
+//              "Mode is locked" page, whose frozen input window also drops
+//              subsequent presses while still acking SUCCESS) desyncs the
+//              model from the real Hub, and every later press lands
+//              somewhere the model does not expect. This endpoint returns
+//              the live truth — menu active, current page id, current row
+//              — so the app re-syncs after each press and surfaces device
+//              position instead of assumption.
+//
+//              The response is three comma-separated ints: active (0/1),
+//              pageId (the LSScreen.h page defines: 0 main, 3 mode, 5 more,
+//              32 mode-locked, 551 calib confirm, …), row (raw index into
+//              the page's text array — the app maps it past the page's
+//              header rows).
+//
+// Parameters :  responseEnabled : bool : The response for serial printing is enabled if it's set to true.
+//                                        The serial printing is ignored if it's set to false.
+//               apiEnabled : bool : The api response is sent if it's set to true.
+//                                   Manual response is sent if it's set to false.
+//
+// Return     : void
+//*********************************//
+void getHubMenuState(bool responseEnabled, bool apiEnabled) {
+  int menuState[3];
+  screen.fillMenuState(menuState);
+  const int outputArraySize = 3;
+  printResponseIntArray(responseEnabled, apiEnabled, true, 0, "CH,0", true, "", outputArraySize, ',', menuState);
+}
+
+//***GET HUB MENU STATE API FUNCTION***//
+// Function   : getHubMenuState
+//
+// Description: This function is redefinition of main getHubMenuState function to match the types of API function arguments.
+//
+// Parameters :  responseEnabled : bool : The response for serial printing is enabled if it's set to true.
+//                                        The serial printing is ignored if it's set to false.
+//               apiEnabled : bool : The api response is sent if it's set to true.
+//                                   Manual response is sent if it's set to false.
+//               optionalParameter : String : The input parameter string should contain one element with value of zero.
+//
+// Return     : void
+void getHubMenuState(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 0) {
+    getHubMenuState(responseEnabled, apiEnabled);
+  }
 }
 
 // *********************************************************************************
