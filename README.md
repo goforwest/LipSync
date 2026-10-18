@@ -122,7 +122,7 @@ The LipSync Firmware code uses several libraries:
  - [Adafruit_Sensor](https://github.com/adafruit/Adafruit_Sensor) by Adafruit
  - [Adafruit_SSD1306](https://github.com/adafruit/Adafruit_SSD1306) by Adafruit
  - [ArduinoJson](https://github.com/bblanchon/ArduinoJson) by Benoit Blanchon
- - [TLV493D-A1B6](https://github.com/Infineon/TLV493D-A1B6-3DMagnetic-Sensor) by Infineon Technologies
+ - [XENSIV TLx493D](https://github.com/Infineon/arduino-xensiv-3d-magnetic-sensor-tlx493d) by Infineon Technologies (successor to the deprecated TLV493D-A1B6 library; vendored in Build_Files/Firmware_Files/Libraries)
 
 
 ### Contributors
