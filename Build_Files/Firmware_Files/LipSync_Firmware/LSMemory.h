@@ -41,17 +41,18 @@ class LSMemory {
     void clear(String fileString);
     void format();
     String readAll(String fileString);
-    void writeAll(String fileString, String jsonString);
+    long size(String fileString);
+    bool writeAll(String fileString, String jsonString);
     JsonObject readObject(String fileString);
     int readInt(String fileString, String key);
     float readFloat(String fileString, String key);
     String readString(String fileString, String key);
     pointFloatType readPoint(String fileString, String key);
-    void writeObject(String fileString, String key, JsonObject obj);
-    void writeInt(String fileString, String key, int value);
-    void writeFloat(String fileString, String key, float value);
-    void writeString(String fileString, String key, String value);
-    void writePoint(String fileString, String key, pointFloatType value);
+    bool writeObject(String fileString, String key, JsonObject obj);
+    bool writeInt(String fileString, String key, int value);
+    bool writeFloat(String fileString, String key, float value);
+    bool writeString(String fileString, String key, String value);
+    bool writePoint(String fileString, String key, pointFloatType value);
 };
 
 
@@ -108,6 +109,19 @@ void LSMemory::initialize(String fileString, String jsonString) {
     delay(5);
   } else
   {
+    // The compiled default must fit the budget by construction — if it ever
+    // does not, a new settings key grew the file past the 4.1.0 downgrade
+    // cliff and the host-side size test should have caught it first. Refuse
+    // the write here rather than seeding every boot with a file the
+    // downgrade path would truncate.
+    if (jsonString.length() > CONF_SETTINGS_FILE_BUDGET) {
+      Serial.print("ERROR: compiled default settings (");
+      Serial.print((int)jsonString.length());
+      Serial.print(" bytes) exceed the ");
+      Serial.print(CONF_SETTINGS_FILE_BUDGET);
+      Serial.println("-byte budget — refusing to initialize settings file");
+      return;
+    }
     if( file.open(fileName, FILE_O_WRITE) )
     {
       const char* jsonChar = jsonString.c_str();
@@ -153,12 +167,37 @@ void LSMemory::format(){
 
 
 //*********************************//
-// Function   : readAll 
-// 
-// Description: Reads all Json data from the settings file and stores it in a buffer
-// 
+// Function   : size
+//
+// Description: Reports the file's exact on-flash size in bytes (-1 when the
+//              file does not exist or the filesystem cannot answer). This is
+//              the truth the settings-size budget is measured against —
+//              readAll()'s 512-byte buffer view would clamp at the very
+//              cliff (4.1.0's reader) the budget exists to stay away from.
+//
 // Arguments :  fileString : String : the name of the file
-// 
+//
+// Return     : long : the file size in bytes, -1 when absent
+//*********************************//
+long LSMemory::size(String fileString) {
+  const char* fileName = fileString.c_str();
+  if (!file.open(fileName, FILE_O_READ)) {
+    file.close();
+    return -1;
+  }
+  long fileSize = (long)file.size();
+  file.close();
+  delay(1);
+  return fileSize;
+}
+
+//*********************************//
+// Function   : readAll
+//
+// Description: Reads all Json data from the settings file and stores it in a buffer
+//
+// Arguments :  fileString : String : the name of the file
+//
 // Return     : buffer : String array : Output from file
 //*********************************//
 String LSMemory::readAll(String fileString){
@@ -180,28 +219,49 @@ String LSMemory::readAll(String fileString){
 //*********************************//
 // Function   : writeAll 
 // 
-// Description: Replaces the entire settings file with new values
-// 
+// Description: Replaces the entire settings file with new values. Refuses
+//              (returns false, file untouched) a write whose serialized form
+//              would push the file past CONF_SETTINGS_FILE_BUDGET — the
+//              downgrade guard (see LSConfig.h): firmware 4.1.0 reads this
+//              file with a 512-byte buffer and truncates anything longer,
+//              so a too-big file survives only until the next 4.1.0 boot.
+//
 // Arguments :  fileString : String : the name of the file
 //              jsonString : String : a json string with list of key and value pairs 
 // 
-// Return     : void
+// Return     : bool : true when the file was written, false when the budget
+//                     guard refused (or the file could not be opened)
 //*********************************//
-void LSMemory::writeAll(String fileString, String jsonString){
+bool LSMemory::writeAll(String fileString, String jsonString){
 
     const char* fileName = fileString.c_str();
 
     const char* jsonChar = jsonString.c_str();
+
+    if (strlen(jsonChar) > CONF_SETTINGS_FILE_BUDGET) {
+      // Name the reason on serial: a refused settings write must never read
+      // as a flash failure — it is a deliberate downgrade guard, and the
+      // line tells the maker/support tech which knob moved.
+      Serial.print("ERROR: settings file budget refused (");
+      Serial.print((int)strlen(jsonChar));
+      Serial.print(" > ");
+      Serial.print(CONF_SETTINGS_FILE_BUDGET);
+      Serial.println(" bytes) — firmware 4.1.0's 512-byte reader would truncate it");
+      return false;
+    }
     
     InternalFS.remove(fileName);
     delay(1);
     
-    file.open(fileName, FILE_O_WRITE);
+    if (!file.open(fileName, FILE_O_WRITE)) {
+      return false;
+    }
     delay(1);
     
     file.write(jsonChar, strlen(jsonChar));
     delay(1);
     file.close();
+    return true;
 
 }
 
@@ -303,31 +363,49 @@ pointFloatType LSMemory::readPoint(String fileString, String key){
 //*********************************//
 // Function   : writeObject 
 // 
-// Description: General function for writing an individual attribute-value pair to the settings file
+// Description: General function for writing an individual attribute-value pair to the settings file.
+//              Refuses (returns false, file untouched) a write whose serialized
+//              form would push the file past CONF_SETTINGS_FILE_BUDGET —
+//              the 4.1.0 downgrade guard (see writeAll): the API layer
+//              turns the refusal into the existing FAIL,3 response shape.
 // 
 // Arguments :  fileString : String : the name of the file
 //              key : String : the key of the desired Json attribute
 //              obj : JsonObject : the Json Object value
 // 
-// Return     : void
+// Return     : bool : true when written, false when the budget guard refused
 //*********************************//
-void LSMemory::writeObject(String fileString, String key, JsonObject obj){
+bool LSMemory::writeObject(String fileString, String key, JsonObject obj){
 
     const char* fileName = fileString.c_str();
     
     String jsonString;
     serializeJson(obj, jsonString);
     const char* jsonChar = jsonString.c_str();
+
+    if (strlen(jsonChar) > CONF_SETTINGS_FILE_BUDGET) {
+      Serial.print("ERROR: settings file budget refused for key ");
+      Serial.print(key);
+      Serial.print(" (");
+      Serial.print((int)strlen(jsonChar));
+      Serial.print(" > ");
+      Serial.print(CONF_SETTINGS_FILE_BUDGET);
+      Serial.println(" bytes) — firmware 4.1.0's 512-byte reader would truncate it");
+      return false;
+    }
     
     InternalFS.remove(fileName);
     delay(1);
     
-    file.open(fileName, FILE_O_WRITE);
+    if (!file.open(fileName, FILE_O_WRITE)) {
+      return false;
+    }
     delay(1);
     
     file.write(jsonChar, strlen(jsonChar));
     delay(1);
     file.close();
+    return true;
 }
 
 
@@ -340,12 +418,12 @@ void LSMemory::writeObject(String fileString, String key, JsonObject obj){
 //              key : String : the key of the desired Json attribute
 //              value : int : The integer to write
 // 
-// Return     : void
+// Return     : bool : true when written, false when refused (see writeObject)
 //*********************************//
-void LSMemory::writeInt(String fileString, String key, int value){
+bool LSMemory::writeInt(String fileString, String key, int value){
   JsonObject obj = readObject(fileString);
   obj[String(key)] = value;
-  writeObject(fileString,key,obj);
+  return writeObject(fileString,key,obj);
 }
 
 //*********************************//
@@ -357,12 +435,12 @@ void LSMemory::writeInt(String fileString, String key, int value){
 //              key : String : the key of the desired Json attribute
 //              value : float : The float value to write
 // 
-// Return     : void
+// Return     : bool : true when written, false when refused (see writeObject)
 //*********************************//
-void LSMemory::writeFloat(String fileString, String key, float value){
+bool LSMemory::writeFloat(String fileString, String key, float value){
   JsonObject obj = readObject(fileString);
   obj[String(key)] = value;
-  writeObject(fileString,key,obj);
+  return writeObject(fileString,key,obj);
 }
 
 //*********************************//
@@ -374,12 +452,12 @@ void LSMemory::writeFloat(String fileString, String key, float value){
 //              key : String : the key of the desired Json attribute
 //              value : string : The string to write to the settings file
 // 
-// Return     : void
+// Return     : bool : true when written, false when refused (see writeObject)
 //*********************************//
-void LSMemory::writeString(String fileString, String key, String value){
+bool LSMemory::writeString(String fileString, String key, String value){
   JsonObject obj = readObject(fileString);
   obj[String(key)] = value;
-  writeObject(fileString,key,obj);
+  return writeObject(fileString,key,obj);
 }
 
 //*********************************//
@@ -391,14 +469,14 @@ void LSMemory::writeString(String fileString, String key, String value){
 //              key : String : the key of the desired Json attribute
 //              value : pointFloatType : The point to write to the settings file
 // 
-// Return     : void
+// Return     : bool : true when written, false when refused (see writeObject)
 //*********************************//
-void LSMemory::writePoint(String fileString, String key, pointFloatType value){
+bool LSMemory::writePoint(String fileString, String key, pointFloatType value){
   JsonObject obj = readObject(fileString);
   JsonArray point = obj[key].to<JsonArray>();
   point.add(value.x);
   point.add(value.y);
-  writeObject(fileString,key,obj);
+  return writeObject(fileString,key,obj);
 }
 
 #endif 

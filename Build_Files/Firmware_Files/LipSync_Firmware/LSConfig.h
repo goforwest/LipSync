@@ -161,6 +161,24 @@ const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + 
 #define CONF_SETTINGS_FILE    "/settings.txt"
 #define CONF_SETTINGS_JSON    "{\"MN\":0,\"VN1\":4,\"VN2\":1,\"VN3\":0,\"ID\":0,\"OM\":1,\"CM\":1,\"SS\":5,\"SL\":5,\"ST\":3.0,\"PT\":3.0,\"AV\":0,\"IZ\":0.07,\"OZ\":0.95,\"CA0\":[0.0,0.0],\"CA1\":[-13.0,13.0],\"CA2\":[13.0,13.0],\"CA3\":[13.0,-13.0],\"CA4\":[-13.0,-13.0],\"SM\":1,\"LM\":1,\"LL\":5,\"DM\":0,\"SD\":0,\"MA\":0,\"LK\":0,\"CF\":0,\"WS\":0,\"WL\":0,\"WM\":0,\"SA\":0,\"SB\":0,\"SC\":0,\"GA\":0,\"GB\":0,\"GC\":0}"
 
+// Serialized-settings size budget (bench follow-up 2026-10-18): firmware
+// 4.1.0 — the oldest firmware the app can downgrade a device to — reads
+// the settings file with a 512-byte buffer and truncates anything longer,
+// silently, on its next write. The file sat at ~383 B through 4.4.x, which
+// is why every 4.1.0 downgrade round-trip kept working; 4.5.0's six switch
+// mappings (SA/SB/SC/GA/GB/GC, ~+80 B fully populated) ate most of that
+// headroom, and one more feature of that size would make a downgrade eat
+// the tail of the file. 4.1.0 cannot be fixed, so the budget is enforced on
+// OUR side: LSMemory refuses (FAIL,3 from the API layer) any write whose
+// serialized form would push the file past this size, the EX,0:0 dump
+// reports the live file size so the bench can watch the headroom, and the
+// app-side host test (LipSync_Connect tests/settings-size.test.mjs) fails
+// when a new key's default alone busts the budget. 480 leaves a margin
+// under the 512-byte cliff for value-width growth (a threshold at 150.0, a
+// 5-digit timing window, 7-digit packed switch triples) while giving every
+// currently-shipped key set ~95 bytes of room.
+#define CONF_SETTINGS_FILE_BUDGET 480
+
 // Input restriction settings (roadmap item 11) — every one defaults to 0 =
 // the unrestricted legacy behavior, so a settings file written by older
 // firmware (missing the keys) reads 0 and keeps working exactly as before.

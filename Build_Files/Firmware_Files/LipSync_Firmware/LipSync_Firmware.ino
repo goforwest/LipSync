@@ -2506,10 +2506,13 @@ void performJoystickCalibrationStep(int* args) {
 
   // Turn off all the LEDs to orange to indicate end of the process
   if (calibrationTimer.getNumRuns(calibrationTimerId[1]) == CONF_JOY_CALIB_READING_NUMBER) {  // Turn LED's OFF when timer is running for last time
-    mem.writePoint(CONF_SETTINGS_FILE, stepKey, maxPoint);                                    // Store the point in Flash Memory
+    // The settings-size budget guard can refuse the store (LSMemory): the
+    // corner response must then report FAIL,3, not SUCCESS — otherwise the
+    // app's calibration readout would show a corner the next boot forgets.
+    bool cornerStored = mem.writePoint(CONF_SETTINGS_FILE, stepKey, maxPoint);
     setLedState(LED_ACTION_OFF, LED_CLR_NONE, CONF_JOY_CALIB_LED_NUMBER, 0, 0, led.getLedBrightness());
     performLedAction(ledCurrentState);
-    printResponseFloatPoint(true, true, true, 0, stepCommand, true, maxPoint);
+    printResponseFloatPoint(true, true, cornerStored, cornerStored ? 0 : 3, stepCommand, true, maxPoint);
     if (g_calibrationError) {
       screen.fullCalibrationPrompt(CONF_JOY_CALIB_ERROR);
       delay(3000);  // TODO 2025-Feb-02 Why the delay?

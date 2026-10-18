@@ -632,11 +632,15 @@ void setOperatingMode(bool responseEnabled, bool apiEnabled, int inputOperatingM
   if ((inputOperatingMode >= CONF_OPERATING_MODE_MIN) && (inputOperatingMode <= CONF_OPERATING_MODE_MAX)) {   
     if ((g_comMode == CONF_COM_MODE_BLE) && (inputOperatingMode == CONF_OPERATING_MODE_GAMEPAD)){
       printResponseInt(responseEnabled, apiEnabled, false, 3, "OM,1", true, inputOperatingMode);    // Return error if user tries to change to Bluetooth mode while in Gamepad mode
-    } else {
-      mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputOperatingMode);
+    } else if (mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputOperatingMode)) {
+      // The settings-size budget guard can refuse the write (LSMemory) — a
+      // refused write must never report SUCCESS or change the live mode, or
+      // the app's readout and the device would disagree after a reboot.
       printResponseInt(responseEnabled, apiEnabled, true, 0, "OM,1", true, inputOperatingMode);
       g_operatingMode = inputOperatingMode;
       changeOperatingMode(inputOperatingMode);
+    } else {
+      printResponseInt(responseEnabled, apiEnabled, false, 3, "OM,1", true, inputOperatingMode);
     }
   }
   else {
@@ -728,13 +732,17 @@ void setCursorSpeed(bool responseEnabled, bool apiEnabled, int inputSpeedLevel) 
   int tempCursorSpeedLevel = inputSpeedLevel;
   
   if ((tempCursorSpeedLevel >= CONF_JOY_CURSOR_SPEED_LEVEL_MIN) && (tempCursorSpeedLevel <= CONF_JOY_CURSOR_SPEED_LEVEL_MAX)) { // Check if inputSpeedCounter is valid
-    // Valid inputSpeedLevel
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempCursorSpeedLevel);
-    if (!CONF_API_ENABLED) {
+    // Valid inputSpeedLevel — the settings-size budget guard can still refuse
+    // the store (LSMemory), which must read as a failed write, not a silent
+    // success the next boot forgets.
+    isValidSpeed = mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempCursorSpeedLevel);
+    if (!isValidSpeed) {
+      tempCursorSpeedLevel = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+    }
+    if (!CONF_API_ENABLED && isValidSpeed) {
       tempCursorSpeedLevel = CONF_JOY_CURSOR_SPEED_LEVEL_DEFAULT;
     }
     performLedAction(ledCurrentState);
-    isValidSpeed = true;
   }
   else {
     // Invalid inputSpeedLevel
@@ -831,13 +839,16 @@ void setScrollLevel(bool responseEnabled, bool apiEnabled, int inputScrollLevel)
   int tempScrollLevel = inputScrollLevel;
   
   if ((tempScrollLevel >= CONF_SCROLL_LEVEL_MIN) && (tempScrollLevel <= CONF_SCROLL_LEVEL_MAX)) { // Check if inputLevelCounter is valid
-    // Valid inputScrollLevel
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempScrollLevel);
-    if (!CONF_API_ENABLED) {
+    // Valid inputScrollLevel — a refused store (settings budget, LSMemory)
+    // must read as a failed write, not a silent success.
+    isValidLevel = mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempScrollLevel);
+    if (!isValidLevel) {
+      tempScrollLevel = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+    }
+    if (!CONF_API_ENABLED && isValidLevel) {
       tempScrollLevel = CONF_SCROLL_LEVEL_DEFAULT;
     }
     performLedAction(ledCurrentState);
-    isValidLevel = true;
     g_scrollLevel = tempScrollLevel;
   }
   else {
@@ -1156,8 +1167,10 @@ void getJoystickInnerDeadzone(bool responseEnabled, bool apiEnabled, String opti
 //*********************************//
 void setJoystickInnerDeadzone(bool responseEnabled, bool apiEnabled, float inputDeadzone) {
   String deadzoneCommand = "IZ";
-  if ((inputDeadzone > CONF_JOY_DEADZONE_MIN) && (inputDeadzone <= CONF_JOY_DEADZONE_MAX)) {
-    mem.writeFloat(CONF_SETTINGS_FILE, deadzoneCommand, inputDeadzone);
+  if (((inputDeadzone > CONF_JOY_DEADZONE_MIN) && (inputDeadzone <= CONF_JOY_DEADZONE_MAX))
+      && mem.writeFloat(CONF_SETTINGS_FILE, deadzoneCommand, inputDeadzone)) {
+    // The store and the live value only land together: a refused store
+    // (settings budget, LSMemory) falls to the FAIL,3 branch below.
     js.setInnerDeadzone(true, inputDeadzone);
     printResponseFloat(responseEnabled, apiEnabled, true, 0, "IZ,1", true, inputDeadzone);
   }
@@ -1239,8 +1252,9 @@ void getJoystickOuterDeadzone(bool responseEnabled, bool apiEnabled, String opti
 //*********************************//
 void setJoystickOuterDeadzone(bool responseEnabled, bool apiEnabled, float inputUpperDeadZone) {
   String outerDeadzoneCommand = "OZ";
-  if ((inputUpperDeadZone > CONF_JOY_DEADZONE_MIN) && (inputUpperDeadZone <= CONF_JOY_DEADZONE_MAX)) {
-    mem.writeFloat(CONF_SETTINGS_FILE, outerDeadzoneCommand, inputUpperDeadZone);
+  if (((inputUpperDeadZone > CONF_JOY_DEADZONE_MIN) && (inputUpperDeadZone <= CONF_JOY_DEADZONE_MAX))
+      && mem.writeFloat(CONF_SETTINGS_FILE, outerDeadzoneCommand, inputUpperDeadZone)) {
+    // See setJoystickInnerDeadzone: a refused store must not report SUCCESS.
     js.setOuterDeadzone(true, inputUpperDeadZone);
     printResponseFloat(responseEnabled, apiEnabled, true, 0, "OZ,1", true, inputUpperDeadZone);
   }
@@ -1529,8 +1543,10 @@ void getSipPressureThreshold(bool responseEnabled, bool apiEnabled, String optio
 void setSipPressureThreshold(bool responseEnabled, bool apiEnabled, float inputSipThreshold) {
   String commandKey = "ST";
 
-  if (inputSipThreshold >= CONF_PRESS_MIN_THRESHOLD && inputSipThreshold < CONF_PRESS_MAX_THRESHOLD) {
-    mem.writeFloat(CONF_SETTINGS_FILE, commandKey, inputSipThreshold);
+  if ((inputSipThreshold >= CONF_PRESS_MIN_THRESHOLD && inputSipThreshold < CONF_PRESS_MAX_THRESHOLD)
+      && mem.writeFloat(CONF_SETTINGS_FILE, commandKey, inputSipThreshold)) {
+    // A refused store (settings budget, LSMemory) reports FAIL,3 — a
+    // SUCCESS here would tell the app a threshold the device did not keep.
     ps.setSipThreshold(inputSipThreshold);
     printResponseFloat(responseEnabled, apiEnabled, true, 0, "ST,1", true, inputSipThreshold);
   }
@@ -1618,8 +1634,9 @@ void getPuffPressureThreshold(bool responseEnabled, bool apiEnabled, String opti
 void setPuffPressureThreshold(bool responseEnabled, bool apiEnabled, float inputPuffThreshold) {
   String commandKey = "PT";
 
-  if (inputPuffThreshold >= CONF_PRESS_MIN_THRESHOLD && inputPuffThreshold < CONF_PRESS_MAX_THRESHOLD) {
-    mem.writeFloat(CONF_SETTINGS_FILE, commandKey, inputPuffThreshold);
+  if ((inputPuffThreshold >= CONF_PRESS_MIN_THRESHOLD && inputPuffThreshold < CONF_PRESS_MAX_THRESHOLD)
+      && mem.writeFloat(CONF_SETTINGS_FILE, commandKey, inputPuffThreshold)) {
+    // See setSipPressureThreshold: a refused store reports FAIL,3.
     ps.setPuffThreshold(inputPuffThreshold);
     printResponseFloat(responseEnabled, apiEnabled, true, 0, "PT,1", true, inputPuffThreshold);
   }
@@ -1708,12 +1725,14 @@ void setJoystickAcceleration(bool responseEnabled, bool apiEnabled, int inputAcc
   int tempJoystickAccelerationLevel = inputAccelerationLevel;
   
   if ((tempJoystickAccelerationLevel >= CONF_JOY_ACCELERATION_LEVEL_MIN) && (tempJoystickAccelerationLevel <= CONF_JOY_ACCELERATION_LEVEL_MAX)) { // Check if inputAccelerationCounter is valid
-    // Valid inputAccelerationLevel
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempJoystickAccelerationLevel);
-    if (!CONF_API_ENABLED) {
+    // Valid inputAccelerationLevel — a refused store (settings budget,
+    // LSMemory) reads back the stored level and reports FAIL,3.
+    isValidAcceleration = mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempJoystickAccelerationLevel);
+    if (!isValidAcceleration) {
+      tempJoystickAccelerationLevel = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+    } else if (!CONF_API_ENABLED) {
       tempJoystickAccelerationLevel = CONF_JOY_ACCELERATION_LEVEL_DEFAULT;
     }
-    isValidAcceleration = true;
   }
   else {
     // Invalid inputAccelerationLevel
@@ -1860,12 +1879,15 @@ void setCommunicationMode(bool responseEnabled, bool apiEnabled, int inputCommun
   if ((inputCommunicationMode >= CONF_COM_MODE_MIN) && (inputCommunicationMode <= CONF_COM_MODE_MAX)) {
     if ((inputCommunicationMode == CONF_COM_MODE_BLE) && (g_operatingMode == CONF_OPERATING_MODE_GAMEPAD)){
       printResponseInt(responseEnabled, apiEnabled, false, 3, "CM,1", true, inputCommunicationMode);    // Return error if user tries to change to Bluetooth mode while in Gamepad mode
-    } else {
+    } else if (mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputCommunicationMode)) {
+      // Store first, switch second: a refused store (settings budget,
+      // LSMemory) must not flip the live mode the next boot would forget.
       g_comMode = inputCommunicationMode;
       setCommunicationModeLed(g_comMode);
       setLedDefault();
-      mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputCommunicationMode);
       printResponseInt(responseEnabled, apiEnabled, true, 0, "CM,1", true, inputCommunicationMode);
+    } else {
+      printResponseInt(responseEnabled, apiEnabled, false, 3, "CM,1", true, inputCommunicationMode);
     }
 
     // TODO: move this?
@@ -2007,8 +2029,10 @@ void getSoundMode(bool responseEnabled, bool apiEnabled, String optionalParamete
 void setSoundMode(bool responseEnabled, bool apiEnabled, int inputSoundMode) {
   String commandKey = "SM";
 
-  if ((inputSoundMode >= CONF_SOUND_MODE_MIN) && (inputSoundMode <= CONF_SOUND_MODE_MAX)) {
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputSoundMode);
+  if (((inputSoundMode >= CONF_SOUND_MODE_MIN) && (inputSoundMode <= CONF_SOUND_MODE_MAX))
+      && mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputSoundMode)) {
+    // A refused store (settings budget, LSMemory) reports FAIL,3 and leaves
+    // the live sound mode untouched.
     g_soundMode = inputSoundMode;  // Update global variable TODO - currently unused
     buzzer.setSoundModeLevel(inputSoundMode);  // Update sound mode level within buzzer instance
     printResponseInt(responseEnabled, apiEnabled, true, 0, "SM,1", true, inputSoundMode);
@@ -2102,8 +2126,9 @@ void getLightMode(bool responseEnabled, bool apiEnabled, String optionalParamete
 void setLightMode(bool responseEnabled, bool apiEnabled, int inputLightMode) {
   String commandKey = "LM";
 
-  if ((inputLightMode >= CONF_LIGHT_MODE_MIN) && (inputLightMode <= CONF_LIGHT_MODE_MAX)) {
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputLightMode);
+  if (((inputLightMode >= CONF_LIGHT_MODE_MIN) && (inputLightMode <= CONF_LIGHT_MODE_MAX))
+      && mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputLightMode)) {
+    // See setSoundMode: a refused store reports FAIL,3.
     g_lightMode = inputLightMode;
     led.setLightModeLevel(inputLightMode);
     printResponseInt(responseEnabled, apiEnabled, true, 0, "LM,1", true, inputLightMode);
@@ -2194,8 +2219,9 @@ void getLightBrightnessLevel(bool responseEnabled, bool apiEnabled, String optio
 void setLightBrightnessLevel(bool responseEnabled, bool apiEnabled, int inputLightLevel) {
   String commandKey = "LL";
 
-  if ((inputLightLevel >= CONF_LED_BRIGHTNESS_LEVEL_MIN) && (inputLightLevel <= CONF_LED_BRIGHTNESS_LEVEL_MAX)) {
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputLightLevel);
+  if (((inputLightLevel >= CONF_LED_BRIGHTNESS_LEVEL_MIN) && (inputLightLevel <= CONF_LED_BRIGHTNESS_LEVEL_MAX))
+      && mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputLightLevel)) {
+    // See setSoundMode: a refused store reports FAIL,3.
     led.setLedBrightnessLevel(inputLightLevel);
     printResponseInt(responseEnabled, apiEnabled, true, 0, "LL,1", true, inputLightLevel);
   }
@@ -2286,8 +2312,10 @@ void getSapDisabled(bool responseEnabled, bool apiEnabled, String optionalParame
 //*********************************//
 void setSapDisabled(bool responseEnabled, bool apiEnabled, int inputSapDisabled) {
   String commandKey = "SD";
-  if (inputSapDisabled == 0 || inputSapDisabled == 1) {
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputSapDisabled);
+  if ((inputSapDisabled == 0 || inputSapDisabled == 1)
+      && mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputSapDisabled)) {
+    // A refused store (settings budget, LSMemory) reports FAIL,3 and leaves
+    // the live gate untouched — all four restriction setters share this.
     g_sapDisabled = (inputSapDisabled == 1);
     printResponseInt(responseEnabled, apiEnabled, true, 0, "SD,1", true, inputSapDisabled);
   } else {
@@ -2340,8 +2368,9 @@ void getMenuButtonsOnly(bool responseEnabled, bool apiEnabled, String optionalPa
 //*********************************//
 void setMenuButtonsOnly(bool responseEnabled, bool apiEnabled, int inputMenuButtonsOnly) {
   String commandKey = "MA";
-  if (inputMenuButtonsOnly == 0 || inputMenuButtonsOnly == 1) {
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputMenuButtonsOnly);
+  if ((inputMenuButtonsOnly == 0 || inputMenuButtonsOnly == 1)
+      && mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputMenuButtonsOnly)) {
+    // See setSapDisabled: a refused store reports FAIL,3.
     g_menuButtonsOnly = (inputMenuButtonsOnly == 1);
     printResponseInt(responseEnabled, apiEnabled, true, 0, "MA,1", true, inputMenuButtonsOnly);
   } else {
@@ -2394,8 +2423,9 @@ void getModeLocked(bool responseEnabled, bool apiEnabled, String optionalParamet
 //*********************************//
 void setModeLocked(bool responseEnabled, bool apiEnabled, int inputModeLocked) {
   String commandKey = "LK";
-  if (inputModeLocked == 0 || inputModeLocked == 1) {
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputModeLocked);
+  if ((inputModeLocked == 0 || inputModeLocked == 1)
+      && mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputModeLocked)) {
+    // See setSapDisabled: a refused store reports FAIL,3.
     g_modeLocked = (inputModeLocked == 1);
     printResponseInt(responseEnabled, apiEnabled, true, 0, "LK,1", true, inputModeLocked);
   } else {
@@ -2449,8 +2479,9 @@ void getCursorHoldDuringSap(bool responseEnabled, bool apiEnabled, String option
 //*********************************//
 void setCursorHoldDuringSap(bool responseEnabled, bool apiEnabled, int inputCursorHold) {
   String commandKey = "CF";
-  if (inputCursorHold == 0 || inputCursorHold == 1) {
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputCursorHold);
+  if ((inputCursorHold == 0 || inputCursorHold == 1)
+      && mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputCursorHold)) {
+    // See setSapDisabled: a refused store reports FAIL,3.
     g_freezeCursorDuringSap = (inputCursorHold == 1);
     printResponseInt(responseEnabled, apiEnabled, true, 0, "CF,1", true, inputCursorHold);
   } else {
@@ -2509,9 +2540,11 @@ void setInputWindowShort(bool responseEnabled, bool apiEnabled, unsigned long in
   String commandKey = "WS";
   unsigned long longEff = (g_inputWindowLongMs > 0) ? g_inputWindowLongMs : CONF_INPUT_WINDOW_LONG_DEFAULT_MS;
   unsigned long newEff = (inputWindowMs > 0) ? inputWindowMs : CONF_INPUT_WINDOW_SHORT_DEFAULT_MS;
-  if ((inputWindowMs == 0) ||
-      (inputWindowMs >= CONF_INPUT_WINDOW_SHORT_MIN_MS && inputWindowMs <= CONF_INPUT_WINDOW_SHORT_MAX_MS && newEff < longEff)) {
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, (int)inputWindowMs);
+  if (((inputWindowMs == 0) ||
+       (inputWindowMs >= CONF_INPUT_WINDOW_SHORT_MIN_MS && inputWindowMs <= CONF_INPUT_WINDOW_SHORT_MAX_MS && newEff < longEff))
+      && mem.writeInt(CONF_SETTINGS_FILE, commandKey, (int)inputWindowMs)) {
+    // A refused store (settings budget, LSMemory) reports FAIL,3 and leaves
+    // the live window untouched — all three window setters share this.
     g_inputWindowShortMs = (inputWindowMs > 0) ? inputWindowMs : 0;
     printResponseInt(responseEnabled, apiEnabled, true, 0, "WS,1", true, (int)newEff);
   } else {
@@ -2564,9 +2597,10 @@ void setInputWindowLong(bool responseEnabled, bool apiEnabled, unsigned long inp
   unsigned long shortEff = (g_inputWindowShortMs > 0) ? g_inputWindowShortMs : CONF_INPUT_WINDOW_SHORT_DEFAULT_MS;
   unsigned long maxEff = (g_inputWindowMaxMs > 0) ? g_inputWindowMaxMs : CONF_INPUT_WINDOW_MAX_DEFAULT_MS;
   unsigned long newEff = (inputWindowMs > 0) ? inputWindowMs : CONF_INPUT_WINDOW_LONG_DEFAULT_MS;
-  if ((inputWindowMs == 0) ||
-      (inputWindowMs >= CONF_INPUT_WINDOW_LONG_MIN_MS && inputWindowMs <= CONF_INPUT_WINDOW_LONG_MAX_MS && newEff > shortEff && newEff < maxEff)) {
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, (int)inputWindowMs);
+  if (((inputWindowMs == 0) ||
+       (inputWindowMs >= CONF_INPUT_WINDOW_LONG_MIN_MS && inputWindowMs <= CONF_INPUT_WINDOW_LONG_MAX_MS && newEff > shortEff && newEff < maxEff))
+      && mem.writeInt(CONF_SETTINGS_FILE, commandKey, (int)inputWindowMs)) {
+    // See setInputWindowShort: a refused store reports FAIL,3.
     g_inputWindowLongMs = (inputWindowMs > 0) ? inputWindowMs : 0;
     printResponseInt(responseEnabled, apiEnabled, true, 0, "WL,1", true, (int)newEff);
   } else {
@@ -2618,9 +2652,10 @@ void setInputWindowMax(bool responseEnabled, bool apiEnabled, unsigned long inpu
   String commandKey = "WM";
   unsigned long longEff = (g_inputWindowLongMs > 0) ? g_inputWindowLongMs : CONF_INPUT_WINDOW_LONG_DEFAULT_MS;
   unsigned long newEff = (inputWindowMs > 0) ? inputWindowMs : CONF_INPUT_WINDOW_MAX_DEFAULT_MS;
-  if ((inputWindowMs == 0) ||
-      (inputWindowMs >= CONF_INPUT_WINDOW_MAX_MIN_MS && inputWindowMs <= CONF_INPUT_WINDOW_MAX_MAX_MS && newEff > longEff)) {
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, (int)inputWindowMs);
+  if (((inputWindowMs == 0) ||
+       (inputWindowMs >= CONF_INPUT_WINDOW_MAX_MIN_MS && inputWindowMs <= CONF_INPUT_WINDOW_MAX_MAX_MS && newEff > longEff))
+      && mem.writeInt(CONF_SETTINGS_FILE, commandKey, (int)inputWindowMs)) {
+    // See setInputWindowShort: a refused store reports FAIL,3.
     g_inputWindowMaxMs = (inputWindowMs > 0) ? inputWindowMs : 0;
     printResponseInt(responseEnabled, apiEnabled, true, 0, "WM,1", true, (int)newEff);
   } else {
@@ -2716,8 +2751,9 @@ void setSwitchAction(bool responseEnabled, bool apiEnabled, String commandKey, i
     cells[2] = packed % 100;
     accepted = switchRemapAllowed(cells[0]) && switchRemapAllowed(cells[1]) && switchRemapAllowed(cells[2]);
   }
-  if (accepted) {
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, packedWireValue);
+  if (accepted && mem.writeInt(CONF_SETTINGS_FILE, commandKey, packedWireValue)) {
+    // A refused store (settings budget, LSMemory) reports FAIL,3 and leaves
+    // the live table untouched.
     for (int w = 0; w < CONF_SWITCH_REMAP_ROWS_PER_JACK; w++) switchRemapApplyCell(jack, w, gamepad, cells[w]);
     printResponseInt(responseEnabled, apiEnabled, true, 0, commandKey + ",1", true, packedWireValue);
   } else {
@@ -2888,8 +2924,10 @@ void getDebugMode(bool responseEnabled, bool apiEnabled, String optionalParamete
 void setDebugMode(bool responseEnabled, bool apiEnabled, int inputDebugMode) {
   String commandKey = "DM";
 
-  if ((inputDebugMode >= CONF_DEBUG_MODE_MIN) && (inputDebugMode <= CONF_DEBUG_MODE_MAX)) {
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputDebugMode);
+  if (((inputDebugMode >= CONF_DEBUG_MODE_MIN) && (inputDebugMode <= CONF_DEBUG_MODE_MAX))
+      && mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputDebugMode)) {
+    // A refused store (settings budget, LSMemory) reports FAIL,3 and leaves
+    // the live debug state untouched.
     g_debugMode = inputDebugMode;
     setDebugState(inputDebugMode);
     printResponseInt(responseEnabled, apiEnabled, true, 0, "DM,1", true, inputDebugMode);
@@ -2928,11 +2966,18 @@ void setDebugMode(bool responseEnabled, bool apiEnabled, String optionalParamete
 //              with no new format to learn.
 //
 //              The dump is framed by SUCCESS,0:EX,0:BEGIN and
-//              SUCCESS,0:EX,0:END so a paste has clean edges. The device
-//              identifier (ID) is deliberately excluded — the same privacy
-//              line LipSync Connect's settings and log exports draw; a
-//              support request that genuinely needs the identifier can ask
-//              for ID,0:0 explicitly.
+//              SUCCESS,0:EX,0:END so a paste has clean edges. Immediately
+//              after BEGIN, one SUCCESS,0:EX,0:SIZE:<n> line reports the
+//              serialized settings file's EXACT on-flash size in bytes
+//              (the settings-size budget's ground truth, bench follow-up
+//              2026-10-18: the file sat at ~383 B through 4.4.x with
+//              firmware 4.1.0's 512-byte reader as the only consumer that
+//              cannot be updated — 4.5.0's six switch mappings ate most of
+//              that headroom, so the bench needs to watch the number, not
+//              estimate it). The device identifier (ID) is deliberately
+//              excluded — the same privacy line LipSync Connect's settings
+//              and log exports draw; a support request that genuinely needs
+//              the identifier can ask for ID,0:0 explicitly.
 //
 //              Every replayed getter is a pure read of stored settings (the
 //              identical calls the app's connect-time load makes), so this
@@ -2948,6 +2993,13 @@ void setDebugMode(bool responseEnabled, bool apiEnabled, String optionalParamete
 //*********************************//
 void exportSettings(bool responseEnabled, bool apiEnabled) {
   printResponseString(responseEnabled, apiEnabled, true, 0, "EX,0", true, "BEGIN");
+
+  // The live serialized size (the number the CONF_SETTINGS_FILE_BUDGET
+  // guard enforces against; -1 would mean no file, which a booted device
+  // never has). Inside the frame, first line after BEGIN.
+  long settingsSize = mem.size(CONF_SETTINGS_FILE);
+  printResponseString(responseEnabled, apiEnabled, true, 0, "EX,0", true,
+                      String("SIZE:") + String(settingsSize) + String("/") + String(CONF_SETTINGS_FILE_BUDGET));
 
   getModelNumber(responseEnabled, apiEnabled);
   getVersionNumber(responseEnabled, apiEnabled);
