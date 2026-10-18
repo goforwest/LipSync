@@ -359,6 +359,22 @@ void setup() {
 // Return     : void
 //*********************************//
 void loop() {
+  // Feed the hardware watchdog directly from the live loop (bench
+  // 2026-10-18, the unbreakable safe-mode reset cycle): the heartbeat
+  // witness proved that in a safe-mode boot the feed's soft timer on the
+  // shared pollTimer pool stops firing — feed= froze at 4428 ms while
+  // mode=3 safe=1 wdt=1 and the loop printed heartbearts for another
+  // minute — so the armed 30 s watchdog starved, reset the device, whose
+  // watchdog flag booted it into safe mode again, where the feed died
+  // again: a 30 s reset cycle unbreakable until the cable was re-seated.
+  // The loop itself demonstrably stays alive, so feed here on every pass:
+  // the feed no longer depends on any timer machinery, and the watchdog
+  // keeps its true job — catching a genuinely dead loop. The 5 s
+  // pollTimer registration stays as a harmless second feeder.
+  if (g_watchdogArmed) {
+    watchdogLoop();
+  }
+
   // Degraded-state heartbeat (bench 2026-10-18, boot-with-unseated-cable
   // forensics): a 4.5.0 boot with the interface cable unseated reset at an
   // exact 30 s cadence — the app connected into the window, loaded ~19
