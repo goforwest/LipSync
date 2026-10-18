@@ -2338,9 +2338,9 @@ void LSScreen::hardwareErrorPage() {
 
   if (!g_joystickSensorConnected && !g_mouthpiecePressureSensorConnected && !g_ambientPressureSensorConnected) {
     _display.println(" CABLE");
-    _screenStateTimerId = _screenStateTimer.setTimeout(CONF_SAFEMODE_MENU_TIMEOUT, &LSScreen::errorPageCable, this);
+    _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::errorPageCable>(CONF_SAFEMODE_MENU_TIMEOUT, this);
   } else {
-    _screenStateTimerId = _screenStateTimer.setTimeout(CONF_SAFEMODE_MENU_TIMEOUT, &LSScreen::errorPageI2C, this);
+    _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::errorPageI2C>(CONF_SAFEMODE_MENU_TIMEOUT, this);
     if (!g_joystickSensorConnected)
       _display.println(" JOYSTICK");
     if (!g_mouthpiecePressureSensorConnected)
@@ -2388,7 +2388,7 @@ void LSScreen::errorPageI2C() {
   
   flushDisplay();
 
-  _screenStateTimerId = _screenStateTimer.setTimeout(CONF_SAFEMODE_MENU_TIMEOUT, &LSScreen::safeModeMenu, this);
+  _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::safeModeMenu>(CONF_SAFEMODE_MENU_TIMEOUT, this);
 }
 
 //*********************************//
@@ -2414,7 +2414,7 @@ void LSScreen::errorPageCable() {
 
   flushDisplay();
 
-  _screenStateTimerId = _screenStateTimer.setTimeout(2*CONF_SAFEMODE_MENU_TIMEOUT, &LSScreen::safeModeMenu, this);
+  _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::safeModeMenu>(2*CONF_SAFEMODE_MENU_TIMEOUT, this);
 
 
 }
@@ -2538,7 +2538,7 @@ void LSScreen::safeModePage(int safeModeReason) {
         case CONF_SAFE_MODE_REASON_INPUT:
         {
           _display.println(" Hub");
-          _screenStateTimerId = _screenStateTimer.setTimeout(CONF_SAFEMODE_MENU_TIMEOUT, &LSScreen::safeModeMenu, this);
+          _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::safeModeMenu>(CONF_SAFEMODE_MENU_TIMEOUT, this);
           _safeModeReasonText = "Hub";
           
           break;
@@ -2546,14 +2546,14 @@ void LSScreen::safeModePage(int safeModeReason) {
         case CONF_SAFE_MODE_REASON_WATCHDOG:
         {
           _display.println(" Watchdog");
-          _screenStateTimerId = _screenStateTimer.setTimeout(CONF_SAFEMODE_MENU_TIMEOUT, &LSScreen::safeModeMenu, this);
+          _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::safeModeMenu>(CONF_SAFEMODE_MENU_TIMEOUT, this);
           _safeModeReasonText = "Watchdog";
           break;
         }
         case CONF_SAFE_MODE_REASON_HARDWARE:
         {
           _display.println(" Hardware");
-          _screenStateTimerId = _screenStateTimer.setTimeout(CONF_SAFEMODE_MENU_TIMEOUT, &LSScreen::hardwareErrorPage, this);    
+          _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::hardwareErrorPage>(CONF_SAFEMODE_MENU_TIMEOUT, this);    
           _safeModeReasonText = "Error";     
           break;
         }

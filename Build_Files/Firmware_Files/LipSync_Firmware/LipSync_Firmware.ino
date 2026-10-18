@@ -286,6 +286,21 @@ void setup() {
   pollTimerId[CONF_TIMER_USB] = pollTimer.setInterval(CONF_USB_POLL_RATE, 0, usbConnectionLoop);
   pollTimerId[CONF_TIMER_WATCHDOG] = pollTimer.setInterval(CONF_WATCHDOG_POLL_RATE, 0, watchdogLoop);
 
+  // Boot-time registration audit (bench 2026-10-18, pool hygiene): a refused
+  // registration returns -1 and every caller used to ignore it — a
+  // "registered" loop that silently never ran is how a pool death hides
+  // (the LSTimer now refuses loudly and counts, but the ids must be checked
+  // at least once at the place they're captured). With the pool raised to
+  // 16 this cannot fire today; if a future feature exhausts it, this line
+  // names the dead feature at boot instead of leaving it a mystery.
+  for (int timerIdx = 0; timerIdx < CONF_TIMER_NUM; timerIdx++) {
+    if (pollTimerId[timerIdx] < 0) {
+      Serial.print("ERROR: poll timer ");
+      Serial.print(timerIdx);
+      Serial.println(" failed to register — that loop WILL NOT RUN");
+    }
+  }
+
 
   pollTimer.disable(CONF_TIMER_USB); // TODO 2025-Feb-21 Disable usbConnectionLoop until implemented
   // If USB is not connected, try to reconnect

@@ -30,7 +30,7 @@
 
 #define CONF_LIPSYNC_VERSION_MAJOR  4
 #define CONF_LIPSYNC_VERSION_MINOR  5
-#define CONF_LIPSYNC_VERSION_REV    0
+#define CONF_LIPSYNC_VERSION_REV    1
 
 const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + "." + String(CONF_LIPSYNC_VERSION_MINOR) + "." + String(CONF_LIPSYNC_VERSION_REV);
 
@@ -279,6 +279,8 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 #define CONF_TIMER_SCREEN 6
 #define CONF_TIMER_USB 7
 #define CONF_TIMER_WATCHDOG 8
+#define CONF_TIMER_NUM 9               // Registrations at boot (ids 0..8) — the
+                                        // setup() loop checks each landed a real slot
 
 #define CONF_TIMER_LED_STARTUP 0
 #define CONF_TIMER_LED_IBM 1

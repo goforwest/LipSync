@@ -26,7 +26,14 @@
 template<typename T>
 class LSTimer {
   private:
-    const static int MAX_TIMERS = 10;                                             // Maximum number of timers
+    // Pool size (bench 2026-10-18, pool hygiene): 10 was tight — pollTimer
+    // alone registers 9 at boot (joystick/pressure/input/bluetooth/debug/
+    // scroll/screen/usb/watchdog), leaving ONE free slot for every future
+    // feature, and rapid health-check-driven scheduling already exhausted it
+    // on the bench ("ERROR: No free timers" in session logs). 16 keeps every
+    // existing pool at ≥7 free slots for a cost of ~264 bytes per pool
+    // (timer_t is 44 bytes on the nRF52840) against 237 KB of RAM.
+    const static int MAX_TIMERS = 16;                                             // Maximum number of timers
     const static int RUN_FOREVER = 0;                                             // Flag used for timer that should run continously                 
     const static int RUN_ONCE = 1;                                                // Flag used for timer that should only run once
     const static int DEFCALL_DONTRUN = 0;                                         // Don't call the callback function
@@ -49,7 +56,27 @@ class LSTimer {
       unsigned toBeCalled;                                                        // Deferred function call
     } timer_t;
     
+    // Stopwatch slots (startTimer) hold callback == NULL, which is the SAME
+    // marker findFirstFreeSlot() uses to mean "free" — without this bitmap a
+    // stopwatch slot is handed to the next registration, silently
+    // overwriting the stopwatch (elapsedTime then reports the new timer's
+    // schedule) while numTimers double-counts one slot. See startTimer().
+    boolean stopwatch[MAX_TIMERS];
+    
     int numTimers; 
+    // Refused/invalid operation counters (bench 2026-10-18, pool hygiene):
+    // setupTimer/startTimer print a rate-limited ERROR on refusal (a timer
+    // that never registered must be impossible to miss), but every other
+    // path stays SILENT in production — the old unconditional prints
+    // ("ERROR: No timers are in use.") landed mid-response and corrupted
+    // serial lines during the LK remote-walk bench session. The counters
+    // keep the failures observable (debugger, future diagnostic endpoint)
+    // without ever printing inside a response.
+    int refusedRegistrations = 0;   // setInterval/setTimeout/setTimer/startTimer calls refused (pool full / null callback)
+    int invalidOperations = 0;      // Calls with an out-of-range timer id (previously printed mid-response or wrote out of bounds)
+    boolean refusalPrinted = false;         // First refusal prints immediately (millis() may still be 0 at boot)
+    unsigned long lastRefusalPrintMs = 0;  // Rate-limit anchor for the refusal print
+
     int findFirstFreeSlot();                                                      // Find the first available slot
     int setupTimer(unsigned long interval, unsigned long startDelay, boolean on, boolean hasParam, unsigned n, void* f, T* p);  
     
@@ -60,7 +87,15 @@ class LSTimer {
     int setInterval(unsigned long interval, unsigned long startDelay, timerCallbackParamPtr f, T* p);
     int setTimeout(unsigned long startDelay, timerCallbackPtr f);                 // Call function f once after interval milliseconds
     int setTimeout(unsigned long startDelay, timerCallbackParamPtr f, T* p);      // Call function f once after interval milliseconds with parameters p
-    template <typename ObjType> int setTimeout(unsigned long interval, void (ObjType::*method)(), ObjType* obj);  // Overloaded function to handle calls from within class
+    // Method-callback setTimeout (see the trampoline below): the method is a
+    // TEMPLATE PARAMETER, not a runtime argument — each (class, method) pair
+    // gets its own generated trampoline function, so two pending method
+    // timers on the same class can never overwrite each other's
+    // continuation. The old (interval, &Class::method, obj) overload stored
+    // the method pointer in ONE static per class, so a second pending
+    // method timer silently redirected the first (LSScreen's safe-mode/error
+    // pages schedule exactly such pairs on a degraded boot).
+    template <typename ObjType, void (ObjType::*Method)()> int setTimeout(unsigned long interval, ObjType* obj);
     int setTimer(unsigned long interval, unsigned long startDelay, unsigned n, timerCallbackPtr f); // Call function f every interval milliseconds for n times, start in startDelay milliseconds
     int setTimer(unsigned long interval, unsigned long startDelay, unsigned n, timerCallbackParamPtr f, T* p);
     int startTimer();                                                             // Start a timer 
@@ -74,8 +109,10 @@ class LSTimer {
     int getNumTimers();                                                           // Returns the number of used timers
     int getNumAvailableTimers() { return MAX_TIMERS - numTimers; };               // Returns the number of available timers
     int getNumRuns(int timerId);                                                  // Returns the number of executed runs
+    int getRefusedRegistrations() { return refusedRegistrations; };              // Diagnostics: registration refusals since construction
+    int getInvalidOperations() { return invalidOperations; };                     // Diagnostics: invalid-timer-id operations since construction
     timer_t timer[MAX_TIMERS];                                                    // Array of timer structures                                                 
-                                                             
+                                                              
 };
 
 
@@ -95,9 +132,14 @@ LSTimer<T>::LSTimer() { // TODO 2025-Feb-07 Consider adding overridden function 
    for (int i = 0; i < MAX_TIMERS; i++) {
         memset(&timer[i], 0, sizeof (timer_t)); //  Initialize each timer
         timer[i].previousTime = current_millis;  //  Set the start time for each timer
+        stopwatch[i] = false;                   //  No stopwatch slots in use yet
     }
 
     numTimers = 0;
+    refusedRegistrations = 0;
+    invalidOperations = 0;
+    refusalPrinted = false;
+    lastRefusalPrintMs = 0;
 }
 
 //*********************************//
@@ -201,7 +243,7 @@ int LSTimer<T>::findFirstFreeSlot() {
 
     // return the first slot with no callback (i.e. free)
     for (int i = 0; i < MAX_TIMERS; i++) {
-        if (timer[i].callback == NULL) {
+        if (timer[i].callback == NULL && !stopwatch[i]) {
             return i;
         }
     }
@@ -231,12 +273,25 @@ int LSTimer<T>::setupTimer(unsigned long interval, unsigned long startDelay, boo
     int freeTimerIndex;
 
     freeTimerIndex = findFirstFreeSlot();
-    if (freeTimerIndex < 0) {
-        Serial.println("ERROR: No free timers");
-        return -1;
-    }
-
-    if (f == NULL) {
+    if (freeTimerIndex < 0 || f == NULL) {
+        // Registration refused — count it, and make it impossible to miss
+        // (bench 2026-10-18): every caller used to ignore the returned -1,
+        // so a "registered" timer silently never ran — the pool-exhaustion
+        // prints in bench logs were the only trace, and nothing tied them
+        // to which feature died. Print at most once per 30 s per pool (a
+        // wedged caller can retry every loop pass; the first line must not
+        // become a firehose that itself corrupts serial output), and keep a
+        // counter a diagnostic endpoint/debugger can read.
+        refusedRegistrations++;
+        if (!refusalPrinted || (millis() - lastRefusalPrintMs) > 30000UL) {
+          refusalPrinted = true;
+          lastRefusalPrintMs = millis();
+          Serial.print("ERROR: LSTimer registration refused (");
+            Serial.print(refusedRegistrations);
+            Serial.print(" total, ");
+            Serial.print(getNumAvailableTimers());
+            Serial.println(" slots free) — the timer/callback was NOT registered");
+        }
         return -1;
     }
 
@@ -270,7 +325,20 @@ int LSTimer<T>::setupTimer(unsigned long interval, unsigned long startDelay, boo
 //*********************************//
 template<typename T>
 int LSTimer<T>::setInterval(unsigned long interval, unsigned long startDelay, timerCallbackPtr f) {
-    return setupTimer(interval, startDelay, true, false, RUN_FOREVER, (void *)f, NULL);
+    // startDelayEnabled only when a nonzero startDelay was actually given
+    // (bench 2026-10-18, semantic fix): the old code passed `true`
+    // unconditionally, and run() treats (numRuns == 0 && startDelayEnabled)
+    // as "use startDelayTime as the first delay" — with startDelay == 0
+    // that meant EVERY interval timer fired once IMMEDIATELY at the first
+    // run() pass (delay 0 is always elapsed), then again a full interval
+    // later. Nine boot registrations fired their first tick at t≈0: the
+    // watchdog feed ran once at registration, the joystick/pressure polls
+    // read before their sensors had settled, and — worse — a timer DISABLED
+    // before its first tick never advanced previousTime (delay 0 adds 0),
+    // freezing its schedule anchor at boot. A nonzero startDelay keeps the
+    // documented offset behavior (first fire at startDelay, then every
+    // interval); zero now means a clean interval-only cadence.
+    return setupTimer(interval, startDelay, (startDelay > 0), false, RUN_FOREVER, (void *)f, NULL);
 }
 
 
@@ -288,9 +356,10 @@ int LSTimer<T>::setInterval(unsigned long interval, unsigned long startDelay, ti
 //*********************************//
 template<typename T>
 int LSTimer<T>::setInterval(unsigned long interval, unsigned long startDelay, timerCallbackParamPtr f, T* p) {
+  // See the plain-callback overload above for the startDelayEnabled fix.
   return setupTimer(interval, // delay
                     startDelay, // startDelay
-                    true, // startDelay enabled
+                    (startDelay > 0), // startDelay enabled only with a real offset
                     true, // has parameter
                     RUN_FOREVER, //  Keep running
                     (void *)f, //  Callback function
@@ -330,36 +399,40 @@ int LSTimer<T>::setTimeout(unsigned long interval, timerCallbackParamPtr f, T* p
   return setupTimer(interval, 0, false, true, RUN_ONCE, (void *)f, p);
 }
 
-template <typename ObjType>
-struct TimerCallbackHelper {
-    static void callback(void* context) {
-        auto* instance = static_cast<ObjType*>(context);
-        (instance->*method)();
-    }
-    static void (ObjType::*method)();  // Store method pointer
-};
-
-template <typename ObjType>
-void (ObjType::*TimerCallbackHelper<ObjType>::method)() = nullptr;
+// Per-method trampoline for the method-callback setTimeout overload: the
+// method pointer is a TEMPLATE PARAMETER, so the compiler generates one
+// distinct function per (class, method) pair with the method baked in.
+//
+// This replaces the old TimerCallbackHelper, which stored the method
+// pointer in ONE static member per class — two pending method timers on the
+// same class shared it, so the second registration silently redirected the
+// first's continuation (LSScreen's degraded-boot pages schedule exactly
+// such pairs: safeModePage → &LSScreen::safeModeMenu while an error page's
+// → &LSScreen::errorPageCable is still pending, and whichever fired first
+// ran the OTHER's method). With the method as a template parameter there is
+// no shared state to collide; each pending timer carries its own generated
+// trampoline as the callback and the object pointer as the param.
+template <typename ObjType, void (ObjType::*Method)()>
+static void lstimerMethodTrampoline(void* context) {
+    (static_cast<ObjType*>(context)->*Method)();
+}
 
 
 //*********************************//
 // Function   : setTimeout 
 // 
-// Description: This function sets up a timer to run forever every interval ms after a startDelay
+// Description: This function sets up a timer to run once after interval ms, calling a class method on obj.
 //
-// Arguments :  unsigned long : interval : Time between timer runs (ms)
-//           :  timerCallbackPtr : f : Function called when timer runs
-//           :  T* : p : Function parameters
-//           :  
+// Arguments :  unsigned long : interval : Time before the callback runs (ms)
+//              ObjType : obj's class; Method : the member function to run
+//              obj : ObjType* : the object the method runs on
 // 
 // Return     : int : Timer index
 //*********************************//
 template <typename T>
-template <typename ObjType>
-int LSTimer<T>::setTimeout(unsigned long interval, void (ObjType::*method)(), ObjType* obj) {
-    TimerCallbackHelper<ObjType>::method = method;  // Store method pointer
-    return setTimeout(interval, TimerCallbackHelper<ObjType>::callback, obj);
+template <typename ObjType, void (ObjType::*Method)()>
+int LSTimer<T>::setTimeout(unsigned long interval, ObjType* obj) {
+    return setTimeout(interval, &lstimerMethodTrampoline<ObjType, Method>, obj);
 }
 
 
@@ -377,7 +450,8 @@ int LSTimer<T>::setTimeout(unsigned long interval, void (ObjType::*method)(), Ob
 //*********************************//
 template<typename T>
 int LSTimer<T>::setTimer(unsigned long interval, unsigned long startDelay, unsigned n, timerCallbackPtr f) {
-  return setupTimer(interval, startDelay, true, false, n, (void *)f, NULL);
+  // See setInterval for the startDelayEnabled fix: 0 means interval-only.
+  return setupTimer(interval, startDelay, (startDelay > 0), false, n, (void *)f, NULL);
 }
 
 
@@ -396,7 +470,8 @@ int LSTimer<T>::setTimer(unsigned long interval, unsigned long startDelay, unsig
 //*********************************//
 template<typename T>
 int LSTimer<T>::setTimer(unsigned long interval, unsigned long startDelay, unsigned n, timerCallbackParamPtr f, T* p) {
-  return setupTimer(interval, startDelay, true, true, n, (void *)f, p);
+  // See setInterval for the startDelayEnabled fix: 0 means interval-only.
+  return setupTimer(interval, startDelay, (startDelay > 0), true, n, (void *)f, p);
 }
 
 
@@ -415,6 +490,23 @@ int LSTimer<T>::startTimer() {
 
     freeTimerIndex = findFirstFreeSlot();
     if (freeTimerIndex < 0) {
+        // Same refusal contract as setupTimer (bench 2026-10-18): the old
+        // code returned -1 SILENTLY, and the callers (LSInput/LSPressure
+        // state machines) stored it as their stopwatch id — every later
+        // elapsedTime()/restartTimer() on that id then read/wrote OUT OF
+        // BOUNDS (timer[-1]) instead of failing visibly. Count + the
+        // rate-limited print make the refusal observable; the negative-id
+        // guards below make a stored -1 harmless.
+        refusedRegistrations++;
+        if (!refusalPrinted || (millis() - lastRefusalPrintMs) > 30000UL) {
+          refusalPrinted = true;
+          lastRefusalPrintMs = millis();
+          Serial.print("ERROR: LSTimer stopwatch registration refused (");
+            Serial.print(refusedRegistrations);
+            Serial.print(" total, ");
+            Serial.print(getNumAvailableTimers());
+            Serial.println(" slots free) — the stopwatch was NOT started");
+        }
         return -1;
     }
 
@@ -427,6 +519,13 @@ int LSTimer<T>::startTimer() {
     timer[freeTimerIndex].startDelayTime = 0;
     timer[freeTimerIndex].startDelayEnabled = false;
     timer[freeTimerIndex].previousTime = millis();
+
+    // Mark the slot as a live stopwatch: its callback stays NULL (the free
+    // marker), so the bitmap is what keeps findFirstFreeSlot() from handing
+    // this slot to the next registration — the old slot-stealing bug
+    // silently repurposed a stopwatch into somebody's interval timer while
+    // double-counting numTimers.
+    stopwatch[freeTimerIndex] = true;
 
     numTimers++;
 
@@ -445,7 +544,12 @@ int LSTimer<T>::startTimer() {
 //*********************************//
 template<typename T>
 unsigned long LSTimer<T>::elapsedTime(int timerId) {
-    if (timerId >= MAX_TIMERS) {
+    // Lower-bound guard (bench 2026-10-18): a -1 from a refused registration
+    // flows straight here from callers that never checked it, and timer[-1]
+    // reads whatever sits before the array — garbage elapsed times in the
+    // input state machines. Count it, return a harmless 0.
+    if (timerId < 0 || timerId >= MAX_TIMERS) {
+        invalidOperations++;
         return 0;
     }
 
@@ -462,30 +566,35 @@ unsigned long LSTimer<T>::elapsedTime(int timerId) {
 // Function   : deleteTimer 
 // 
 // Description: This function deletes the timer corresponding to the timer index
-//
+//              WITHOUT printing: the old unconditional ERROR prints (invalid
+//              id; "No timers are in use.") landed MID-RESPONSE during the
+//              LK remote-walk bench session and corrupted serial lines —
+//              deleteTimer runs inside run()'s callback pass and inside the
+//              serial API, where any print interleaves with a response.
+//              Refusals are counted (invalidOperations) instead.
+// 
 // Arguments :  int : timerId : Index of timer to delete
 // 
-// Return     : void
+// Return     : int : 0 when deleted (or the slot was already empty), -1 on
+//                     an out-of-range id (counted, silent)
 //*********************************//
 template<typename T>
 int LSTimer<T>::deleteTimer(int timerId) {
-    if (timerId >= MAX_TIMERS) {
-        Serial.print("ERROR: Invalid Timer ID: ");
-        Serial.println(timerId);
-        return -1; // ERROR: Invalid timer ID
-    }
-
-    // Don't delete if no timers are in use
-    if (numTimers == 0) {
-        Serial.print("ERROR: No timers are in use.");
-        Serial.println(timerId);
+    // Both bounds — the old code only checked the upper end, so a -1 from a
+    // refused registration (or any negative id) memset 44 bytes BEFORE the
+    // timer array: memory corruption of whatever global precedes the pool,
+    // and numTimers zeroed/negative (timer[-1].toBeCalled overlaps it on
+    // the nRF52840 layout). Silent, counted, harmless.
+    if (timerId < 0 || timerId >= MAX_TIMERS) {
+        invalidOperations++;
         return -1;
     }
 
     // Don't decrease the number of timers if the slot is already empty
-    if (timer[timerId].callback != NULL) {
+    if (timer[timerId].callback != NULL || stopwatch[timerId]) {
         memset(&timer[timerId], 0, sizeof (timer_t));
         timer[timerId].previousTime = millis();
+        stopwatch[timerId] = false;
 
         // update number of timers
         numTimers--;
@@ -505,9 +614,12 @@ int LSTimer<T>::deleteTimer(int timerId) {
 //*********************************//
 template<typename T>
 void LSTimer<T>::restartTimer(int timerId) {
-    if (timerId >= MAX_TIMERS) {
-        Serial.print("ERROR: Invalid Timer ID: ");
-        Serial.println(timerId);
+    // Lower-bound guard, silent + counted (see deleteTimer): restartTimer
+    // with a refused-registration -1 used to WRITE out of bounds —
+    // timer[-1].previousTime and timer[-1].numRuns are 40 bytes before the
+    // array, i.e. straight into an adjacent global.
+    if (timerId < 0 || timerId >= MAX_TIMERS) {
+        invalidOperations++;
         return;
     }
 
@@ -527,9 +639,9 @@ void LSTimer<T>::restartTimer(int timerId) {
 //*********************************//
 template<typename T>
 boolean LSTimer<T>::isEnabled(int timerId) {
-    if (timerId >= MAX_TIMERS) {
-        Serial.print("ERROR: Invalid Timer ID: ");
-        Serial.println(timerId);
+    // Lower-bound guard, silent + counted (see deleteTimer).
+    if (timerId < 0 || timerId >= MAX_TIMERS) {
+        invalidOperations++;
         return false;
     }
 
@@ -548,9 +660,9 @@ boolean LSTimer<T>::isEnabled(int timerId) {
 //*********************************//
 template<typename T>
 void LSTimer<T>::enable(int timerId) {
-    if (timerId >= MAX_TIMERS) {
-        Serial.print("ERROR: Invalid Timer ID: ");
-        Serial.println(timerId);
+    // Lower-bound guard, silent + counted (see deleteTimer).
+    if (timerId < 0 || timerId >= MAX_TIMERS) {
+        invalidOperations++;
         return;
     }
 
@@ -569,9 +681,9 @@ void LSTimer<T>::enable(int timerId) {
 //*********************************//
 template<typename T>
 void LSTimer<T>::disable(int timerId) {
-    if (timerId >= MAX_TIMERS) {
-        Serial.print("ERROR: Invalid Timer ID: ");
-        Serial.println(timerId);
+    // Lower-bound guard, silent + counted (see deleteTimer).
+    if (timerId < 0 || timerId >= MAX_TIMERS) {
+        invalidOperations++;
         return;
     }
 
@@ -590,9 +702,9 @@ void LSTimer<T>::disable(int timerId) {
 //*********************************//
 template<typename T>
 void LSTimer<T>::toggle(int timerId) {
-    if (timerId >= MAX_TIMERS) {
-        Serial.print("ERROR: Invalid Timer ID: ");
-        Serial.println(timerId);
+    // Lower-bound guard, silent + counted (see deleteTimer).
+    if (timerId < 0 || timerId >= MAX_TIMERS) {
+        invalidOperations++;
         return;
     }
 
@@ -626,6 +738,13 @@ int LSTimer<T>::getNumTimers() {
 //*********************************//
 template<typename T>
 int LSTimer<T>::getNumRuns(int timerId) {
+    // Bounds guard — the old code had NONE at all (not even the upper end),
+    // so a refused registration's -1 read timer[-1].numRuns out of bounds.
+    if (timerId < 0 || timerId >= MAX_TIMERS) {
+        invalidOperations++;
+        return 0;
+    }
+
     return timer[timerId].numRuns;
 }
 
