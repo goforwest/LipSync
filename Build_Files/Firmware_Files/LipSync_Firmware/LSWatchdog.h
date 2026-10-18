@@ -26,6 +26,8 @@
 const uint32_t WATCHDOG_RESET_MASK = 0x2; //POWER_RESETREAS_DOG_Msk; //  0x2;
 extern bool g_watchdogReset;
 extern uint8_t g_watchdogBootCount;  // Consecutive watchdog-reset boots this power cycle (tracked in GPREGRET2)
+extern unsigned long g_watchdogLastFeedMs;  // Loop-liveness witness (bench 2026-10-18): ms timestamp of the last feed
+extern bool g_watchdogArmed;                 // True from initWatchdog() until the retry limit stops re-arming
 extern uint32_t g_lastRebootReason;
 
 //*********************************//
@@ -96,6 +98,7 @@ void initWatchdog() {
   NRF_WDT->CRV = CONF_WATCHDOG_TIMEOUT_SEC * 32768;                   // Convert timeout in seconds to watchdog cycles (1 cycle = 1/32.768kHz)
   NRF_WDT->RREN |= WDT_RREN_RR0_Msk;                                  // Enable reload register 0
   NRF_WDT->TASKS_START = 1;                                           // Start watchdog
+  g_watchdogArmed = true;
 }
 
 //***WATCHDOG LOOP FUNCTION***//
@@ -110,6 +113,7 @@ void initWatchdog() {
 void watchdogLoop(void) {
   //if (USB_DEBUG) { Serial.println("USBDEBUG: watchDogLoop"); }
 
+  g_watchdogLastFeedMs = millis();
   NRF_WDT->RR[0] = WDT_RR_RR_Reload;  // Feed (reset) the watchdog timer
 
   // A boot that stays up this long proves any hang was transient — restore

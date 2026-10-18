@@ -108,6 +108,8 @@ unsigned int g_usbAttempt = 0;
 unsigned int g_usbConnectDelay = CONF_USB_HID_INIT_DELAY;
 unsigned long g_usbNotReadySinceMs = 0;  // When the current HID-not-ready stretch began; 0 = none in progress
 unsigned int g_usbReenumCount = 0;        // Forced re-enumerations spent on the current episode
+unsigned long g_watchdogLastFeedMs = 0;   // Loop-liveness witness (bench 2026-10-18): ms timestamp of the last watchdog feed
+bool g_watchdogArmed = false;            // True from initWatchdog() until the retry limit stops re-arming
 // The .noinit once-guard for the USB-recovery auto-restart: a full chip reset
 // is the one cure that has cleared every configured-but-HID-dead boot on the
 // bench (2026-10-17: a wedge survived all three forced re-enumerations), but
@@ -357,6 +359,44 @@ void setup() {
 // Return     : void
 //*********************************//
 void loop() {
+  // Degraded-state heartbeat (bench 2026-10-18, boot-with-unseated-cable
+  // forensics): a 4.5.0 boot with the interface cable unseated reset at an
+  // exact 30 s cadence — the app connected into the window, loaded ~19
+  // settings, then the device vanished ("connection lost"), cycle after
+  // cycle, unrecoverable until the cable was re-seated. Every static
+  // suspect is ruled out (the vendored Wire bounds every transaction at
+  // 50 ms and recovers wedges; the joystick/pressure/screen paths back
+  // off; the safe-mode path leaves the watchdog timer enabled; the API
+  // table is not filtered by safe mode) — so the freeze mechanism needs a
+  // witness that survives it. A degraded or safe-mode boot prints one line
+  // every 5 s; a healthy boot prints nothing. The line's very existence
+  // proves the main loop is alive, and the three numbers split the
+  // remaining hypotheses: feed= growing past 30 s while lines keep
+  // printing = the feed timer died while the loop lives; lines stopping =
+  // the loop froze; wdt=1 feed=never = the watchdog was armed but its
+  // timer never registered (the LSTimer pool has shown "No free timers").
+  static unsigned long lastHeartbeatMs = 0;
+  const bool degradedNow = g_safeModeEnabled || !g_displayConnected || !g_joystickSensorConnected
+                         || !g_mouthpiecePressureSensorConnected || !g_ambientPressureSensorConnected;
+  if (degradedNow && (millis() - lastHeartbeatMs >= 5000)) {
+    lastHeartbeatMs = millis();
+    Serial.print(F("HB: ms="));
+    Serial.print(millis());
+    Serial.print(F(" mode="));
+    Serial.print(g_operatingMode);
+    Serial.print(F(" safe="));
+    Serial.print(g_safeModeEnabled ? 1 : 0);
+    Serial.print(F(" wdt="));
+    Serial.print(g_watchdogArmed ? 1 : 0);
+    Serial.print(F(" feed="));
+    if (g_watchdogLastFeedMs == 0) {
+      Serial.println(F("never"));
+    } else {
+      Serial.print(millis() - g_watchdogLastFeedMs);
+      Serial.println(F("ms"));
+    }
+  }
+
   ledStateTimer.run();  // Timer for lights
   
   usbConnectTimer.run();
