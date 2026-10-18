@@ -239,6 +239,12 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
                                              // 2026-10-16: post-flash boots come up configured-but-HID-dead — serial
                                              // alive, every mouse report refused — and the host never fixes it itself)
 #define CONF_USB_REENUM_MAX 3                // forced re-enumerations per episode; further ticks only keep the page
+#define CONF_USB_REENUM_DWELL_MS 500         // bus-dark window per forced re-enumeration — 100 ms was not always long
+                                             // enough for the host to tear the old configuration down (bench 2026-10-17:
+                                             // a wedge survived three 100 ms cycles), while a real restart's ~4 s always
+                                             // heals; this borrows part of that margin without the reboot cost
+#define CONF_USB_RESTART_MAGIC 0x4C535255    // "LSRU" — the .noinit once-guard value: set right before the USB-recovery
+                                             // restart, checked at the next boot so the auto-restart can never loop
 
 #define CONF_UPDATE_MODE_DWELL_MS 500  // Bounded dwell in enterUpdateMode() between the ack, the "Update mode" splash
                                         // and the reset into the bootloader: long enough for the ack to reach the host

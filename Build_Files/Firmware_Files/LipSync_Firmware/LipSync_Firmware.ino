@@ -108,6 +108,17 @@ unsigned int g_usbAttempt = 0;
 unsigned int g_usbConnectDelay = CONF_USB_HID_INIT_DELAY;
 unsigned long g_usbNotReadySinceMs = 0;  // When the current HID-not-ready stretch began; 0 = none in progress
 unsigned int g_usbReenumCount = 0;        // Forced re-enumerations spent on the current episode
+// The .noinit once-guard for the USB-recovery auto-restart: a full chip reset
+// is the one cure that has cleared every configured-but-HID-dead boot on the
+// bench (2026-10-17: a wedge survived all three forced re-enumerations), but
+// an automatic restart must never loop. This word is written with
+// CONF_USB_RESTART_MAGIC immediately before the reset and checked at the next
+// boot — .noinit survives NVIC_SystemReset (startup clears .bss by symbols,
+// not whole RAM), so a matching magic means the previous boot already spent
+// its one auto-restart this power cycle. Any healthy boot clears it, re-arming
+// the guard for a future incident; a cold power-on reads random garbage, which
+// the magic test simply fails.
+__attribute__((section(".noinit"))) uint32_t g_usbRestartArmed;
 
 // Joystick module variables and structures
 int acceleration = 0;
@@ -1089,6 +1100,7 @@ void usbCheckConnection(void) {
       }
       g_usbNotReadySinceMs = 0;  // Episode over
       g_usbReenumCount = 0;
+      g_usbRestartArmed = 0;     // Healthy boot: re-arm the one auto-restart for a future incident
     } else {
       if (g_usbNotReadySinceMs == 0) {
         g_usbNotReadySinceMs = millis();  // Episode begins
@@ -1099,10 +1111,28 @@ void usbCheckConnection(void) {
         Serial.print(" at ");
         Serial.println(millis());
         USBDevice.detach();
-        delay(100);  // Long enough for the host to register the disconnect
+        delay(CONF_USB_REENUM_DWELL_MS);  // Dark long enough for the host to tear the old configuration down
         USBDevice.attach();
         g_usbConnectDelay = CONF_USB_HID_INIT_DELAY;  // Resume fast checks while the fresh enumeration settles
         g_usbNotReadySinceMs = millis();              // Fresh budget for the fresh enumeration
+      } else if ((millis() - g_usbNotReadySinceMs >= CONF_USB_REENUM_AFTER_MS) && (g_usbReenumCount >= CONF_USB_REENUM_MAX)
+                 && (g_usbRestartArmed != CONF_USB_RESTART_MAGIC)) {
+        // The re-enumeration budget is spent and the HID interface is still
+        // dead while serial lives — the host is not recovering this
+        // composite, and no bus-level cycle left will change that (bench
+        // 2026-10-17: a wedge survived three forced cycles). A full device
+        // restart has cleared every such boot on the bench — fresh USB
+        // peripheral, fresh address, seconds of bus darkness — so spend the
+        // one auto-restart this power cycle allows. The next boot wins the
+        // enumeration the way every restart boot has; if it somehow wedges
+        // again, the magic guard keeps this branch from firing and the page +
+        // retry ticks carry on for the app/user to see honestly.
+        g_usbRestartArmed = CONF_USB_RESTART_MAGIC;
+        Serial.print("USB restarting device to recover the HID interface at ");
+        Serial.println(millis());
+        screen.restartPage();
+        delay(500);  // Bounded: drain the serial line and let the framebuffer push complete (bounded by Wire)
+        NVIC_SystemReset();
       }
     }
   } else {
