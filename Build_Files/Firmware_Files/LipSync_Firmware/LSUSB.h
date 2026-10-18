@@ -177,11 +177,29 @@ class LSUSBGamepad {
     inline bool isReady(void);
     inline bool isConnected(void);
     bool usbRetrying = false;
+    bool timedOut = false;
+    // HID telemetry — the gamepad twin of LSUSBMouse's counters (bench
+    // 2026-10-18, gamepad-mode validation): in gamepad mode BH,0:0 used to
+    // read the MOUSE's interface unconditionally, so hidReady read 0 and
+    // attempts/successes read 0 forever while the gamepad happily reported —
+    // every health check and stuck-boot forensics lied about a working
+    // device, and would say nothing at all about a broken one (the exact
+    // "attempts climbing, successes 0" signature that decided the 4.4.0
+    // post-flash wedges was invisible in gamepad mode). Counted in send()/
+    // write() at the same points the mouse counts in mouseReport(): attempts
+    // before the readiness gate (refused reports are the signal), successes
+    // after TinyUSB accepts the report, and the movement stats from the
+    // axis deltas actually carried. Reported through BH,0:0.
+    uint32_t reportAttempts = 0;
+    uint32_t reportSuccesses = 0;
+    uint32_t nonzeroReports = 0;      // Reports that carried actual axis movement (x or y != center 128)
+    int16_t maxAbsReport = 0;         // Largest |x|/|y| delta ever sent — 0 forever means the report PIPELINE sends centered reports
   protected:
     HID_GamepadReport_Data_t _report;
     uint32_t startMillis;
     bool _begun = false;   // HID interface registered on the USB configuration — must happen exactly once (see begin())
     Adafruit_USBD_HID usb_hid;
+    inline void countReportMovement(void);
 };
 
 
@@ -558,11 +576,22 @@ void LSUSBGamepad::send(void)
   // 5-second spin refired on every send while the interface was down,
   // freezing the whole firmware against its serial session. Flag the
   // retry path instead and skip this report.
+  reportAttempts++;  // Counted before the gate: a refused report is the diagnostic signal, not a non-event
   if (!isReady()) {
     usbRetrying = true;
+    // Refused while the host had already configured the composite — the
+    // configured-but-HID-dead signature (bench 2026-10-16). A simple latch
+    // is enough here: the retry/re-enumeration machinery is driven by
+    // usbRetrying through usbCheckConnection, exactly as before; the latch
+    // only makes the refusal visible in BH. Cleared by any accepted report.
+    if (USBDevice.mounted()) timedOut = true;
     return;
   }
-  GamepadReport(&_report, sizeof(_report));
+  if (GamepadReport(&_report, sizeof(_report))) {
+    reportSuccesses++;
+    countReportMovement();
+    timedOut = false;
+  }
     startMillis = millis();
   }
 }
@@ -587,11 +616,17 @@ void LSUSBGamepad::write(void)
   wakeup();
 
   // Never block on HID readiness — see send().
+  reportAttempts++;
   if (!isReady()) {
     usbRetrying = true;
+    if (USBDevice.mounted()) timedOut = true;
     return;
   }
-  GamepadReport(&_report, sizeof(_report));
+  if (GamepadReport(&_report, sizeof(_report))) {
+    reportSuccesses++;
+    countReportMovement();
+    timedOut = false;
+  }
 }
 
 void LSUSBGamepad::write(void *report)
@@ -599,12 +634,30 @@ void LSUSBGamepad::write(void *report)
   wakeup();
 
   // Never block on HID readiness — see send().
+  reportAttempts++;
   if (!isReady()) {
     usbRetrying = true;
+    if (USBDevice.mounted()) timedOut = true;
     return;
   }
   memcpy(&_report, report, sizeof(_report));
-  GamepadReport(&_report, sizeof(_report));
+  if (GamepadReport(&_report, sizeof(_report))) {
+    reportSuccesses++;
+    countReportMovement();
+    timedOut = false;
+  }
+}
+
+// Movement accounting for an accepted report (the mouse counts this inside
+// mouseReport(); the gamepad reports from three gated paths, so the shared
+// helper reads the just-sent _report). Axes are 128-centered: the delta from
+// center is the movement actually carried.
+void LSUSBGamepad::countReportMovement(void) {
+  int16_t absX = (int16_t)abs((int)_report.xAxis - 128);
+  int16_t absY = (int16_t)abs((int)_report.yAxis - 128);
+  if (absX > 0 || absY > 0) nonzeroReports++;
+  if (absX > maxAbsReport) maxAbsReport = absX;
+  if (absY > maxAbsReport) maxAbsReport = absY;
 }
 
 void LSUSBGamepad::press(uint8_t b)

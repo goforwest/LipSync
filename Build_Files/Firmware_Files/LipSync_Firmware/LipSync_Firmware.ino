@@ -1552,6 +1552,15 @@ unsigned long effectiveWindowMs(unsigned long defaultWindowMs) {
 //              "called and refused by TinyUSB" and "accepted but ignored by
 //              the host". These seven numbers split exactly those cases).
 //
+//              The values describe the ACTIVE mode's HID interface (bench
+//              2026-10-18, gamepad-mode validation): mouse mode reads
+//              usbmouse and gamepad mode reads the gamepad — the old
+//              unconditional mouse read made BH report hidReady=0 and
+//              attempts=0 forever on a healthy gamepad boot, so health
+//              checks and stuck-boot forensics lied exactly when they
+//              mattered (LSUSBGamepad now carries the same counters as
+//              LSUSBMouse, filled at the same choke points).
+//
 // Parameters : out : int[9] : filled with [usbMounted, hidReady, hidRetrying,
 //              hidTimedOut, centerComplete, reportAttempts, reportSuccesses,
 //              nonzeroReports, maxAbsReport]
@@ -1559,15 +1568,17 @@ unsigned long effectiveWindowMs(unsigned long defaultWindowMs) {
 // Return     : void
 //****************************************//
 void fillUsbHidDiagnostics(int out[9]) {
+  const bool gamepadMode = (g_operatingMode == CONF_OPERATING_MODE_GAMEPAD);
   out[0] = USBDevice.mounted() ? 1 : 0;
-  out[1] = usbmouse.isReady() ? 1 : 0;
-  out[2] = usbmouse.usbRetrying ? 1 : 0;
-  out[3] = usbmouse.timedOut ? 1 : 0;
+  out[1] = (gamepadMode ? gamepad.isReady() : usbmouse.isReady()) ? 1 : 0;
+  out[2] = (gamepadMode ? gamepad.usbRetrying : usbmouse.usbRetrying) ? 1 : 0;
+  out[3] = (gamepadMode ? gamepad.timedOut : usbmouse.timedOut) ? 1 : 0;
   out[4] = g_resetCenterComplete ? 1 : 0;
-  out[5] = (int)(usbmouse.reportAttempts % 1000000007);  // Wrap-safe read of a boot-long counter
-  out[6] = (int)(usbmouse.reportSuccesses % 1000000007);
-  out[7] = (int)(usbmouse.nonzeroReports % 1000000007);
-  out[8] = usbmouse.maxAbsReport;
+  // Wrap-safe reads of boot-long counters (the raw uint32 would overflow int)
+  out[5] = (int)((gamepadMode ? gamepad.reportAttempts : usbmouse.reportAttempts) % 1000000007);
+  out[6] = (int)((gamepadMode ? gamepad.reportSuccesses : usbmouse.reportSuccesses) % 1000000007);
+  out[7] = (int)((gamepadMode ? gamepad.nonzeroReports : usbmouse.nonzeroReports) % 1000000007);
+  out[8] = gamepadMode ? gamepad.maxAbsReport : usbmouse.maxAbsReport;
 }
 
 //***FILL JOYSTICK PIPELINE DIAGNOSTICS FUNCTION***//

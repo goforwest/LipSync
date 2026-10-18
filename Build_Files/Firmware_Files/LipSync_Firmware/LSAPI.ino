@@ -1417,9 +1417,13 @@ void getBusHealth(bool responseEnabled, bool apiEnabled) {
   // HID-layer + joystick-pipeline telemetry (bench 2026-10-16 hunt):
   // [6..14] = usbMounted, hidReady, hidRetrying, hidTimedOut,
   // centerComplete, reportAttempts, reportSuccesses, nonzeroReports,
-  // maxAbsReport; [15..28] = the pipeline internals (see
-  // fillJoystickPipelineDiagnostics). The app's health check reads the
-  // first six values and ignores the rest; a serial monitor sees everything.
+  // maxAbsReport — read from the ACTIVE mode's HID interface (mouse mode:
+  // usbmouse; gamepad mode: the gamepad's own counters, bench 2026-10-18 —
+  // the old unconditional mouse read made gamepad-mode BH report hidReady=0
+  // and attempts=0 forever on a healthy boot). [15..28] = the pipeline
+  // internals (see fillJoystickPipelineDiagnostics). The app's health check
+  // reads the first six values and ignores the rest; a serial monitor sees
+  // everything.
   int hidDiagnostics[9];
   fillUsbHidDiagnostics(hidDiagnostics);
 
