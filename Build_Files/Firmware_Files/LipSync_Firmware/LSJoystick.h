@@ -20,7 +20,7 @@
 #ifndef _LSJOYSTICK_H
 #define _LSJOYSTICK_H
 
-#include <Tlv493d.h>                    // Infinion TLV493 magnetic sensor
+#include <TLx493D_inc.hpp>               // XENSIV TLx493D — Infineon's successor to the deprecated TLV493D-A1B6 library (upstream #37; see Libraries/xensiv-tlx493d/LIPSYNC.md for the boundedness audit)
 #include <Arduino.h>
 #include "LSCircularBuffer.h"           // LSCircularBuffer
 #include "LSUtils.h"                    // pointIntType
@@ -107,7 +107,16 @@ class LSJoystick {
     void fillPipelineDiagnostics(int out[14]);
 
   private:
-    Tlv493d _Tlv493dSensor = Tlv493d();                                   // Create an object of Tlv493d class
+    // XENSIV sensor object (the old code held a Tlv493d): the A1B6 alias is
+    // TLx493D<Kit2GoBoardSupport, TwoWireWrapper, TLx493D_A1B6_e>. Constructed
+    // with the sketch's Wire (the vendored bounded fork — every transaction
+    // this class makes flows through it) and the A0 strap address (0xBC write
+    // address = 0x5E 7-bit = CONF I2CADDR_TLV493D). In master-controlled
+    // continuous measurement after begin(): every read is one bounded I2C
+    // read of the live register map, and getMagneticField() scales with the
+    // same 0.098 mT/LSB factor the old library used, so raw values and JV
+    // output are numerically comparable across the migration.
+    ifx::tlx493d::TLx493D_A1B6 _Tlv493dSensor = ifx::tlx493d::TLx493D_A1B6(Wire, TLx493D_IIC_ADDR_A0_e);
     LSCircularBuffer <pointFloatType> _joystickRawBuffer;                 // Create a buffer of type pointFloatType to push raw readings 
     LSCircularBuffer <pointIntType> _joystickInputBuffer;                 // Create a buffer of type pointIntType to push mapped and filtered readings 
     LSCircularBuffer <pointIntType> _joystickOutputBuffer;                // Create a buffer of type pointIntType to push mapped readings 
@@ -184,7 +193,29 @@ void LSJoystick::begin() {
   _skipInputChange = false;                                            // Initialize _skipInputChange
   _operatingMode = getOperatingMode(false, false); //TODO 2025-Mar-06 Remove - Joystick class should be independent of operating mode
 
-  _Tlv493dSensor.begin();  // TODO 2025-Feb-25 This will likely hang if it fails. Ideally replace with something that returns error/success.
+  // XENSIV TLx493D begin (upstream #37 migration; see Libraries/xensiv-tlx493d/
+  // LIPSYNC.md for the full audit). All four arguments are load-bearing:
+  //   - enablePower=false: the sensor is hardwired on the LipSync PCB, not on
+  //     a Kit2Go board — the library's power-pin machinery must stay out of
+  //     the sketch's pins.
+  //   - enableSelect=false: no select pin exists on the PCB.
+  //   - enableExtendedAdress=false: the sensor strap is the A0 address
+  //     (0xBC write / 0x5E 7-bit — CONF I2CADDR_TLV493D).
+  //   - executeInit=false: Wire is already begun and configured by
+  //     initWire() (the vendored bounded Wire fork); a library-side
+  //     Wire.begin() must never reconfigure the bus the display and both
+  //     pressure sensors share.
+  // The old call was the argument-less _Tlv493dSensor.begin() of the
+  // deprecated TLV493D-A1B6 library (POWERDOWNMODE with a bounded wake-wait
+  // per read); XENSIV's default A1B6 config is MASTER-CONTROLLED continuous
+  // measurement — the sensor measures on its own and every poll is a single
+  // bounded I2C read of the live registers (no wake write, no measurement
+  // wait, no sleep write: strictly cheaper per poll, still bounded through
+  // the vendored Wire's 50 ms per-transaction cap). Bench-validated before
+  // merge: raw-value parity with JV, calibration feel, magnet-direction
+  // latch, flaky-bus backoff, and the battery budget of a continuously
+  // measuring sensor (µA power-down vs ~mA master-controlled).
+  _Tlv493dSensor.begin(false, false, false, false);
   setMagnetDirection(JOY_DIRECTION_DEFAULT, JOY_DIRECTION_DEFAULT);      // Set default magnet direction.
   setInnerDeadzone(JOY_OUTPUT_DEADZONE_STATUS, JOY_OUTPUT_DEADZONE_FACTOR);   // Set default deadzone status and deadzone factor.
   setOuterDeadzone(JOY_OUTPUT_DEADZONE_STATUS, 1.0 - JOY_OUTPUT_DEADZONE_FACTOR);   // Set default deadzone status and deadzone factor.
@@ -298,8 +329,12 @@ void LSJoystick::setMagnetZDirection() {
 
   float zReading = 0.0;
   for (int i = 0 ; i < JOY_MAG_SAMPLE_SIZE ; i++){        // Get the average of 5 z direction reading 
-    _Tlv493dSensor.updateData();
-    zReading += _Tlv493dSensor.getZ();
+    // One XENSIV read returns x/y/z from the same register snapshot (the
+    // old library's updateData()+getZ() pair is now a single call; each
+    // iteration is still one bounded I2C read of the live registers).
+    double xReading = 0.0, yReading = 0.0, zSample = 0.0;
+    _Tlv493dSensor.getMagneticField(&xReading, &yReading, &zSample);
+    zReading += (float)zSample;
   }
   zReading = ((float) zReading) / JOY_MAG_SAMPLE_SIZE;
    
@@ -555,8 +590,11 @@ void LSJoystick::evaluateInputCenter() {
 // Return     : void
 //*********************************//
 void LSJoystick::updateInputCenterBuffer() {
-  _Tlv493dSensor.updateData();
-  _joystickCenterBuffer.pushElement({_Tlv493dSensor.getY(), _Tlv493dSensor.getX()});   // Joystick direction mapping
+  // Single XENSIV read replaces the old updateData()+getY()+getX() trio —
+  // one bounded I2C transaction, one register snapshot.
+  double xReading = 0.0, yReading = 0.0, zReading = 0.0;
+  _Tlv493dSensor.getMagneticField(&xReading, &yReading, &zReading);
+  _joystickCenterBuffer.pushElement({(float)yReading, (float)xReading});   // Joystick direction mapping
 }
 
 
@@ -570,9 +608,11 @@ void LSJoystick::updateInputCenterBuffer() {
 // Return     : max point : pointFloatType : The max point
 //*********************************//
 pointFloatType LSJoystick::getInputMax(int quad) {
-  _Tlv493dSensor.updateData();
+  // Single XENSIV read replaces the old updateData()+getY()+getX() trio.
+  double xReading = 0.0, yReading = 0.0, zReading = 0.0;
+  _Tlv493dSensor.getMagneticField(&xReading, &yReading, &zReading);
   // Get new x and y reading
-  pointFloatType tempCalibrationPoint = {_Tlv493dSensor.getY(), _Tlv493dSensor.getX()};
+  pointFloatType tempCalibrationPoint = {(float)yReading, (float)xReading};
 //  Serial.print("x:");
 //  Serial.print(tempCalibrationPoint.x);
 //  Serial.print("y:");
@@ -634,18 +674,26 @@ void LSJoystick::update() {
 
   // A flaky device on the shared I2C bus (failing display or sensor) can
   // drag every transfer until it completes slowly instead of wedging — no
-  // bounded-timeout ever fires, but the TLV493D's measurement wait turns
-  // this ~1 ms update into ~1 s of crawling transfers, once per 20 ms tick,
-  // which read as a flat ~1 s main-loop tax. Measure each update and back
-  // off hard while the bus crawls; a fast update (bus healthy again)
-  // restores the base cadence immediately.
+  // bounded-timeout ever fires, but a crawling transfer chain turns
+  // this ~1 ms update into ~1 s, once per 20 ms tick, which reads as a
+  // flat ~1 s main-loop tax. Measure each update and back off hard while
+  // the bus crawls; a fast update (bus healthy again) restores the base
+  // cadence immediately. (The original trigger was the TLV493D's
+  // measurement wait; the XENSIV read path has no wait of its own, but a
+  // dragged bus taxes ANY transaction — the backoff stays, µs-level
+  // expectations unchanged.)
   if ((long)(millis() - _busRetryAtMs) < 0) return;
 
   unsigned long updateStartUs = micros();
 
-  _Tlv493dSensor.updateData();
+  // Single XENSIV read replaces the old updateData()+getY()+getX() trio and
+  // yields the Z from the same snapshot (the deferred latch below used to
+  // read the old library's cached Z; now it is this call's z directly). One
+  // bounded I2C read per tick, through the vendored Wire.
+  double xReading = 0.0, yReading = 0.0, zReading = 0.0;
+  _Tlv493dSensor.getMagneticField(&xReading, &yReading, &zReading);
   // Get the new readings as a point
-  _rawPoint = {_Tlv493dSensor.getY(), _Tlv493dSensor.getX()};  // TODO 2025-Feb-25 This should be abstracted to a dedicated function   
+  _rawPoint = {(float)yReading, (float)xReading};  // TODO 2025-Feb-25 This should be abstracted to a dedicated function   
   
   _skipInputChange = canSkipInputChange(_rawPoint);
   _joystickRawBuffer.pushElement(_rawPoint);                  // Add raw points to _joystickRawBuffer : DON'T MOVE THIS
@@ -661,12 +709,12 @@ void LSJoystick::update() {
     // directions. Zero extra bus traffic: the Z is this very update's data.
     // Runs at most once per processed tick and stops the moment it latches.
     if (_magnetZDirection == JOY_DIRECTION_FAULT) {
-      float zReading = _Tlv493dSensor.getZ();
-      if (zReading < -1 * JOY_Z_DIRECTION_THRESHOLD) {
+      float zFromSnapshot = (float)zReading;
+      if (zFromSnapshot < -1 * JOY_Z_DIRECTION_THRESHOLD) {
         _magnetZDirection = JOY_DIRECTION_INVERSE;
         _joystickXDirection = -1 * _magnetZDirection * _magnetXDirection;
         _joystickYDirection = -1 * _magnetZDirection * _magnetYDirection;
-      } else if (zReading > JOY_Z_DIRECTION_THRESHOLD) {
+      } else if (zFromSnapshot > JOY_Z_DIRECTION_THRESHOLD) {
         _magnetZDirection = JOY_DIRECTION_DEFAULT;
         _joystickXDirection = -1 * _magnetZDirection * _magnetXDirection;
         _joystickYDirection = -1 * _magnetZDirection * _magnetYDirection;
