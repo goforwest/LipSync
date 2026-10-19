@@ -30,7 +30,7 @@
 
 #define CONF_LIPSYNC_VERSION_MAJOR  4
 #define CONF_LIPSYNC_VERSION_MINOR  5
-#define CONF_LIPSYNC_VERSION_REV    2
+#define CONF_LIPSYNC_VERSION_REV    3
 
 const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + "." + String(CONF_LIPSYNC_VERSION_MINOR) + "." + String(CONF_LIPSYNC_VERSION_REV);
 
@@ -345,16 +345,17 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 #define CONF_LIGHT_MODE_DEFAULT CONF_LIGHT_MODE_BASIC
 
 // Input-state LED feedback (the LM=3 tier): while any input is held, the
-// LEDs show WHICH WINDOW the hold is in — green in the short window,
-// yellow after crossing into the long window, red in the very-long
-// window — instead of the pending action's color. Actions are not
+// LEDs show WHICH WINDOW the hold is in, on two redundant channels — the
+// three face LEDs FILL left -> middle -> right as the hold crosses each
+// boundary (1/2/3: they are physically single-color, so a count is the
+// one message they can carry), and the micro LED next to the USB-C port
+// shows the window's COLOR (the Hub's single RGB LED). Actions are not
 // one-to-one with inputs (#43), so the window is the honest thing to
-// show; the traffic-light progression also tells the user what release
-// will do without memorizing any mapping.
+// show; the fill progression also tells the user what a release will do
+// without memorizing any mapping.
 #define CONF_INPUT_STATE_LED_SHORT_COLOR LED_CLR_GREEN
 #define CONF_INPUT_STATE_LED_LONG_COLOR  LED_CLR_YELLOW
 #define CONF_INPUT_STATE_LED_MAX_COLOR    LED_CLR_RED
-#define CONF_INPUT_STATE_LED_NUMBER       CONF_LED_ALL
 
 // Light Brightness Levels
 #define CONF_LED_BRIGHTNESS_LEVEL_DEFAULT   5

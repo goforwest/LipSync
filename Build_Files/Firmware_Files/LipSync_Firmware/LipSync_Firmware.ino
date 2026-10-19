@@ -1954,24 +1954,31 @@ void evaluateOutputAction(inputStateStruct actionState, unsigned long actionMaxE
       tempActionIndex = applyInputRestrictions(tempActionIndex, inputClass);
 
       // Input-state LED mode (LM=3, roadmap item 16 / upstream #43): the
-      // LEDs show the window the hold is in — green in the short window,
-      // yellow after crossing into the long window, red in the very-long
-      // window — instead of the pending action's color. Actions are not
+      // LEDs show the window the hold is in — a DUAL channel (bench design
+      // 2026-10-19): the three face LEDs FILL 1 -> 2 -> 3 as the hold
+      // crosses each window boundary (they are physically single-color, so
+      // a count is the one message they can carry), and the micro LED next
+      // to the USB-C port shows the window's COLOR. Actions are not
       // one-to-one with inputs (#43), so the window is the honest signal,
-      // and the progression previews what a release will do without
-      // memorizing any mapping. Re-evaluated every tick, so the LEDs
-      // step through the traffic light as the hold crosses each boundary;
-      // a gated (restricted) input still shows nothing at all.
+      // and the fill previews what a release will do without memorizing
+      // any mapping. Re-evaluated every tick, so the LEDs step up through
+      // the windows as the hold crosses each boundary; a gated (restricted)
+      // input still shows nothing at all.
       if (tempActionIndex != CONF_ACTION_NOTHING && g_lightMode == CONF_LIGHT_MODE_STATE) {
         unsigned long holdMs = actionState.elapsedTime;
-        int stateColor = CONF_INPUT_STATE_LED_MAX_COLOR;
-        if (holdMs < effectiveWindowMs(CONF_INPUT_WINDOW_LONG_DEFAULT_MS)) {
-          stateColor = (holdMs < effectiveWindowMs(CONF_INPUT_WINDOW_SHORT_DEFAULT_MS))
-                           ? CONF_INPUT_STATE_LED_SHORT_COLOR
-                           : CONF_INPUT_STATE_LED_LONG_COLOR;
+        int stateColor;
+        int windowCount;
+        if (holdMs < effectiveWindowMs(CONF_INPUT_WINDOW_SHORT_DEFAULT_MS)) {
+          stateColor = CONF_INPUT_STATE_LED_SHORT_COLOR;  // green
+          windowCount = 1;
+        } else if (holdMs < effectiveWindowMs(CONF_INPUT_WINDOW_LONG_DEFAULT_MS)) {
+          stateColor = CONF_INPUT_STATE_LED_LONG_COLOR;  // yellow
+          windowCount = 2;
+        } else {
+          stateColor = CONF_INPUT_STATE_LED_MAX_COLOR;  // red
+          windowCount = 3;
         }
-        setLedState(LED_ACTION_ON, stateColor, CONF_INPUT_STATE_LED_NUMBER, 0, 0, led.getLedBrightness());
-        performLedAction(ledCurrentState);
+        led.setInputStateLeds(windowCount, stateColor, led.getLedBrightness());
         break;
       }
 

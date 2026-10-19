@@ -96,6 +96,7 @@ public:
   int getLedBrightnessLevel();              // get brightness level from 1-10
   void setLedBrightnessLevel(int ledBrightnessLevel);
   void setLedColor(int ledNumber, int ledColorNumber, int ledBrightness);
+  void setInputStateLeds(int windowCount, int colorNumber, int ledBrightness);
   void show();
   void setLightModeLevel(int lightModeLevel);
   int getLightModeLevel();
@@ -363,5 +364,36 @@ void LSOutput::setLedColor(int ledNumber, int ledColorNumber, int ledBrightness)
   }  // end switch
 
 } // end LSOutput::setLedColor
+
+//*********************************//
+// Function   : setInputStateLeds
+//
+// Description: The LM=3 input-state tier's dual-channel window indicator
+//              (bench design 2026-10-19, roadmap item 16 / upstream #43):
+//              the three face LEDs fill left -> middle -> right as the hold
+//              crosses each window boundary — 1 in the short window, 2 in
+//              the long, 3 in the very-long — because the face LEDs are
+//              physically single-color and can only render a count, and a
+//              growing fill is the one message they can carry unambiguously
+//              ("more lights = further into the hold"). The micro LED next
+//              to the USB-C port carries the window's COLOR (the Hub's
+//              single RGB LED), so the two channels are redundant: count
+//              for anyone who cannot distinguish colors (or cannot see the
+//              tiny LED), color for anyone who can. The unlit face LEDs are
+//              turned OFF explicitly — the fill is a level, not a tint.
+//
+// Arguments :  windowCount : int : how many windows the hold has crossed
+//                                          (1 = short, 2 = long, 3 = very-long)
+//              ledColorNumber : int : the window's color (drives the micro LED)
+//              ledBrightness : int : configured LED brightness
+//
+// Return     : void
+//*********************************//
+void LSOutput::setInputStateLeds(int windowCount, int colorNumber, int ledBrightness) {
+  setLedColor(CONF_LED_LEFT,   windowCount >= 1 ? colorNumber : LED_CLR_NONE, ledBrightness);
+  setLedColor(CONF_LED_MIDDLE, windowCount >= 2 ? colorNumber : LED_CLR_NONE, ledBrightness);
+  setLedColor(CONF_LED_RIGHT,  windowCount >= 3 ? colorNumber : LED_CLR_NONE, ledBrightness);
+  setLedColor(CONF_LED_MICRO,  colorNumber, ledBrightness);
+}
 
 #endif
