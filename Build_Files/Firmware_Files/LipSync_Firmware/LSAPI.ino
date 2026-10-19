@@ -1004,9 +1004,16 @@ void getJoystickInitialization(bool responseEnabled, bool apiEnabled, String opt
 // Return     : void
 //*********************************//
 void setJoystickInitialization(bool responseEnabled, bool apiEnabled) {
+  // Record who initiated the center (4.5.2, wire hygiene): the completion's
+  // IN,1 line is an ack (SUCCESS) only when the serial API asked for it —
+  // a device-initiated center (boot auto-center, Hub-menu Center Reset,
+  // the calibration's internal step 5) prints MANUAL instead, so a boot
+  // straggler can never falsely resolve a host's pending IN,1:1 waiter.
+  // See g_centerInitFromApi in LipSync_Firmware.ino for the full evidence.
+  g_centerInitFromApi = apiEnabled;
   int stepNumber = 0;
   canOutputAction = false;
-  calibrationTimerId[0] = calibrationTimer.setTimeout(CONF_JOY_INIT_START_DELAY, performJoystickCenter, (int *)stepNumber);  
+  calibrationTimerId[0] = calibrationTimer.setTimeout(CONF_JOY_INIT_START_DELAY, performJoystickCenter, (int *)stepNumber);
 }
 //***SET JOYSTICK INITIALIZATION API FUNCTION***//
 // Function   : setJoystickInitialization

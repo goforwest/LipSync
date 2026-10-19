@@ -132,6 +132,21 @@ bool canOutputAction = true;
 bool g_startupCenterReset = true;
 bool g_resetCenterComplete = false;  // global variable for center reset status
 bool g_calibrationError = false;     // Global variable for error in full calibration
+// Who initiated the in-flight joystick center-reset (4.5.2, wire hygiene):
+// the center flow always ends by printing an IN,1 line, but only a center
+// the HOST requested over the serial API (IN,1:1) is an ack — a
+// device-initiated center (the boot-time auto-center in initJoystick, the
+// Hub menu's Center Reset row, the full calibration's internal step 5)
+// must print MANUAL, not SUCCESS. The old hardcoded SUCCESS let the boot
+// auto-center land an UNSOLICITED SUCCESS mid-settings-load (bench
+// 2026-10-18: a stray SUCCESS,0:IN,1:1.23|-1.55 between the VN request
+// and its response), and on the host side an unsolicited SUCCESS is worse
+// than noise: command waiters match on SUCCESS — a boot straggler could
+// falsely resolve a pending IN,1:1 with the boot center's value. MANUAL
+// carries the same data, renders identically in the app, and no waiter
+// will ever match it. Set by setJoystickInitialization from its own
+// (responseEnabled, apiEnabled) pair; consumed once by the completion.
+bool g_centerInitFromApi = false;
 
 bool settingsEnabled = false;  // Serial input settings command mode enabled or disabled
 
@@ -2359,7 +2374,16 @@ void performJoystickCenter(int* args) {
     js.evaluateInputCenter();           // Evaluate the center point using values in the buffer
     js.setMinimumRadius();              // Update minimum radius of operation
     centerPoint = js.getInputCenter();  // Get the new center for API output
-    printResponseFloatPoint(true, true, true, 0, "IN,1", true, centerPoint);
+    // apiEnabled follows the initiator (g_centerInitFromApi, 4.5.2 wire
+    // hygiene): SUCCESS only for a host-requested IN,1:1; MANUAL for every
+    // device-initiated center (the boot auto-center, the Hub-menu Center
+    // Reset, the calibration's internal step 5) — an unsolicited SUCCESS on
+    // the wire is a lie a command waiter can false-match (the bench caught
+    // a boot straggler landing between the VN request and its response);
+    // MANUAL carries the same data and matches no waiter. The response is
+    // always printed: hosts consume it either way to refresh the neutral.
+    printResponseFloatPoint(true, g_centerInitFromApi, true, 0, "IN,1", true, centerPoint);
+    g_centerInitFromApi = false;  // One-shot: the initiator is consumed by the print
     calibrationTimer.deleteTimer(0);  // Delete timer
     setLedDefault();                  // Set default led feedback
     canOutputAction = true;

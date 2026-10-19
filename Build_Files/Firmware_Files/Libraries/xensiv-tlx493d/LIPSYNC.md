@@ -8,13 +8,20 @@ calibration completing cleanly in proper quadrature, the Z-direction latch
 holding `dirX=-1, dirY=1` across five restarts, cursor feel signed off by
 the bench user (SS=7/AV=3), and an unseated-cable flaky-bus episode that
 matched the documented degraded-state pattern exactly (graceful gating, no
-reset loop, full recovery on re-seat). The battery trade was ACCEPTED by
-the bench user: the sensor now measures continuously (~mA vs µA
-power-down), a USB-powered usage profile pays nothing; BLE untethered
-runtime is the one place it can be felt, logged for upstream. The retired
-`TLV493D-A1B6` fork was removed in the merge commit; its bounding work
-lives on in the vendored Wire, and this library's read path needs none (see
-the audit below).
+reset loop, full recovery on re-seat). The battery trade is CLOSED AS MOOT
+(follow-up 2026-10-18): **the LipSync has no internal battery** — the BOM
+is a Xiao nRF52840 powered via the hub USB cable, with no cell or charger
+anywhere in the parts list. Every powered state is externally fed: host USB
+(computer / power bank / powered splitter) or, for mobile use, the phone
+over USB-OTG — the one case where the sensor's continuous mA-scale draw
+(built-in measurement vs the old fork's µA-scale power-down between reads)
+lands on something the user notices, and precisely the case the User Guide
+already steers to an external power source. There is no device-battery-life
+metric for the continuous current to affect; powerdown-mode work would
+churn the freshly-validated read path for no measurable product benefit.
+The retired `TLV493D-A1B6` fork was removed in the merge commit; its
+bounding work lives on in the vendored Wire, and this library's read path
+needs none (see the audit below).
 
 Vendored copy of Infineon's `arduino-xensiv-3d-magnetic-sensor-tlx493d`
 (library.properties version 1.1.2, MIT license; repository
@@ -88,9 +95,9 @@ This copy is unmodified upstream. If the bounding guarantees above ever
 regress (an upstream change reintroducing an unbounded wait or a per-read
 write-wait-read cycle), port the old fork's bounding into this copy BEFORE
 updating — the guarantees are load-bearing for the 20 ms poll loop and the
-watchdog math, not cosmetic. If BLE battery life ever matters enough to
-revisit, the follow-up is a powerdown access-mode variant on this copy —
-accepting the wake-wait cycle it reintroduces.
+watchdog math, not cosmetic. (The powerdown-mode variant once considered for
+battery reasons is closed as moot: see the status paragraph — the LipSync
+hardware has no internal battery to trade against.)
 
 ---
 
