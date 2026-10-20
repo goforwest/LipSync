@@ -205,6 +205,23 @@ void doFactoryReset(bool responseEnabled, bool apiEnabled, String optionalParame
 void enterUpdateMode(bool responseEnabled, bool apiEnabled);
 void enterUpdateMode(bool responseEnabled, bool apiEnabled, String optionalParameter);
 
+// ---- Serial print helpers (defined in LSAPI.ino) ----
+// Declared here because LSScreen.h's menu-state push (CH,5, the two-way Hub
+// remote) prints through the same canonical formatter as every response —
+// building the line by hand in the screen class would be a second wire
+// format that can drift. Signatures MUST match the LSAPI.ino definitions.
+
+void printResponseIntArray(bool responseEnabled,
+                           bool apiEnabled,
+                           bool responseStatus,
+                           int responseNumber,
+                           String responseCommand,
+                           bool responseParameterEnabled,
+                           String responsePrefix,
+                           int responseParameterSize,
+                           char responseParameterDelimiter,
+                           int responseParameter[]);
+
 // ---- Cross-tab free functions (defined in LipSync_Firmware.ino) ----
 
 // Device lifecycle

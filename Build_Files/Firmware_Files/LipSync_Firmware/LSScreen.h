@@ -126,6 +126,15 @@ public:
   // _cursorStart header rows.
   void fillMenuState(int out[3]);
 
+  // Two-way Hub remote (firmware side of the CH,5 push, LipSync_Connect's
+  // protocol proposal now realized): report the live menu state on the wire
+  // whenever it changes, so the app's remote mirror follows PHYSICAL
+  // navigation too — the one menu fact that never rode the wire unprompted
+  // (settings changes already push MANUAL lines; app-driven presses are
+  // followed by the app's own CH,0:0 poll). See reportMenuState for the wire
+  // contract; the change-detect is the rate limiter.
+  void reportMenuState();
+
   // Non-blocking page transitions (see scheduleTransition): the continuations
   // run on the screen timer when the informational page's dwell time ends,
   // instead of delay() freezing the whole main loop for 0.2-3 s.
@@ -205,6 +214,12 @@ private:
   int _currentSelection = 0;
   int _selectedLine;
   int _cursorPos;
+
+  // Two-way Hub remote (CH,5 push): the last [active, page, row] triple
+  // reported on the wire, for reportMenuState's change-detect. Boot state
+  // {0,0,0} means the closed-menu triple never prints by itself — the first
+  // line is the first real menu event.
+  int _lastReportedMenuState[3] = {0, 0, 0};
 
   int _operatingMode;
   int _tempOperatingMode;
@@ -650,6 +665,14 @@ void LSScreen::flushDisplay() {
   } else {
     _displayProbeIntervalMs = 2000;  // Clean push — restore the base re-probe cadence
   }
+
+  // Two-way Hub remote (see reportMenuState): every menu redraw ends here,
+  // so this single hook turns a menu state change into a wire push — open,
+  // navigation, page transitions, the exit/timeout close all flow through
+  // it. It runs only when the framebuffer actually reached the bus: while
+  // the display is demoted the menu's internal state advances but nothing
+  // is shown, and the app's CH,0:0 poll still reads the same truth.
+  reportMenuState();
 }
 
 //*********************************//
@@ -2207,6 +2230,48 @@ void LSScreen::fillMenuState(int out[3]) {
   out[0] = _isActive ? 1 : 0;
   out[1] = _currentMenu;
   out[2] = _currentSelection;
+}
+
+//*********************************//
+// Function   : reportMenuState
+//
+// Description: The push half of Hub remote control (the CH,5 menu-state
+//              push, two-way remote): whenever the live [active, page, row]
+//              triple changes, print MANUAL,0:CH,5:<active>,<page>,<row> —
+//              the same triple the CH,0:0 read answers — so the app's
+//              remote mirror follows PHYSICAL navigation (Next/Select on
+//              the Hub, joystick-driven menu steps, the inactivity
+//              timeout) instead of drifting until the next app press.
+//              Called from the flushDisplay choke point, where every menu
+//              redraw ends; the change-detect below is the entire rate
+//              limiter — value screens re-render on every adjust step and
+//              the long-text scroll flushes every 100 ms, and neither
+//              changes the triple, so neither prints.
+//
+//              Wire safety is the 4.5.2 initiator contract: MANUAL + seq 0
+//              is device-initiated and matches no command waiter (the boot
+//              re-center precedent), printed unconditionally like every
+//              unsolicited line this firmware emits (the CDC stack drops
+//              writes with no host listening). The triple comes from
+//              fillMenuState verbatim, so the poll and the push can never
+//              disagree.
+//
+// Arguments :  void
+//
+// Return     : void
+//*********************************//
+void LSScreen::reportMenuState() {
+  int menuState[3];
+  fillMenuState(menuState);
+  if (menuState[0] == _lastReportedMenuState[0] &&
+      menuState[1] == _lastReportedMenuState[1] &&
+      menuState[2] == _lastReportedMenuState[2]) {
+    return;
+  }
+  _lastReportedMenuState[0] = menuState[0];
+  _lastReportedMenuState[1] = menuState[1];
+  _lastReportedMenuState[2] = menuState[2];
+  printResponseIntArray(true, false, true, 0, "CH,5", true, "", 3, ',', menuState);
 }
 
 //*********************************//
