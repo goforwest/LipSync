@@ -2426,7 +2426,14 @@ void performJoystickCenterStep(int* args) {
 void performJoystickCalibration(int* args) {
   g_resetCenterComplete = false;
   g_calibrationError = false;
-  int stepNumber = (int)args;
+  // The initiator rides the chain's payload (CONF_CALIB_API_FLAG, 4.5.4
+  // audit follow-up): the per-corner CA,n lines print SUCCESS only for a
+  // calibration the HOST requested over the serial API (CA,1:1); a
+  // Hub-menu-initiated run prints MANUAL with the same data — the 4.5.2
+  // initiator contract (an unsolicited SUCCESS on the wire can falsely
+  // resolve a pending command waiter).
+  bool calibFromApi = ((int)args & CONF_CALIB_API_FLAG) != 0;
+  int stepNumber = (int)args & ~CONF_CALIB_API_FLAG;
 
   // Duration of the max corner reading ( 2 seconds )
   unsigned long readingDuration = CONF_JOY_CALIB_READING_DELAY * CONF_JOY_CALIB_READING_NUMBER;
@@ -2444,7 +2451,7 @@ void performJoystickCalibration(int* args) {
     setLedState(LED_ACTION_BLINK, CONF_JOY_CALIB_START_LED_COLOR, CONF_JOY_CALIB_LED_NUMBER, CONF_JOY_CALIB_STEP_BLINK, CONF_JOY_CALIB_STEP_BLINK_DELAY, led.getLedBrightness());
     performLedAction(ledCurrentState);
     ++stepNumber;
-    calibrationTimerId[0] = calibrationTimer.setTimeout(currentReadingStart, performJoystickCalibration, (int*)stepNumber);  // Start next step
+    calibrationTimerId[0] = calibrationTimer.setTimeout(currentReadingStart, performJoystickCalibration, (int*)(stepNumber | (calibFromApi ? CONF_CALIB_API_FLAG : 0)));  // Start next step
   } else if (stepNumber < 5) {                                                                                               // STEP 1-4: Joystick Calibration Corner Points
     screen.fullCalibrationPrompt(stepNumber);
     buzzer.calibCornerTone();
@@ -2452,17 +2459,17 @@ void performJoystickCalibration(int* args) {
     performLedAction(ledCurrentState);  // LED Feedback to show start of performJoystickCalibrationStep
     js.zeroInputMax(stepNumber);        // Clear the existing calibration value
 
-    calibrationTimerId[1] = calibrationTimer.setTimer(CONF_JOY_CALIB_READING_DELAY, currentReadingStart, CONF_JOY_CALIB_READING_NUMBER, performJoystickCalibrationStep, (int*)stepNumber);
+    calibrationTimerId[1] = calibrationTimer.setTimer(CONF_JOY_CALIB_READING_DELAY, currentReadingStart, CONF_JOY_CALIB_READING_NUMBER, performJoystickCalibrationStep, (int*)(stepNumber | (calibFromApi ? CONF_CALIB_API_FLAG : 0)));
     ++stepNumber;
     // Set LED's feedback to show step is already started and get the max reading for the quadrant/step
 
-    calibrationTimerId[0] = calibrationTimer.setTimeout(nextStepStart, performJoystickCalibration, (int*)stepNumber);  // Start next step
+    calibrationTimerId[0] = calibrationTimer.setTimeout(nextStepStart, performJoystickCalibration, (int*)(stepNumber | (calibFromApi ? CONF_CALIB_API_FLAG : 0)));  // Start next step
   } else if (stepNumber == 5) {                                                                                        // STEP 5 : Joystick center point initialization
     screen.fullCalibrationPrompt(stepNumber);
     buzzer.calibCenterTone();
     setJoystickInitialization(false, false);
     ++stepNumber;
-    calibrationTimerId[0] = calibrationTimer.setTimeout(nextStepStart, performJoystickCalibration, (int*)stepNumber);  // Start next step
+    calibrationTimerId[0] = calibrationTimer.setTimeout(nextStepStart, performJoystickCalibration, (int*)(stepNumber | (calibFromApi ? CONF_CALIB_API_FLAG : 0)));  // Start next step
   }
 
   else  // STEP 6: Calibration ended
@@ -2491,7 +2498,11 @@ void performJoystickCalibration(int* args) {
 // Return     : void
 //****************************************//
 void performJoystickCalibrationStep(int* args) {
-  int stepNumber = (int)args;
+  // See performJoystickCalibration(): the payload carries this chain's
+  // initiator alongside the step number — the corner line is an ack (SUCCESS)
+  // only when the serial API started the calibration, MANUAL otherwise.
+  bool calibFromApi = ((int)args & CONF_CALIB_API_FLAG) != 0;
+  int stepNumber = (int)args & ~CONF_CALIB_API_FLAG;
   String stepKey = "CA" + String(stepNumber);       // Key to write new calibration point to Flash memory
   String stepCommand = "CA," + String(stepNumber);  // Command to output calibration point via serial
   pointFloatType maxPoint;
@@ -2540,7 +2551,7 @@ void performJoystickCalibrationStep(int* args) {
     bool cornerStored = mem.writePoint(CONF_SETTINGS_FILE, stepKey, maxPoint);
     setLedState(LED_ACTION_OFF, LED_CLR_NONE, CONF_JOY_CALIB_LED_NUMBER, 0, 0, led.getLedBrightness());
     performLedAction(ledCurrentState);
-    printResponseFloatPoint(true, true, cornerStored, cornerStored ? 0 : 3, stepCommand, true, maxPoint);
+    printResponseFloatPoint(true, calibFromApi, cornerStored, cornerStored ? 0 : 3, stepCommand, true, maxPoint);
     if (g_calibrationError) {
       screen.fullCalibrationPrompt(CONF_JOY_CALIB_ERROR);
       delay(3000);  // TODO 2025-Feb-02 Why the delay?

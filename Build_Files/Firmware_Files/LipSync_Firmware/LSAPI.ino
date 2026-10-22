@@ -550,7 +550,12 @@ void getDeviceID(bool responseEnabled, bool apiEnabled) {
   }
   g_deviceUID = deviceID; // Update global variable
   
-  printResponseString(responseEnabled, apiEnabled, true, 0, "ID,0", true, tempDeviceID);
+  // Answer the ID now in force (the chip's real UID): on a fresh settings
+  // file the stored value is the compiled placeholder, and answering it made
+  // the FIRST read after a factory reset (or any board swap) report a value
+  // the device had already replaced in memory — the truth only arrived on
+  // the second read.
+  printResponseString(responseEnabled, apiEnabled, true, 0, "ID,0", true, deviceID);
 
 }
 //***GET DEVICE ID API FUNCTION***//
@@ -1015,6 +1020,15 @@ void setJoystickInitialization(bool responseEnabled, bool apiEnabled) {
   int stepPayload = apiEnabled ? CONF_CENTER_INIT_API_FLAG : 0;
   canOutputAction = false;
   calibrationTimerId[0] = calibrationTimer.setTimeout(CONF_JOY_INIT_START_DELAY, performJoystickCenter, (int *)stepPayload);
+  if (calibrationTimerId[0] < 0) {
+    // Registration refused (a loud, counted LSTimer failure): the flow never
+    // starts — without this guard the completion that would have restored
+    // canOutputAction never fires and the cursor output stays dead. Answer
+    // FAIL,3 so the host's IN,1 waiter resolves honestly instead of timing
+    // out on a center that will never run.
+    canOutputAction = true;
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "IN,1", true, 1);
+  }
 }
 //***SET JOYSTICK INITIALIZATION API FUNCTION***//
 // Function   : setJoystickInitialization
@@ -1092,14 +1106,28 @@ void getJoystickCalibration(bool responseEnabled, bool apiEnabled, String option
 //*********************************//
 void setJoystickCalibration(bool responseEnabled, bool apiEnabled) {
   js.clear();                                                                                           // Clear previous calibration values
-  int stepNumber = 0;
+  // The initiator rides the chain's payload (CONF_CALIB_API_FLAG): the
+  // per-corner lines print SUCCESS only for a host-requested calibration
+  // (CA,1:1) and MANUAL for a Hub-menu one — the 4.5.2 initiator contract.
+  int stepPayload = apiEnabled ? CONF_CALIB_API_FLAG : 0;
   canOutputAction = false;
   // #36: apiEnabled is true only on the serial-dispatch path — a calibration
   // the app started must not end by parking the Hub's menu on screen. The
   // menu-driven path (fullCalibrationPage) passes false and keeps the
   // return-to-menu behavior the device user expects.
   screen.calibrationEndsByClosingMenu(apiEnabled);
-  calibrationTimerId[0] = calibrationTimer.setTimeout(CONF_JOY_CALIB_START_DELAY, performJoystickCalibration, (int *)stepNumber);  // Start the process
+  calibrationTimerId[0] = calibrationTimer.setTimeout(CONF_JOY_CALIB_START_DELAY, performJoystickCalibration, (int *)stepPayload);  // Start the process
+  if (calibrationTimerId[0] < 0) {
+    // Registration refused (a loud, counted LSTimer failure): the flow never
+    // starts, so restore the state a completed calibration would have —
+    // otherwise the output stays dead and the menu-close flag stays armed
+    // for an unrelated later transition. Answer FAIL,3 so the host's CA,1
+    // waiter resolves honestly instead of timing out on a calibration that
+    // will never run.
+    canOutputAction = true;
+    screen.calibrationEndsByClosingMenu(false);
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "CA,1", true, 1);
+  }
 }
 //***SET JOYSTICK CALIBRATION API FUNCTION***//
 // Function   : setJoystickCalibration
@@ -1896,21 +1924,24 @@ void setCommunicationMode(bool responseEnabled, bool apiEnabled, int inputCommun
       setCommunicationModeLed(g_comMode);
       setLedDefault();
       printResponseInt(responseEnabled, apiEnabled, true, 0, "CM,1", true, inputCommunicationMode);
+
+      // The interface hand-off runs ONLY on the success path: a refused or
+      // rejected write leaves g_comMode unchanged, and re-beginning the
+      // current interface for a command the device just refused can block
+      // the serial handler for the full mount wait when the host is away.
+      releaseOutputAction();
+      switch(g_comMode) {
+        case CONF_COM_MODE_USB:       // USB Mouse
+          btmouse.end();
+          usbmouse.begin();
+          break;
+        case CONF_COM_MODE_BLE:       // Bluetooth Mouse
+          usbmouse.end();
+          btmouse.begin();
+          break;
+      }
     } else {
       printResponseInt(responseEnabled, apiEnabled, false, 3, "CM,1", true, inputCommunicationMode);
-    }
-
-    // TODO: move this?
-    releaseOutputAction();
-    switch(g_comMode) {
-      case CONF_COM_MODE_USB:       // USB Mouse
-        btmouse.end();
-        usbmouse.begin();    
-        break;
-      case CONF_COM_MODE_BLE:       // Bluetooth Mouse
-        usbmouse.end();
-        btmouse.begin();
-        break;
     }
 
   }
@@ -2717,6 +2748,15 @@ String getSwitchAction(bool responseEnabled, bool apiEnabled, String commandKey)
       cells[0] = packed / 10000;
       cells[1] = (packed / 100) % 100;
       cells[2] = packed % 100;
+      // Defense-in-depth for the caregiver allowlist (the write path already
+      // enforces it): a stored value can only come from a hand-edited or
+      // foreign settings file, but the whole point of the allowlist is that
+      // one switch press can never erase settings or restart the device —
+      // so a stored triple that fails it falls back to the compiled
+      // factory mapping instead of loading the forbidden cells.
+      if (!switchRemapAllowed(cells[0]) || !switchRemapAllowed(cells[1]) || !switchRemapAllowed(cells[2])) {
+        for (int w = 0; w < CONF_SWITCH_REMAP_ROWS_PER_JACK; w++) cells[w] = switchRemapDefaultCell(jack, w, gamepad);
+      }
     } else {
       for (int w = 0; w < CONF_SWITCH_REMAP_ROWS_PER_JACK; w++) cells[w] = switchRemapDefaultCell(jack, w, gamepad);
     }

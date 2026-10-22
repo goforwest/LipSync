@@ -30,7 +30,7 @@
 
 #define CONF_LIPSYNC_VERSION_MAJOR  4
 #define CONF_LIPSYNC_VERSION_MINOR  5
-#define CONF_LIPSYNC_VERSION_REV    4
+#define CONF_LIPSYNC_VERSION_REV    5
 
 const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + "." + String(CONF_LIPSYNC_VERSION_MINOR) + "." + String(CONF_LIPSYNC_VERSION_REV);
 
@@ -243,7 +243,10 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 #define CONF_SPLASH_SCREEN_DURATION 10000   // 10 seconds - how long the splash screen stays on on startup
 #define CONF_SAFEMODE_MENU_TIMEOUT 3000 // 3 seconds between screens
 #define CONF_MENU_TIMEOUT  300000           // 300 seconds (5 minutes) - duration of inactivity after which the screen turns off 
-#define CONF_MENU_CONTROL_MIN 0
+// 0 is NOT a control: controlHubMenu's switch has no case for it, and a
+// value with no action must answer FAIL,3 — not a SUCCESS that did nothing
+// (the app's remote only ever sends 1-4).
+#define CONF_MENU_CONTROL_MIN 1
 #define CONF_MENU_CONTROL_OPEN 1
 #define CONF_MENU_CONTROL_SELECT 2
 #define CONF_MENU_CONTROL_NEXT 3
@@ -413,6 +416,16 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 // whichever-fires-first consumes. Step numbers stay in the low 7 bits
 // (the flow only ever uses 0 and 1).
 #define CONF_CENTER_INIT_API_FLAG 0x80
+
+// Full-calibration flow initiator flag (the 4.5.2 initiator contract's
+// calibration half): the calibration chain's timer payload carries the step
+// number in the low bits and this bit when the HOST started the calibration
+// over the serial API (CA,1:1). The per-corner lines print SUCCESS only for
+// a host-initiated run; a Hub-menu-initiated run prints MANUAL,0:CA,n with
+// the same data — an unsolicited SUCCESS on the wire can falsely resolve a
+// pending command waiter, exactly the straggler class 4.5.2 fixed for the
+// center flow. Steps stay in the low 7 bits (the flow only ever uses 0-6).
+#define CONF_CALIB_API_FLAG 0x80
 
 // Joystick cursor speed change and related LED feedback settings 
 #define CONF_JOY_CURSOR_SPEED_LEVEL_DEFAULT 5  // Default cursor speed level

@@ -191,7 +191,7 @@ private:
   Adafruit_SSD1306 _display = Adafruit_SSD1306(CONF_SCREEN_WIDTH, CONF_SCREEN_HEIGHT, &Wire, OLED_RESET);
 
   LSTimer<void> _screenStateTimer;  // Timer with a callback function
-  int _screenStateTimerId;          // Timer ID for screen
+  int _screenStateTimerId = -1;     // Timer ID for screen (-1 = none pending; read by the USB-error-page splash-clear cancel)
   int _screenTimeoutTimerId;        // Timer ID to trigger next screen based on time
   unsigned long _inputFrozenUntil = 0;  // While millis() is before this, menu input is frozen (a scheduled page transition owns the menu)
   int _transitionTimerId = -1;           // Pending scheduled page transition (LSTimer id), -1 = none
@@ -578,6 +578,16 @@ void LSScreen::drawUsbErrorPageOnce() {
   }
   if (!Wire.busHealthy()) return;  // Bus is held — a draw would only feed the timeout tax; retried on the next connection check
   if (!_isActive) {
+    // Cancel the ready page's pending 10 s self-clear: it was armed by the
+    // splash this episode interrupted, and if it fires while the No-USB page
+    // is on the OLED it wipes it — and the once-per-episode latch this
+    // function sets would then keep the page from ever redrawing (a blank
+    // screen for the rest of the outage, bench-audit finding). The error
+    // page owns the display until the episode clears.
+    if (_screenStateTimerId >= 0) {
+      _screenStateTimer.deleteTimer(_screenStateTimerId);
+      _screenStateTimerId = -1;
+    }
     noUsbPage();
     _usbErrorPagePainted = true;
   }
@@ -788,6 +798,7 @@ void LSScreen::splashScreen2() {
 //*********************************//
 void LSScreen::nextMenuItem() {
   if ((long)(millis() - _inputFrozenUntil) < 0) return;  // A scheduled page transition owns the menu right now
+  if (_currentMenuText == nullptr) return;  // No menu page is registered yet (the safe-mode/error boot pages set _isActive before safeModeMenu registers state)
 
   _lastActivityMillis = millis();
 
@@ -826,6 +837,7 @@ void LSScreen::nextMenuItem() {
 //*********************************//
 void LSScreen::selectMenuItem() {
   if ((long)(millis() - _inputFrozenUntil) < 0) return;  // A scheduled page transition owns the menu right now
+  if (_currentMenuText == nullptr) return;  // No menu page is registered yet (the safe-mode/error boot pages set _isActive before safeModeMenu registers state)
 
   _lastActivityMillis = millis();
 
@@ -2217,8 +2229,9 @@ void LSScreen::factoryResetConfirm2Page(void) {
 // Description: Reports the live menu state for the CH,0:0 menu-sync
 //              endpoint: menu active flag, current page id (the
 //              MAIN_MENU/…/TIMING_ADJUST_MENU defines), and the current
-//              row selection (raw index into the page's text array — the
-//              app applies the page's _cursorStart offset). Read-only, so
+//              row selection — the SELECTABLE-row index (the same index
+//              selectMenuItem() switches on; add the page's _cursorStart
+//              offset for the text-array row). Read-only, so
 //              it is safe mid-transition: during a scheduled page's frozen
 //              window the values still name what the Hub is showing.
 //
@@ -2261,6 +2274,8 @@ void LSScreen::fillMenuState(int out[3]) {
 // Return     : void
 //*********************************//
 void LSScreen::reportMenuState() {
+  if (_currentMenuText == nullptr) return;  // No menu page registered yet (safe-mode/error boot dwell): the boot pages are not menu truth, and pushing their (1, MAIN_MENU, 0) triple would tell the app a menu that does not exist yet
+
   int menuState[3];
   fillMenuState(menuState);
   if (menuState[0] == _lastReportedMenuState[0] &&
@@ -2441,6 +2456,9 @@ void LSScreen::updateModePage(void) {
 void LSScreen::hardwareErrorPage() {
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::hardwareErrorPage()"); }
   
+  // See safeModePage(): drop menu presses while this informational page
+  // owns the display and no menu state is registered yet.
+  _inputFrozenUntil = millis() + CONF_SAFEMODE_MENU_TIMEOUT;
   setupDisplay();
 
   _display.println("ERROR:");
@@ -2489,6 +2507,8 @@ void LSScreen::hardwareErrorPage() {
 void LSScreen::errorPageI2C() {
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::errorPageI2C()"); }
 
+  // See safeModePage(): drop menu presses for this page's dwell.
+  _inputFrozenUntil = millis() + CONF_SAFEMODE_MENU_TIMEOUT;
   setupDisplay();
   _display.println("ERROR: ");
   _display.println("Sensor not");
@@ -2514,6 +2534,8 @@ void LSScreen::errorPageCable() {
   // Joystick sensor, ambient pressure sensor and mouthpiece pressure sensor not detected
   // Likely a cable issue
 
+  // See safeModePage(): drop menu presses for this page's dwell (2x the base).
+  _inputFrozenUntil = millis() + 2 * CONF_SAFEMODE_MENU_TIMEOUT;
   setupDisplay();
 
   _display.println("ERROR: ");
@@ -2639,6 +2661,12 @@ void LSScreen::safeModePage(int safeModeReason) {
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::safeModePage()"); }
 
   _isActive = true;
+  // Freeze menu input for the dwell (the safe-mode menu registers on the
+  // continuation): the 4.2.0 non-blocking conversion made this window live
+  // to the input poll and the serial API, and a Next/Select arriving before
+  // safeModeMenu() registers state hit a null menu — the frozen window drops
+  // those presses exactly as the old blocking pages did.
+  _inputFrozenUntil = millis() + CONF_SAFEMODE_MENU_TIMEOUT;
   setupDisplay();
 
   _display.println("SAFE MODE: ");
