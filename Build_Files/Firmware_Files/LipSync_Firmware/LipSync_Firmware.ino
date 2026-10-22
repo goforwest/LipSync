@@ -61,7 +61,6 @@ int  g_safeModeReason = 0;
 bool readyToUseFirstTime = true;
 
 bool g_btIsConnected = false;   // Bluetooth connection state
-bool g_usbIsConnected = false;  // USB Connection state
 
 bool g_displayConnected = false;                   // Display connection state
 bool g_joystickSensorConnected = false;            // Joystick sensor connection state
@@ -132,21 +131,6 @@ bool canOutputAction = true;
 bool g_startupCenterReset = true;
 bool g_resetCenterComplete = false;  // global variable for center reset status
 bool g_calibrationError = false;     // Global variable for error in full calibration
-// Who initiated the in-flight joystick center-reset (4.5.2, wire hygiene):
-// the center flow always ends by printing an IN,1 line, but only a center
-// the HOST requested over the serial API (IN,1:1) is an ack — a
-// device-initiated center (the boot-time auto-center in initJoystick, the
-// Hub menu's Center Reset row, the full calibration's internal step 5)
-// must print MANUAL, not SUCCESS. The old hardcoded SUCCESS let the boot
-// auto-center land an UNSOLICITED SUCCESS mid-settings-load (bench
-// 2026-10-18: a stray SUCCESS,0:IN,1:1.23|-1.55 between the VN request
-// and its response), and on the host side an unsolicited SUCCESS is worse
-// than noise: command waiters match on SUCCESS — a boot straggler could
-// falsely resolve a pending IN,1:1 with the boot center's value. MANUAL
-// carries the same data, renders identically in the app, and no waiter
-// will ever match it. Set by setJoystickInitialization from its own
-// (responseEnabled, apiEnabled) pair; consumed once by the completion.
-bool g_centerInitFromApi = false;
 
 bool settingsEnabled = false;  // Serial input settings command mode enabled or disabled
 
@@ -482,7 +466,6 @@ void initGlobals() {
   g_ambientPressureSensorConnected = false;
   g_joystickSensorConnected = false;
   g_displayConnected = false;
-  g_usbIsConnected = false;
   g_btIsConnected = false;
   g_errorCode = 0;
   g_debugMode = 0;
@@ -1121,26 +1104,13 @@ void initCommunicationMode() {
 // Return     : void
 //****************************************//
 void usbConnectionLoop() {
-  //if (USB_DEBUG) { Serial.println("USBDEBUG: usbConnectionLoop()"); }
-  
-  // Check if USB is connected
-  if (g_comMode == CONF_COM_MODE_USB) {
-    if (g_operatingMode == CONF_OPERATING_MODE_MOUSE) {
-      g_usbIsConnected = usbmouse.isConnected();
-    }
-    else if (g_operatingMode == CONF_OPERATING_MODE_GAMEPAD) {
-      g_usbIsConnected = gamepad.isConnected();
-    }
-    else { // Bluetooth mouse mode
-      g_usbIsConnected = false;
-    }
-  }
-
-  /*  // TODO 2025-Feb-21 Integrate USB connection check
-  if (g_comMode == CONF_COM_MODE_USB) {
-    usbConnectTimerId[0] = usbConnectTimer.setTimeout(g_usbConnectDelay, usbCheckConnection);  // Call usbCheckConnection function when g_usbConnectDelay reached
-  }
-  */
+  // Parked since 2025-Feb-21 (upstream TODO: "Disable usbConnectionLoop
+  // until implemented"): the USB connection state it computed had no
+  // consumer — errorCheck/usbCheckConnection read usbmouse.isReady()
+  // directly — and the write-only global it fed is gone. The registration
+  // below stays: the boot pool's nine registrations (including this one)
+  // are what the app-repo lstimer-test harness models, and the slot stays
+  // reserved for the feature. Disabled at boot; never runs.
 }
 
 
@@ -2348,7 +2318,20 @@ void initJoystick() {
 // Return     : void
 //****************************************//
 void performJoystickCenter(int* args) {
-  int stepNumber = (int)args;
+  // The timer payload carries this chain's initiator alongside the step
+  // number (CONF_CENTER_INIT_API_FLAG, 4.5.4): SUCCESS only for a center
+  // the HOST requested over the serial API (IN,1:1); MANUAL for every
+  // device-initiated center (the boot auto-center, the Hub-menu Center
+  // Reset, the calibration's internal step 5) — an unsolicited SUCCESS on
+  // the wire is a lie a command waiter can false-match (the bench caught a
+  // boot straggler landing between the VN request and its response); MANUAL
+  // carries the same data and matches no waiter. Riding the payload
+  // instead of the 4.5.2 global means each in-flight chain owns its own
+  // initiator: two overlapping centers (an app IN,1:1 racing the boot
+  // auto-center) each ack with their own correct prefix instead of sharing
+  // one flag that whichever-fires-first consumes.
+  bool centerInitFromApi = ((int)args & CONF_CENTER_INIT_API_FLAG) != 0;
+  int stepNumber = (int)args & ~CONF_CENTER_INIT_API_FLAG;
   if (USB_DEBUG) { Serial.print("USBDEBUG: performJoystickCenter("); Serial.print(stepNumber); Serial.println(")"); }
 
   g_resetCenterComplete = false;  // Reset the global flag
@@ -2372,26 +2355,25 @@ void performJoystickCenter(int* args) {
       setLedState(LED_ACTION_BLINK, CONF_JOY_INIT_STEP_BLINK_COLOR, CONF_JOY_INIT_LED_NUMBER, CONF_JOY_INIT_STEP_BLINK, CONF_JOY_INIT_STEP_BLINK_DELAY, led.getLedBrightness());
       performLedAction(ledCurrentState);  // LED Feedback to show start of performJoystickCalibrationStep
     }
-    // Start timer to get 5 reading every 100 ms
-    calibrationTimerId[1] = calibrationTimer.setTimer(CONF_JOY_INIT_READING_DELAY, currentReadingStart, CONF_JOY_INIT_READING_NUMBER, performJoystickCenterStep, (int*)stepNumber);
-    ++stepNumber;
+    // Start timer to get 5 reading every 100 ms
+    calibrationTimerId[1] = calibrationTimer.setTimer(CONF_JOY_INIT_READING_DELAY, currentReadingStart, CONF_JOY_INIT_READING_NUMBER, performJoystickCenterStep, (int*)args);
+    // Carry the initiator into the completion step
+    int payload = (stepNumber + 1) | (centerInitFromApi ? CONF_CENTER_INIT_API_FLAG : 0);
     // Start exit step
-    calibrationTimerId[0] = calibrationTimer.setTimeout(nextStepStart, performJoystickCenter, (int*)stepNumber);
+    calibrationTimerId[0] = calibrationTimer.setTimeout(nextStepStart, performJoystickCenter, (int*)payload);
   } else {
     js.evaluateInputCenter();           // Evaluate the center point using values in the buffer
     js.setMinimumRadius();              // Update minimum radius of operation
     centerPoint = js.getInputCenter();  // Get the new center for API output
-    // apiEnabled follows the initiator (g_centerInitFromApi, 4.5.2 wire
-    // hygiene): SUCCESS only for a host-requested IN,1:1; MANUAL for every
-    // device-initiated center (the boot auto-center, the Hub-menu Center
-    // Reset, the calibration's internal step 5) — an unsolicited SUCCESS on
-    // the wire is a lie a command waiter can false-match (the bench caught
-    // a boot straggler landing between the VN request and its response);
-    // MANUAL carries the same data and matches no waiter. The response is
-    // always printed: hosts consume it either way to refresh the neutral.
-    printResponseFloatPoint(true, g_centerInitFromApi, true, 0, "IN,1", true, centerPoint);
-    g_centerInitFromApi = false;  // One-shot: the initiator is consumed by the print
-    calibrationTimer.deleteTimer(0);  // Delete timer
+    printResponseFloatPoint(true, centerInitFromApi, true, 0, "IN,1", true, centerPoint);
+    // No deleteTimer here (4.5.4): the fired RUN_ONCE timeout already
+    // deleted itself, and the old blind deleteTimer(0) could kill a LIVE
+    // timer — slot 0 is the lowest free slot handed to the next
+    // registration, which in an overlapping-centers race is exactly the
+    // OTHER flow's pending timeout (a host IN,1:1 arriving during the
+    // boot auto-center's reading phase took slot 0 and was silently
+    // eaten). Overlapping chains now both complete, each with their own
+    // correct ack.
     setLedDefault();                  // Set default led feedback
     canOutputAction = true;
     g_resetCenterComplete = true;
@@ -2879,7 +2861,15 @@ void checkI2C() {
     Serial.println("ERROR: Joystick Sensor: Not found");
     g_joystickSensorConnected = false;
   }
-  Wire.end();
+  // No Wire.end() here (4.5.4): this used to disable the TWIM peripheral
+  // behind it — scanner-example residue with no consumer — and the bus only
+  // worked afterwards because the display's and the pressure sensors'
+  // begin()s happen to call Wire.begin() as a side effect. The XENSIV
+  // migration deliberately stopped the joystick library from re-beginning
+  // the shared bus (executeInit=false), which left the joystick-only
+  // degraded boot reading against a dead controller until the vendored
+  // Wire's bounded recovery re-enabled it. One owner instead: the bus comes
+  // up at the Wire.begin() above and stays up for every consumer.
 }
 
 

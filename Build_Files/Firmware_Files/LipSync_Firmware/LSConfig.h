@@ -403,6 +403,17 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 #define CONF_JOY_INIT_READING_DELAY 100
 #define CONF_JOY_INIT_READING_NUMBER 5
 
+// Center-reset flow initiator flag (4.5.4, per-flow ack correctness): the
+// center flow's timer payload carries the step number in the low bits and
+// this flag bit when the HOST requested the center over the serial API
+// (IN,1:1). The completion prints SUCCESS only when ITS OWN chain carries
+// the flag — MANUAL otherwise — so two overlapping centers (an app
+// IN,1:1 racing the boot auto-center or the Hub menu's Center Reset) each
+// ack with their own correct prefix instead of sharing one global that
+// whichever-fires-first consumes. Step numbers stay in the low 7 bits
+// (the flow only ever uses 0 and 1).
+#define CONF_CENTER_INIT_API_FLAG 0x80
+
 // Joystick cursor speed change and related LED feedback settings 
 #define CONF_JOY_CURSOR_SPEED_LEVEL_DEFAULT 5  // Default cursor speed level
 #define CONF_JOY_SPEED_CHANGE_LED_DELAY 150

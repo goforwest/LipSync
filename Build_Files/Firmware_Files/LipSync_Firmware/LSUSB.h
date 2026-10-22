@@ -92,34 +92,15 @@ class LSUSBMouse {
     Adafruit_USBD_HID usb_hid;
 };
 
-typedef struct
-{
-  uint8_t modifiers;
-  uint8_t reserved;
-  uint8_t keys[6];
-} KeyReport;
-
-
-class LSUSBKeyboard : public Print
-{
-	private:
-		KeyReport _keyReport;
-		void keyboardReport(KeyReport* keys);
-    uint8_t const _ascii2keycode[128][2] = {HID_ASCII_TO_KEYCODE};
-	public:
-		inline LSUSBKeyboard(void);
-		inline void begin(void);
-		inline void end(void);
-		inline void wakeup(void);
-		inline size_t write(uint8_t k);
-		inline size_t write(const uint8_t *buffer, size_t size);
-		inline size_t press(uint8_t m, uint8_t k);
-		inline size_t release(uint8_t m, uint8_t k);
-		inline void releaseAll(void);
-		inline bool isReady(void);
-  protected:
-    Adafruit_USBD_HID usb_hid;
-};
+// LSUSBKeyboard removed (4.5.4 dead-code cleanup): the class was never
+// instantiated anywhere in the sketch — a v4.0-era leftover whose
+// keyboardReport() still carried an unbounded while(!isReady()) delay(1)
+// spin, the exact bug class the 4.4.0+ HID rework eradicated from every
+// live path. Unreachable code cannot hang, but it also must not sit in
+// the file as a copy-paste invitation. RID_KEYBOARD and the keyboard
+// report descriptor in mouse_desc_hid_report[] stay: they define the
+// composite device's report IDs on the wire and the descriptor must
+// remain byte-identical for hosts.
 
 typedef struct ATTRIBUTE_PACKED {
     uint8_t buttons;
@@ -390,133 +371,6 @@ bool LSUSBMouse::isReady(void)
 	  return true;
 	return false;
 }
-
-/*****************************
- *   KEYBOARD SECTION
- *****************************/ 
-
-LSUSBKeyboard::LSUSBKeyboard(void) 
-{
-}
-
-void LSUSBKeyboard::begin(void)
-{
-	usb_hid.setPollInterval(2);
-	usb_hid.setReportDescriptor(mouse_desc_hid_report, sizeof(mouse_desc_hid_report));
-	usb_hid.begin();
-	while( !USBDevice.mounted() ) delay(1);
-}
-
-void LSUSBKeyboard::end(void)
-{
-}
-
-void LSUSBKeyboard::keyboardReport(KeyReport* keys)
-{
-	wakeup();
-	while(!isReady()) delay(1);
-	usb_hid.keyboardReport(RID_KEYBOARD,keys->modifiers,keys->keys);
-	delay(2);
-}
-
-void LSUSBKeyboard::wakeup(void)
-{
-	if ( USBDevice.suspended() )  {
-      USBDevice.remoteWakeup();
-    }
-}
-
-size_t LSUSBKeyboard::press(uint8_t m, uint8_t k) 
-{
-	uint8_t i;
-	_keyReport.modifiers = m;
-
-	// Add key if the it's not already present and if there is an empty spot.
-	if (_keyReport.keys[0] != k && _keyReport.keys[1] != k && 
-	  _keyReport.keys[2] != k && _keyReport.keys[3] != k &&
-	  _keyReport.keys[4] != k && _keyReport.keys[5] != k) {
-	  
-	  for (i=0; i<6; i++) {
-		if (_keyReport.keys[i] == 0x00) {
-		  _keyReport.keys[i] = k;
-		  break;
-		}
-	  }
-	  if (i == 6) {
-		setWriteError();
-		return 0;
-	  } 
-	}
-	keyboardReport(&_keyReport);
-	return 1;
-}
-
-
-size_t LSUSBKeyboard::release(uint8_t m, uint8_t k) 
-{
-	uint8_t i;
-	_keyReport.modifiers = 0x00;
-	// Check to see if the key is present and clear it if it exists.
-	for (i=0; i<6; i++) {
-	  if (0 != k && _keyReport.keys[i] == k) {
-		_keyReport.keys[i] = 0x00;
-	  }
-	}
-	keyboardReport(&_keyReport);
-	return 1;
-}
-
-void LSUSBKeyboard::releaseAll(void)
-{
-	_keyReport.keys[0] = 0;
-	_keyReport.keys[1] = 0; 
-	_keyReport.keys[2] = 0;
-	_keyReport.keys[3] = 0; 
-	_keyReport.keys[4] = 0;
-	_keyReport.keys[5] = 0; 
-	_keyReport.modifiers = 0;
-	keyboardReport(&_keyReport);
-}
-  
-size_t LSUSBKeyboard::write(uint8_t c)
-{
-  uint8_t keycode = 0;
-  uint8_t modifier = 0;
-  uint8_t uch = (uint8_t)c;
-  
-  if (_ascii2keycode[c][0]) {
-    modifier = KEYBOARD_MODIFIER_LEFTSHIFT;
-  }
-  
-  keycode = _ascii2keycode[uch][1];
-  
-	uint8_t p = press(modifier, keycode);  // Keydown
-	release(modifier, keycode);            // Keyup
-	return p;              // Return the result of press() 
-}
-
-size_t LSUSBKeyboard::write(const uint8_t *buffer, size_t size) {
-	size_t n = 0;
-	while (size--) {
-	  if (*buffer != '\r') {
-		if (write(*buffer)) {
-		  n++;
-		} else {
-		  break;
-		}
-	  }
-	  buffer++;
-	}
-	return n;
-}
-
-bool LSUSBKeyboard::isReady(void)
-{
-	if (usb_hid.ready()) 
-	  return true;
-	return false;
-}
-
 
 /*****************************
  *   GAMEPAD SECTION

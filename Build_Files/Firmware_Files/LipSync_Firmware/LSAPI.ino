@@ -1009,11 +1009,12 @@ void setJoystickInitialization(bool responseEnabled, bool apiEnabled) {
   // a device-initiated center (boot auto-center, Hub-menu Center Reset,
   // the calibration's internal step 5) prints MANUAL instead, so a boot
   // straggler can never falsely resolve a host's pending IN,1:1 waiter.
-  // See g_centerInitFromApi in LipSync_Firmware.ino for the full evidence.
-  g_centerInitFromApi = apiEnabled;
-  int stepNumber = 0;
+  // 4.5.4: the initiator rides the flow's own timer payload
+  // (CONF_CENTER_INIT_API_FLAG) instead of a shared global, so overlapping
+  // centers each carry their own initiator through their own chain.
+  int stepPayload = apiEnabled ? CONF_CENTER_INIT_API_FLAG : 0;
   canOutputAction = false;
-  calibrationTimerId[0] = calibrationTimer.setTimeout(CONF_JOY_INIT_START_DELAY, performJoystickCenter, (int *)stepNumber);
+  calibrationTimerId[0] = calibrationTimer.setTimeout(CONF_JOY_INIT_START_DELAY, performJoystickCenter, (int *)stepPayload);
 }
 //***SET JOYSTICK INITIALIZATION API FUNCTION***//
 // Function   : setJoystickInitialization
