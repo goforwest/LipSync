@@ -28,6 +28,12 @@
 //      setTimeout<Obj, &Obj::m1/m2> scheduled together both fire their OWN
 //      method (the old single-static-per-class bug ran whichever fired
 //      first's method for both).
+//   9. A fired RUN_ONCE timeout's id names a FREED slot that the pool hands
+//      to the NEXT registration — deleting through a stale id kills the new
+//      occupant (the LSScreen::_screenStateTimerId hazard the 4.5.5 audit
+//      follow-up closed by resetting the id in every continuation). The
+//      discipline, not the pool, is what a caller must hold: this test pins
+//      both halves so neither silently regresses.
 //
 // Build & run (matches the app repo's dev/firmware harness discipline):
 //   c++ -std=c++17 -g -fsanitize=address,undefined -I../LipSync_Firmware \
@@ -277,6 +283,49 @@ static void test_parameterized_callbacks_receive_their_payload() {
   CHECK_EQ(s_argLast, (1 | 0x80));
 }
 
+// The stale-id hazard class (4.5.5 audit follow-up, the LSScreen fix):
+// a fired RUN_ONCE timeout frees its slot and the pool recycles it, so an
+// id that is not reset when its timer fires can later delete an unrelated
+// LIVE registration. Models the exact screen pattern: a splash-clear fires
+// (its continuation must clear the id), a scheduled transition takes the
+// recycled slot, and an error-page cancel reads the id.
+static int s_clearFires = 0;
+static int s_transitionFires = 0;
+static void clearFiredCb() { s_clearFires++; }                 // the "old" splash clear: forgot the id
+static void transitionCb() { s_transitionFires++; }             // the live occupant of the recycled slot
+
+static void test_stale_id_after_fire_can_kill_recycled_slot_reset_avoids_it() {
+  resetCounters();
+  s_clearFires = 0;
+  s_transitionFires = 0;
+  LSTimer<void> pool;
+
+  // HAZARD HALF: the caller keeps the id after the timer fires.
+  int staleId = pool.setTimeout(100, clearFiredCb);
+  CHECK(staleId >= 0);
+  pump(pool, 100);
+  CHECK_EQ(s_clearFires, 1);          // fired; RUN_ONCE freed its slot
+  int liveId = pool.setTimeout(500, transitionCb);
+  CHECK(liveId == staleId);           // the pool recycles the lowest free slot — the trap is armed
+  CHECK_EQ(pool.deleteTimer(staleId), 0);  // a cancel through the stale id…
+  pump(pool, 500);
+  CHECK_EQ(s_transitionFires, 0);     // …killed the LIVE registration (the defect, demonstrated)
+
+  // DISCIPLINE HALF: the caller that resets the id at fire cannot hit it.
+  int honestId = pool.setTimeout(100, clearFiredCb);  // the fixed pattern: the
+  pump(pool, 100);                     // continuation resets the id (simulated
+  int honestIdReset = -1;              // here because the reset lives in the
+  (void)honestId;                      // application's callback, not the pool)
+  int liveId2 = pool.setTimeout(500, transitionCb);
+  CHECK(liveId2 == staleId);          // recycled again
+  if (honestIdReset >= 0) {            // the fixed continuation leaves nothing to read
+    pool.deleteTimer(honestIdReset);
+  }
+  pump(pool, 500);
+  CHECK_EQ(s_transitionFires, 1);     // the live registration survived the cancel
+  CHECK_EQ(s_clearFires, 2);
+}
+
 int main() {
   test_zero_delay_interval_never_fires_immediately();
   test_nonzero_start_delay_offsets_only_the_first_fire();
@@ -287,6 +336,7 @@ int main() {
   test_registration_refusal_is_loud_and_consistent();
   test_pending_method_timers_cannot_collide();
   test_parameterized_callbacks_receive_their_payload();
+  test_stale_id_after_fire_can_kill_recycled_slot_reset_avoids_it();
 
   std::printf("%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;

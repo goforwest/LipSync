@@ -270,7 +270,8 @@ void switchRemapApplyCell(int jack, int window, bool gamepad, int actionNumber);
 int switchRemapDefaultCell(int jack, int window, bool gamepad);
 
 // Screen page-transition continuations passed to LSScreen::scheduleTransition()
-void clearSplashScreen();
+// (the splash clear is LSScreen::finishSplashClear, a member so it can reset
+// _screenStateTimerId when it fires)
 void screenExitTransitionDone();
 void screenScrollTransitionDone();
 void screenChangeModeTransitionDone();

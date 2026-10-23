@@ -2880,8 +2880,12 @@ void controlHubMenu(bool responseEnabled, bool apiEnabled, int inputMenuControl)
         screen.nextMenuItem();
         break;     
       case CONF_MENU_CONTROL_CLOSE:
-        screen.deactivateMenu();
-        break;      
+        // Freeze-aware close (4.5.5 follow-up): a close arriving while a
+        // scheduled transition or boot dwell page owns the display is
+        // dropped — executing it early would flip the menu-active flag off
+        // before the pending continuation registers its menu.
+        screen.closeMenu();
+        break;
     } // end switch
    
     printResponseInt(responseEnabled, apiEnabled, true, 0, "CH,1", true, inputMenuControl);
@@ -2926,9 +2930,9 @@ void controlHubMenu(bool responseEnabled, bool apiEnabled, String optionalParame
 //
 //              The response is three comma-separated ints: active (0/1),
 //              pageId (the LSScreen.h page defines: 0 main, 3 mode, 5 more,
-//              32 mode-locked, 551 calib confirm, …), row (raw index into
-//              the page's text array — the app maps it past the page's
-//              header rows).
+//              32 mode-locked, 551 calib confirm, …), row (the SELECTABLE-row
+//              index — the same index selectMenuItem() switches on; add the
+//              page's _cursorStart offset for the text-array row).
 //
 // Parameters :  responseEnabled : bool : The response for serial printing is enabled if it's set to true.
 //                                        The serial printing is ignored if it's set to false.

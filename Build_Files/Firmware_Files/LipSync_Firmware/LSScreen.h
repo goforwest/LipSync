@@ -114,6 +114,16 @@ public:
   bool isMenuActive();
   void activateMenu();
   void deactivateMenu();
+  // The user-facing menu CLOSE (serial CH,1:4 and the STOP_MENU input
+  // action), frozen-window-aware like activateMenu/nextMenuItem/
+  // selectMenuItem: a close arriving while a scheduled page transition or a
+  // boot dwell page owns the display is dropped — executing it early would
+  // flip _isActive off before the pending continuation registers its menu,
+  // leaving a menu that is drawn and navigable but reported inactive (and
+  // outside the 5-minute timeout). deactivateMenu itself stays unguarded:
+  // the screen's own continuations and the timeout must always be able to
+  // run their state machine.
+  void closeMenu();
 
   // Live menu-state read for the serial menu-sync endpoint (CH,0:0, bench
   // follow-up 2026-10-18): fills [active, currentPageId, currentSelection].
@@ -121,9 +131,8 @@ public:
   // ~2 s locked page) or a press dropped in a scheduled transition's frozen
   // window acked SUCCESS while the real menu went somewhere the client-side
   // model did not predict — device truth is the only cure. Selection is the
-  // RAW row index into the page's text array (the same index
-  // selectMenuItem() switches on), which the app maps past each page's
-  // _cursorStart header rows.
+  // SELECTABLE-row index (the same index selectMenuItem() switches on); add
+  // the page's _cursorStart offset for the text-array row.
   void fillMenuState(int out[3]);
 
   // Two-way Hub remote (firmware side of the CH,5 push, LipSync_Connect's
@@ -205,6 +214,7 @@ private:
                                                  // ACK a probe during momentary releases, and every re-trusted
                                                  // full push that then wedges costs seconds of bounded timeouts)
   void flushDisplay();                   // The single choke point for framebuffer pushes to the I2C bus
+  void finishSplashClear();              // The splash/ready page's scheduled self-clear (see its definition)
 
   bool _isActive = false;
   bool _menuTimeoutEnabled = true;
@@ -243,7 +253,7 @@ private:
   int _testScreenAttempt = 0;
 
   int _currentMenuLength;
-  String *_currentMenuText;
+  String *_currentMenuText = nullptr;  // null until a menu page registers (the boot dwell pages set _isActive first); read by the input/CH,5 guards
   String _selectedText;
 
   float _sipPressThresh;
@@ -461,6 +471,27 @@ void LSScreen::deactivateMenu() {
 }
 
 //*********************************//
+// Function   : closeMenu
+//
+// Description: The user-facing menu close (serial CH,1:4, the STOP_MENU
+//              input action): drops the close while a scheduled page
+//              transition or a boot dwell page owns the display, so a
+//              pending continuation can never register its menu onto an
+//              _isActive the close already turned off (a menu that draws
+//              and navigates but reports inactive, outside the timeout —
+//              the same frozen-window contract activateMenu /
+//              nextMenuItem / selectMenuItem already enforce).
+//
+// Arguments :  void
+//
+// Return     : void
+//*********************************//
+void LSScreen::closeMenu() {
+  if ((long)(millis() - _inputFrozenUntil) < 0) return;  // A scheduled page transition / boot dwell page owns the display right now
+  deactivateMenu();
+}
+
+//*********************************//
 // Function   : scheduleTransition
 //
 // Description: Shows an informational page, then runs `transitionFn` after
@@ -474,7 +505,7 @@ void LSScreen::deactivateMenu() {
 //
 // Arguments :  delayMs : unsigned long : page dwell time in milliseconds
 //              transitionFn : void (*)() : free-function continuation (defined
-//                            in LipSync_Firmware.ino, like clearSplashScreen)
+//                            in LipSync_Firmware.ino)
 //
 // Return     : void
 //*********************************//
@@ -583,7 +614,11 @@ void LSScreen::drawUsbErrorPageOnce() {
     // is on the OLED it wipes it — and the once-per-episode latch this
     // function sets would then keep the page from ever redrawing (a blank
     // screen for the rest of the outage, bench-audit finding). The error
-    // page owns the display until the episode clears.
+    // page owns the display until the episode clears. Safe against
+    // recycled slots because every continuation that fires from a
+    // _screenStateTimerId registration resets it (see finishSplashClear and
+    // the boot-page chain) — the id only ever names a genuinely pending
+    // timer, never a fired-and-reused slot.
     if (_screenStateTimerId >= 0) {
       _screenStateTimer.deleteTimer(_screenStateTimerId);
       _screenStateTimerId = -1;
@@ -616,6 +651,35 @@ bool LSScreen::resetUsbErrorPage() {
   _usbErrorPagePainted = false;
   splashScreen2();
   return true;
+}
+
+//*********************************//
+// Function   : finishSplashClear
+//
+// Description: The splash/ready page's scheduled self-clear, as a member so
+//              it can keep _screenStateTimerId honest (the 4.5.5 follow-up
+//              audit): every continuation that fires from a
+//              _screenStateTimerId slot resets the id, exactly the way the
+//              scheduleTransition continuations reset _transitionTimerId
+//              (see the invariant documented there) — a fired RUN_ONCE
+//              timeout frees its slot, and the pool hands that slot to the
+//              NEXT registration, so a stale id read later could delete a
+//              live, unrelated timer. The only reader is the USB-error
+//              page's splash-clear cancel, which must stay able to kill a
+//              genuinely pending splash clear without any chance of hitting
+//              a recycled slot.
+//
+// Arguments :  void
+//
+// Return     : void
+//*********************************//
+void LSScreen::finishSplashClear() {
+  _screenStateTimerId = -1;  // The timer just fired — its slot is free again
+  if (!_isActive) {
+    // Same body the clearSplashScreen free function had: blank the display
+    // once the splash's dwell ends and no menu took it over.
+    deactivateMenu();
+  }
 }
 
 bool LSScreen::isDisplayHealthy() {
@@ -777,7 +841,7 @@ void LSScreen::splashScreen2() {
     //delay(2000);  //TODO - 2025-FEB-21 Why is this delay here?
     warningUSBDebugOn();
   } else {
-    _screenStateTimerId = _screenStateTimer.setTimeout(CONF_SPLASH_SCREEN_DURATION, clearSplashScreen);
+    _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::finishSplashClear>(CONF_SPLASH_SCREEN_DURATION, this);
   }
 
   _lastActivityMillis = millis();
@@ -2240,7 +2304,13 @@ void LSScreen::factoryResetConfirm2Page(void) {
 // Return     : void
 //*********************************//
 void LSScreen::fillMenuState(int out[3]) {
-  out[0] = _isActive ? 1 : 0;
+  // No menu page registered yet (the safe-mode/error boot dwell pages set
+  // _isActive before their continuation registers the menu): the boot pages
+  // are not menu truth — answer "no menu", the same honesty the CH,5 push's
+  // null gate enforces (4.5.5 follow-up: the app polls CH,0:0 after every
+  // press, and a press dropped in the dwell window would otherwise sync its
+  // mirror onto a "menu active, MAIN page" that does not exist).
+  out[0] = (_isActive && _currentMenuText != nullptr) ? 1 : 0;
   out[1] = _currentMenu;
   out[2] = _currentSelection;
 }
@@ -2455,7 +2525,8 @@ void LSScreen::updateModePage(void) {
 //*********************************//
 void LSScreen::hardwareErrorPage() {
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::hardwareErrorPage()"); }
-  
+  _screenStateTimerId = -1;  // The timer that scheduled this page just fired — its slot is free; keep the id honest (see finishSplashClear)
+
   // See safeModePage(): drop menu presses while this informational page
   // owns the display and no menu state is registered yet.
   _inputFrozenUntil = millis() + CONF_SAFEMODE_MENU_TIMEOUT;
@@ -2506,6 +2577,7 @@ void LSScreen::hardwareErrorPage() {
 //*********************************//
 void LSScreen::errorPageI2C() {
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::errorPageI2C()"); }
+  _screenStateTimerId = -1;  // The timer that scheduled this page just fired — its slot is free; keep the id honest (see finishSplashClear)
 
   // See safeModePage(): drop menu presses for this page's dwell.
   _inputFrozenUntil = millis() + CONF_SAFEMODE_MENU_TIMEOUT;
@@ -2531,6 +2603,7 @@ void LSScreen::errorPageI2C() {
 //*********************************//
 void LSScreen::errorPageCable() {
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::errorPageCable()"); }
+  _screenStateTimerId = -1;  // The timer that scheduled this page just fired — its slot is free; keep the id honest (see finishSplashClear)
   // Joystick sensor, ambient pressure sensor and mouthpiece pressure sensor not detected
   // Likely a cable issue
 
@@ -2569,7 +2642,7 @@ void LSScreen::warningUSBDebugOn(void) {
   _display.println("for user.");
   flushDisplay();
 
-  _screenStateTimerId = _screenStateTimer.setTimeout(CONF_SPLASH_SCREEN_DURATION, clearSplashScreen);
+  _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::finishSplashClear>(CONF_SPLASH_SCREEN_DURATION, this);
 }
 
 //*********************************//
@@ -2593,7 +2666,7 @@ void LSScreen::restartPage() {
   flushDisplay();
 
   const int RESTART_TIMEOUT = 3000;
-  _screenStateTimerId = _screenStateTimer.setTimeout(RESTART_TIMEOUT, clearSplashScreen);
+  _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::finishSplashClear>(RESTART_TIMEOUT, this);
 }
 
 //*********************************//
@@ -2616,7 +2689,7 @@ void LSScreen::factoryResetPage() {
 
   flushDisplay();
   const int RESET_TIMEOUT = 3000;
-  _screenStateTimerId = _screenStateTimer.setTimeout(RESET_TIMEOUT, clearSplashScreen);
+  _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::finishSplashClear>(RESET_TIMEOUT, this);
 }
 
 //*********************************//
@@ -2717,6 +2790,7 @@ void LSScreen::safeModePage(int safeModeReason) {
 
 void LSScreen::safeModeMenu(void) {
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::safeModeMenu()"); }
+  _screenStateTimerId = -1;  // The boot-page chain's timer just fired — its slot is free; keep the id honest (see finishSplashClear)
 
   _safeModeMenuText[1] = _safeModeReasonText;
 

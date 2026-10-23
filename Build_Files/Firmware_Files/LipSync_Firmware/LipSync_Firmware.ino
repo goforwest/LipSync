@@ -864,35 +864,13 @@ void initScreen() {
   //screen.splashScreen();  // Show splash screen
 }
 
-//***CLEAR MENU SCREEN FUNCTION***//
-// Function   : closeMenu
-//
-// Description: This function closes the menu and clears the screen
-//
-// Parameters : void
-//
-// Return     : void
-//****************************************//
-void closeMenu() {
-  screen.deactivateMenu();
-}
-
-//***CLEAR SPLASH SCREEN FUNCTION***//
-// Function   : clearSplashScreen
-//
-// Description: This function clears the splash screen
-//
-// Parameters : void
-//
-// Return     : void
-//****************************************//
-void clearSplashScreen() {
-
-  // Check if menu is active, only turn off screen if menu is not open
-  if (!screen.isMenuActive()) {
-    screen.deactivateMenu();
-  }
-}
+// (4.5.5 audit follow-up) The free closeMenu()/clearSplashScreen() wrappers
+// that used to live here are gone: closeMenu had no callers (the serial
+// CH,1:4 close and the STOP_MENU input action now call the freeze-aware
+// LSScreen::closeMenu), and clearSplashScreen's body moved into
+// LSScreen::finishSplashClear — a member so the continuation can reset
+// _screenStateTimerId when it fires (the free function could not, which
+// left the id naming a freed pool slot).
 
 //***SCREEN TRANSITION CONTINUATION FUNCTIONS***//
 // Free-function continuations for LSScreen::scheduleTransition() — the
@@ -2047,7 +2025,7 @@ void performOutputAction(int action) {
       }
     case CONF_ACTION_STOP_MENU:
       {
-        screen.deactivateMenu();  // Deactivate Menu
+        screen.closeMenu();  // Deactivate Menu (freeze-aware: see LSScreen::closeMenu)
         break;
       }
     case CONF_ACTION_B1_PRESS:
