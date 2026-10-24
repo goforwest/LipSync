@@ -183,8 +183,6 @@ public:
   void testPage(unsigned int usbConnectDelay);
   void noUsbPage();
   void updateModePage();
-  void errorPageI2C();
-  void errorPageCable();
   void warningUSBDebugOn();
   void connectionTimingPage(unsigned long, unsigned long);
   void restartPage();
@@ -296,7 +294,6 @@ private:
   void factoryResetConfirm1Page();
   void factoryResetConfirm2Page();
   void factoryResetPage();
-  void hardwareErrorPage();
 
   String _safeModeReasonText = "<Reason>";
 
@@ -1434,7 +1431,15 @@ void LSScreen::selectMenuItem() {
       _prevMenu = SAFEMODE_MENU;
       switch(_currentSelection) {
         case 0: // Restart
-          softwareReset();
+          // Confirm first (bench 2026-10-23): this row reset the device the
+          // INSTANT any select landed on it — the safe menu's default row
+          // was a hair trigger (a real select press on this row showed as a
+          // mystery rst=0x4 "idle" reset with no wire trace, because the
+          // reset fires inside the select, before any CH,5 push prints).
+          // The normal menu's Restart goes through the confirm page; the
+          // safe menu's does too now — same RESTART_PAGE confirm, and its
+          // "... Back" row already returns to the safe menu.
+          restartConfirmPage();
           break;
         case 1: 
           factoryResetConfirm2Page();
@@ -2514,114 +2519,12 @@ void LSScreen::updateModePage(void) {
   flushDisplay();
 }
 
-//*********************************//
-// Function   : hardwareErrorPage
-//
-// Description: Format and display a hardware error page
-//
-// Arguments :  void
-//
-// Return     : void
-//*********************************//
-void LSScreen::hardwareErrorPage() {
-  if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::hardwareErrorPage()"); }
-  _screenStateTimerId = -1;  // The timer that scheduled this page just fired — its slot is free; keep the id honest (see finishSplashClear)
-
-  // See safeModePage(): drop menu presses while this informational page
-  // owns the display and no menu state is registered yet.
-  _inputFrozenUntil = millis() + CONF_SAFEMODE_MENU_TIMEOUT;
-  setupDisplay();
-
-  _display.println("ERROR:");
-
-  if (!g_joystickSensorConnected && !g_mouthpiecePressureSensorConnected && !g_ambientPressureSensorConnected) {
-    _display.println(" CABLE");
-    _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::errorPageCable>(CONF_SAFEMODE_MENU_TIMEOUT, this);
-  } else {
-    _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::errorPageI2C>(CONF_SAFEMODE_MENU_TIMEOUT, this);
-    if (!g_joystickSensorConnected)
-      _display.println(" JOYSTICK");
-    if (!g_mouthpiecePressureSensorConnected)
-      _display.println(" PRESSURE");
-    if (!g_ambientPressureSensorConnected)
-      _display.println(" AMBIENT");
-  }
-
-// Format error code using binary representation of whether sensors are connected
-  if (!g_joystickSensorConnected)
-    _hardwareErrorCode |= 1 << 0;
-  if (!g_mouthpiecePressureSensorConnected)
-    _hardwareErrorCode |= 1 << 1;
-  if (!g_ambientPressureSensorConnected)
-    _hardwareErrorCode |= 1 << 2;
-  if (!g_displayConnected)
-    _hardwareErrorCode |= 1 << 3;
-
-  char buffer[10];
-  sprintf(buffer, "ERROR-%03u", _hardwareErrorCode);
-  _safeModeReasonText = String(buffer);
-
-  flushDisplay();
-    
-}
-
-
-//*********************************//
-// Function   : errorPageI2C
-//
-// Description: Format and display an error page when an i2C sensor is not detected
-//
-// Arguments :  void
-//
-// Return     : void
-//*********************************//
-void LSScreen::errorPageI2C() {
-  if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::errorPageI2C()"); }
-  _screenStateTimerId = -1;  // The timer that scheduled this page just fired — its slot is free; keep the id honest (see finishSplashClear)
-
-  // See safeModePage(): drop menu presses for this page's dwell.
-  _inputFrozenUntil = millis() + CONF_SAFEMODE_MENU_TIMEOUT;
-  setupDisplay();
-  _display.println("ERROR: ");
-  _display.println("Sensor not");
-  _display.println("detected.");
-  //_display.println("Contact Maker.");
-  
-  flushDisplay();
-
-  _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::safeModeMenu>(CONF_SAFEMODE_MENU_TIMEOUT, this);
-}
-
-//*********************************//
-// Function   : errorPageCable
-//
-// Description: Format and display an error page related to Interface Cable
-//
-// Arguments :  void
-//
-// Return     : void
-//*********************************//
-void LSScreen::errorPageCable() {
-  if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::errorPageCable()"); }
-  _screenStateTimerId = -1;  // The timer that scheduled this page just fired — its slot is free; keep the id honest (see finishSplashClear)
-  // Joystick sensor, ambient pressure sensor and mouthpiece pressure sensor not detected
-  // Likely a cable issue
-
-  // See safeModePage(): drop menu presses for this page's dwell (2x the base).
-  _inputFrozenUntil = millis() + 2 * CONF_SAFEMODE_MENU_TIMEOUT;
-  setupDisplay();
-
-  _display.println("ERROR: ");
-  _display.println("No joystick");
-  _display.println("detected.");
-  _display.println("Try cable.");
-
-  flushDisplay();
-
-  _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::safeModeMenu>(2*CONF_SAFEMODE_MENU_TIMEOUT, this);
-
-
-}
+// (4.5.6) The hardware-error page CHAIN (hardwareErrorPage -> errorPageI2C /
+// errorPageCable -> safeMenu) was collapsed into safeModePage's HARDWARE case:
+// one synchronous draw of the same error list plus a single +3 s continuation
+// to the safe menu. The chain's three page functions were dead code from that
+// moment and are removed per the af91082 discipline; the safeModePage comment
+// documents why the chain had to go.
 
 //*********************************//
 // Function   : warningUSBDebugOn
@@ -2732,6 +2635,7 @@ void LSScreen::connectionTimingPage(unsigned long before, unsigned long after) {
 
 void LSScreen::safeModePage(int safeModeReason) {
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::safeModePage()"); }
+  bootTrailStamp(2);  // witness v7: a safe/degraded boot's dwell window begins
 
   _isActive = true;
   // Freeze menu input for the dwell (the safe-mode menu registers on the
@@ -2762,9 +2666,40 @@ void LSScreen::safeModePage(int safeModeReason) {
         }
         case CONF_SAFE_MODE_REASON_HARDWARE:
         {
+          // THE FREEZE FIX (bench 2026-10-23, five witness rounds): every
+          // freeze on this hardware landed inside the hardware-error dwell
+          // CHAIN's timer windows (safeModePage -> +3 s hardwareErrorPage ->
+          // +3 s errorPageI2C/Cable -> +3 s safeModeMenu, ms 0.5-9.5) — the
+          // witness caught the screen pool's continuations dying mid-chain
+          // (trail 21/22 with the next page's stamp due and never landing)
+          // while the serial API kept answering, then the loop. The chain's
+          // content is informational only, so it collapses to ONE
+          // synchronous draw here plus a single +3 s continuation straight
+          // to the safe menu — same error list, same error code, same
+          // recovery path, none of the intermediate pages' timer windows.
           _display.println(" Hardware");
-          _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::hardwareErrorPage>(CONF_SAFEMODE_MENU_TIMEOUT, this);    
-          _safeModeReasonText = "Error";     
+          _hardwareErrorCode = 0;
+          if (!g_joystickSensorConnected) {
+            _display.println(" JOYSTICK");
+            _hardwareErrorCode |= 1 << 0;
+          }
+          if (!g_mouthpiecePressureSensorConnected) {
+            _display.println(" PRESSURE");
+            _hardwareErrorCode |= 1 << 1;
+          }
+          if (!g_ambientPressureSensorConnected) {
+            _display.println(" AMBIENT");
+            _hardwareErrorCode |= 1 << 2;
+          }
+          if (!g_displayConnected) {
+            _hardwareErrorCode |= 1 << 3;
+          }
+          {
+            char buffer[10];
+            sprintf(buffer, "ERROR-%03u", _hardwareErrorCode);
+            _safeModeReasonText = String(buffer);
+          }
+          _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::safeModeMenu>(CONF_SAFEMODE_MENU_TIMEOUT, this);
           break;
         }
         default:
@@ -2790,6 +2725,7 @@ void LSScreen::safeModePage(int safeModeReason) {
 
 void LSScreen::safeModeMenu(void) {
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::safeModeMenu()"); }
+  bootTrailStamp(3);  // witness v7: the safe-mode menu registered
   _screenStateTimerId = -1;  // The boot-page chain's timer just fired — its slot is free; keep the id honest (see finishSplashClear)
 
   _safeModeMenuText[1] = _safeModeReasonText;

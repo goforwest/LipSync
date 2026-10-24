@@ -72,12 +72,17 @@ void checkResetReason() {
   // CONF_WATCHDOG_BOOT_CLEAR_MS, so isolated hangs months apart never exhaust
   // the retry budget. Any non-watchdog reset (power cycle, reset pin, soft
   // reset) also clears it.
+  // The retention byte is PACKED (bench 2026-10-23): bits 0-1 watchdog
+  // counter (the retry limit is 3 — two bits), bits 5-7 the witness TRAIL
+  // (the last milestone a dying boot reached; RAM dies at the reset, this
+  // does not). All writes touch only their own bits.
   if (g_watchdogReset) {
-    g_watchdogBootCount = (uint8_t)(NRF_POWER->GPREGRET2 & 0xFF) + 1;
-    NRF_POWER->GPREGRET2 = g_watchdogBootCount;
+    g_watchdogBootCount = (uint8_t)(NRF_POWER->GPREGRET2 & 0x03UL) + 1;
+    if (g_watchdogBootCount > 3) g_watchdogBootCount = 3;
+    NRF_POWER->GPREGRET2 = (NRF_POWER->GPREGRET2 & ~0x03UL) | g_watchdogBootCount;
   } else {
     g_watchdogBootCount = 0;
-    NRF_POWER->GPREGRET2 = 0;
+    NRF_POWER->GPREGRET2 &= ~0x03UL;  // clear only the counter bits — the trail survives non-watchdog resets too
   }
 }
 
@@ -120,7 +125,7 @@ void watchdogLoop(void) {
   // the full watchdog-reset retry budget for the next one.
   static bool watchdogBootCountCleared = false;
   if (!watchdogBootCountCleared && millis() > CONF_WATCHDOG_BOOT_CLEAR_MS) {
-    NRF_POWER->GPREGRET2 = 0;
+    NRF_POWER->GPREGRET2 &= ~0x03UL;  // clear only the counter bits (the trail bits 5-7 stay)
     watchdogBootCountCleared = true;
   }
 }

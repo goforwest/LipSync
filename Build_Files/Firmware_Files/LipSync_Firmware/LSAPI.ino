@@ -238,7 +238,7 @@ bool processSerialMessage(String commandString, bool settingsFlag) {
 // Return     : bool : The settings-mode flag to carry to the next pass
 //*********************************************************************//
 bool serialSettings(bool enabled) {
-
+  bootTrailStamp(7);  // witness v9: a serial command is being dispatched (the freeze lands between commands when the app is connected)
   bool settingsFlag = enabled;
 
   while (Serial.available() > 0) {

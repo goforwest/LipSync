@@ -309,8 +309,36 @@ void LSBuzzer::playReadySound(){
 // Return     : void
 //*********************************//
 void LSBuzzer::playErrorSound(){
+  // THE FREEZE ROOT CAUSE FIX (bench 2026-10-23, cold-boot freeze hunt): the
+  // queued follow-up note was the ONLY tone() call that ever fired from
+  // loop() context — every other sound plays during setup, before the LED
+  // feedback machinery is live. The Seeed core's tone() claims ownership of
+  // hardware PWM2, the LED brightness writes analogWrite() onto the same
+  // shared PWM instances, and the hardware-error path is the ONE place both
+  // run interleaved (this sound + the ledError blink): the +500 ms queued
+  // note fired from the loop straight into the blink window, and the main
+  // loop froze there on 12/12 boots whose joystick sensor was dead at
+  // power-on (the watchdog closed every one; the bench even heard the
+  // second note silently swallowed on some boots — tone() returning
+  // without playing when the ownership takeover failed). Two fixes at the
+  // source: (1) the sound is now fully blocking and plays BOTH notes
+  // before the caller starts the LED error feedback — the error path runs
+  // once at boot on a degraded device ahead of the error pages, so a
+  // bounded ~1 s block (the pre-4.2.0 norm, watchdog budget 30 s) buys a
+  // loop context that never touches tone(); (2) the sound-mode gate every
+  // other tone has (this one beeped even with sound OFF — a long-standing
+  // gap). The queue machinery stays for any future user; nothing queues
+  // today, so buzzer.update() is a no-op and the loop never calls tone().
+  if (!_buzzerOn || (_soundModeLevel == CONF_SOUND_MODE_OFF)) return;
     tone(CONF_BUZZER_PIN, NOTE_G4, 500);
-    queueNote(500, NOTE_C4, 500);  // Was delay(500) between the tones — the loop now runs through the pause
+    delay(500);
+    tone(CONF_BUZZER_PIN, NOTE_C4, 500);
+    delay(500);
+    // Release the PWM peripheral explicitly (Tone.cpp: noTone -> stopPlayback
+    // with release) — the LED feedback's analogWrite allocates the same
+    // instance right after this, and an ownership left behind here is how
+    // the peripheral ended up in the conflicted state that froze the loop.
+    noTone(CONF_BUZZER_PIN);
 }
 
 //*********************************//

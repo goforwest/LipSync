@@ -119,7 +119,99 @@ bool g_watchdogArmed = false;            // True from initWatchdog() until the r
 // its one auto-restart this power cycle. Any healthy boot clears it, re-arming
 // the guard for a future incident; a cold power-on reads random garbage, which
 // the magic test simply fails.
-__attribute__((section(".noinit"))) uint32_t g_usbRestartArmed;
+// WITNESS v4 + PLATFORM FIX (bench 2026-10-23): the .noinit section DOES NOT
+// survive resets on this platform — the bench proved it (every soft-reset and
+// watchdog boot read boot#1/ptrail=0 back; the map places the section at
+// 0x20007bac but its content is zeroed by the time the next boot's setup()
+// runs — the bootloader/core scrubs it). Every cross-reset word therefore
+// moves to the nRF52 POWER RETENTION REGISTERS, which survive every warm
+// reset and clear only on cold power-on (the mechanism the 4.2.0 watchdog
+// boot counter has used all along):
+//   GPREGRET2 bits  0- 7 : consecutive-watchdog-boot counter (4.2.0, unchanged)
+//   GPREGRET2 bits  8-15 : witness boot TRAIL — the last milestone stamped
+//                         before a boot died; the next boot prints it as ptrail=
+//   GPREGRET2 bits 16-23 : the USB-recovery once-guard (438643c), MIGRATED
+//                         here from .noinit where it never survived the very
+//                         reset it was armed for — the once-per-power-cycle
+//                         auto-restart contract is restored on hardware
+//   GPREGRET2 bits 24-31 : soft-reset boot counter (witness: counts boots in
+//                         a reset chain; cold power-on re-seeds at 1)
+// The core's own DFU magic lives in GPREGRET (1), not GPREGRET2.
+// WITNESS v5 (bench 2026-10-23): the platform offers NO reliable cross-reset
+// storage — the retention register GPREGRET2 is 8 bits wide (SVD: only bits
+// 0-7 implemented; the 4.2.0 watchdog counter lives there), GPREGRET belongs
+// to the bootloader's DFU magic, and the .noinit section is wiped by the
+// boot path (the map even shows its orphan placement straddling
+// __bss_start__, so most of it lands inside the bss-clear loop). The trail
+// is therefore a plain RAM byte, printed live by the HB line: for a freezing
+// boot, the LAST PRINTED trail names the site the loop died at. Cross-reset
+// questions are answered by rst= (the nRF52 RESETREAS register — the one
+// reset fact that does survive).
+// WITNESS v7 (bench 2026-10-23): the freeze's CPU does NOT hardfault (the
+// Seeed core's HardFault_Handler is an instant NVIC_SystemReset — a fault
+// would read rst=0x4 on the next boot; every freeze successor reads rst=0x2,
+// the 30-s watchdog: the CPU is SPINNING, not faulting) — and every bounded
+// wait in the Wire/Tone/HardwarePWM paths checks out, so the spin site is
+// somewhere no witness has survived to report: RAM dies at the reset. The
+// trail therefore moves into the retention register's spare bits
+// (GPREGRET2 bits 5-7 — the watchdog counter only needs bits 0-1): the last
+// 3-bit milestone a dying boot stamped SURVIVES the watchdog reset, and the
+// next boot prints it as pt=. Trail codes (3 bits): 1 setup-done, 2
+// safeModePage, 3 safeMenu, 4 LED action, 5 softwareReset, 6
+// usbCheckConnection.
+uint8_t g_bootTrailPrev = 0;  // The DEAD boot's last trail code (read from retention at setup)
+uint8_t g_hangMarkerPrev = 0;  // The DEAD boot's hang-witness marker (retention bits 2-4)
+volatile bool g_shutdownInProgress = false;  // witness v9: softwareReset's deliberate blocking shutdown is NOT a hang — the witness exempts it
+uint8_t readTrailByte()            { return (NRF_POWER->GPREGRET2 >> 5) & 0x07; }
+void writeTrailByte(uint8_t step)  { NRF_POWER->GPREGRET2 = (NRF_POWER->GPREGRET2 & ~0xE0UL) | ((step & 0x07) << 5); }
+
+// WITNESS v8 — THE HANG WITNESS (bench 2026-10-23): this round proved the
+// freeze ends in a WATCHDOG reset that WIPES GPREGRET2 (every freeze
+// successor read pt=0 while the dead boot demonstrably stamped trail=1/3;
+// SREQ resets preserve it — pt=5 survived every SR). So the freeze's death
+// site could never be reported. This converts the freeze's silent DOG death
+// into an SREQ the trail survives: TIMER3 (free — the core only touches
+// TIMER2 read-only for the bootloader version) fires an interrupt every
+// second and watches the loop's watchdog feed stamp — the loop pass
+// refreshes it on every iteration. If the loop hangs for >3 s, the IRQ
+// writes a hang marker into retention bits 2-4 and resets via
+// NVIC_SystemReset (SREQ): the trail bits 5-7 SURVIVE, the next boot prints
+// pt= (the last milestone the dead boot stamped) and pm=1 (hang witnessed),
+// and the bench cycle drops from 30 s to ~4 s. If the hang instead masks
+// interrupts, the IRQ never fires and the hardware DOG still ends it
+// (pt=0) — that split (pm=1 vs pm=0) is itself decisive: IRQs-live hang vs
+// IRQs-masked hang.
+void initHangWitness() {
+  NRF_TIMER3->MODE = TIMER_MODE_MODE_Timer << TIMER_MODE_MODE_Pos;
+  NRF_TIMER3->BITMODE = TIMER_BITMODE_BITMODE_32Bit << TIMER_BITMODE_BITMODE_Pos;
+  NRF_TIMER3->PRESCALER = 9;                       // 16 MHz / 512 = 31.25 kHz
+  NRF_TIMER3->CC[0] = 31250;                       // 1 s
+  NRF_TIMER3->SHORTS = TIMER_SHORTS_COMPARE0_CLEAR_Enabled << TIMER_SHORTS_COMPARE0_CLEAR_Pos;
+  NRF_TIMER3->INTENSET = TIMER_INTENSET_COMPARE0_Msk;
+  NVIC_SetPriority(TIMER3_IRQn, 0);  // witness v9: HIGHEST priority — a hang that still blocks it can only be PRIMASK-level masking; a hang it now escapes was a lower/equal-priority handler
+  NVIC_ClearPendingIRQ(TIMER3_IRQn);
+  NVIC_EnableIRQ(TIMER3_IRQn);
+  NRF_TIMER3->TASKS_START = 1;
+}
+extern "C" void TIMER3_IRQHandler(void) {
+  NRF_TIMER3->EVENTS_COMPARE[0] = 0;
+  if (!g_shutdownInProgress && g_watchdogArmed && g_watchdogLastFeedMs != 0 && (millis() - g_watchdogLastFeedMs > 3000)) {
+    NRF_POWER->GPREGRET2 = (NRF_POWER->GPREGRET2 & ~0x1CUL) | (1UL << 2);  // marker 1: loop hang witnessed (trail bits preserved)
+    NVIC_SystemReset();  // SREQ — retention survives; the next boot reports pt=/pm=
+  }
+}
+
+// Milestones: 1 boot-seed, 2 serial-up, 3 post-com-op, 4 post-checkI2C,
+// 5 joystick-init-ran, 6 joystick-init-SKIPPED, 7 timers-registered,
+// 8 post-hardware-error-check, 9 post-toggle-safe-mode, 10 setup-end;
+// 20 safeModePage, 21 hardwareErrorPage, 22 errorPageI2C, 23 errorPageCable,
+// 24 safeModeMenu (the error-dwell chain, where the freeze class strikes);
+// 30 first loop pass, 31 entering queued-tone(), 32 tone() returned,
+// 33 LED action running (analogWrite), 40 softwareReset, 41 USB one-shot
+// restart, 50 usbCheckConnection.
+void bootTrailStamp(uint8_t step) {
+  writeTrailByte(step);
+}
 
 // Joystick module variables and structures
 int acceleration = 0;
@@ -189,6 +281,13 @@ void setup() {
   initGlobals();  //  Intialize global variables to default values
   checkResetReason();  //  Check reason for reset and reset the reset-reason register
 
+  // Witness v7: capture what the DEAD boot last stamped (survives the reset
+  // in the retention register), then start this boot's trail.
+  g_bootTrailPrev = readTrailByte();
+  g_hangMarkerPrev = (NRF_POWER->GPREGRET2 >> 2) & 0x07;
+  NRF_POWER->GPREGRET2 &= ~0x1CUL;  // consume the marker — one hang reports once
+  writeTrailByte(0);
+
   beginMillis = millis();  // Intialize timer
 
   // Keep the bus dark until the composite descriptor is complete. The core
@@ -220,7 +319,6 @@ void setup() {
   initRestrictions();  // Load the input restriction settings (roadmap item 11) before any input can fire
 
 
-  ledWaitFeedback();  // Turn on all LEDS
 
   beforeComOpMillis = millis() - beginMillis;  // Note time before USB/BT connection
   beginComOpMode();                            // Initialize Operating Mode, Communication Mode, and start instance of mouse or gamepad
@@ -341,6 +439,21 @@ void setup() {
     hardwareErrorCheck();
   }
 
+  // THE FREEZE FIX, round 2 (bench 2026-10-23, the correlation that closed the
+  // hunt): ledWaitFeedback used to run BEFORE checkI2C, allocating the LED
+  // brightness channels on the shared HwPWM instance; hardwareErrorCheck's
+  // playErrorSound then called tone(), and the Seeed core's tone() CLAIMS
+  // THAT SAME PWM PERIPHERAL (Tone.cpp hard-codes PWM2) and rewrites its
+  // sequence/loop configuration under the live LED channels — the first
+  // note plays, the peripheral is left in a conflicted state, and the loop
+  // froze 0.9-8.6 s later on 15/15 boots whose joystick sensor was absent
+  // (the only boots that ever play the error sound; all-sensor safe boots
+  // and healthy boots never froze). The two PWM users are now SEQUENCED:
+  // the error sound plays first (with no LED channels allocated), releases
+  // the peripheral via noTone(), and the all-LEDs-on feedback runs here —
+  // after any sound, on every boot. Same cues for the user, no overlap.
+  ledWaitFeedback();  // Turn on all LEDS (moved from before checkI2C — see above)
+
   //handleHardwareErrors(); // Currently not implemented
 
   toggleSafeMode(g_safeModeEnabled);
@@ -355,6 +468,8 @@ void setup() {
   // resetting forever.
   if (CONF_ENABLE_WATCHDOG && g_watchdogBootCount < CONF_WATCHDOG_BOOT_RETRY_LIMIT) { 
     initWatchdog();  // Initialize hardware watchdog
+    initHangWitness();  // witness v8: the TIMER3 hang witness — converts a loop hang into an SREQ that preserves the trail
+    bootTrailStamp(1);  // witness v7: setup complete (the only boot-phase code; deaths are all loop-phase)
   }
 
   if (USB_DEBUG) { Serial.print("USBDEBUG: lastRebootReason: "); Serial.println(g_lastRebootReason); }
@@ -408,7 +523,25 @@ void loop() {
   static unsigned long lastHeartbeatMs = 0;
   const bool degradedNow = g_safeModeEnabled || !g_displayConnected || !g_joystickSensorConnected
                          || !g_mouthpiecePressureSensorConnected || !g_ambientPressureSensorConnected;
-  if (degradedNow && (millis() - lastHeartbeatMs >= 5000)) {
+  // WITNESS BUILD (bench 2026-10-23, cold-boot freeze hunt — a diagnostic
+  // patch, not the release behavior): the released gate prints only in
+  // degraded boots, but the three freezing boots showed every sensor ACKing
+  // at checkI2C (degradedNow false) — so they printed NOTHING while the main
+  // loop died ~1 s in (the load answered ~18 endpoints, the boot-center
+  // MANUAL line never arrived, and the port vanished at an exact +30 s =
+  // the armed watchdog). This build brackets the freeze: EVERY boot prints
+  // at a 1 s cadence for the first 90 s (the freeze window), each line
+  // reporting the live bus state, the Wire recovery count and each sensor's
+  // detected flag — the LAST line before silence names the second the loop
+  // died and what the bus was doing at that instant. After 90 s the
+  // released gate stands (degraded-only, 5 s cadence), so a stable session
+  // stays quiet past the window.
+  const bool witnessWindow = (millis() < 90000);
+  // v2 cadence: 250 ms for the first 5 s — the freeze class has struck
+  // between the last served command and the first 1 s line (three boots
+  // printed NOTHING on v1), so the early window needs its own resolution.
+  const unsigned long heartbeatIntervalMs = (millis() < 5000) ? 250 : (witnessWindow ? 1000 : 5000);
+  if ((degradedNow || witnessWindow) && (millis() - lastHeartbeatMs >= heartbeatIntervalMs)) {
     lastHeartbeatMs = millis();
     Serial.print(F("HB: ms="));
     Serial.print(millis());
@@ -420,11 +553,30 @@ void loop() {
     Serial.print(g_watchdogArmed ? 1 : 0);
     Serial.print(F(" feed="));
     if (g_watchdogLastFeedMs == 0) {
-      Serial.println(F("never"));
+      Serial.print(F("never"));
     } else {
       Serial.print(millis() - g_watchdogLastFeedMs);
-      Serial.println(F("ms"));
+      Serial.print(F("ms"));
     }
+    Serial.print(F(" rst=0x"));
+    Serial.print(g_lastRebootReason, HEX);
+    Serial.print(F(" pt="));
+    Serial.print(g_bootTrailPrev);
+    Serial.print(F(" pm="));
+    Serial.print(g_hangMarkerPrev);
+    Serial.print(F(" trail="));
+    Serial.print(readTrailByte());
+    Serial.print(F(" bus="));
+    Serial.print(Wire.busHealthy() ? 1 : 0);
+    Serial.print(F(" recov="));
+    Serial.print(Wire.recoveryCount());
+
+    Serial.print(F(" sns="));
+    Serial.print(g_joystickSensorConnected ? 1 : 0);
+    Serial.print(g_mouthpiecePressureSensorConnected ? 1 : 0);
+    Serial.print(g_ambientPressureSensorConnected ? 1 : 0);
+    Serial.print(g_displayConnected ? 1 : 0);
+    Serial.println();
   }
 
   ledStateTimer.run();  // Timer for lights
@@ -1105,6 +1257,7 @@ void usbConnectionLoop() {
 //****************************************//
 void usbCheckConnection(void) {
   if (USB_DEBUG) { Serial.println("USBDEBUG: usbCheckConnection()"); }
+  bootTrailStamp(6);  // witness v7: the USB connection check is running
 
   // Self-healing re-enumeration (bench 2026-10-16, second stuck-boot capture):
   // twice now a post-flash 4.5.0 boot came up CONFIGURED but permanently
@@ -1134,7 +1287,9 @@ void usbCheckConnection(void) {
       }
       g_usbNotReadySinceMs = 0;  // Episode over
       g_usbReenumCount = 0;
-      g_usbRestartArmed = 0;     // Healthy boot: re-arm the one auto-restart for a future incident
+      // The once-guard now lives in the reset reason itself: this healthy
+      // boot will end in whatever reset ends it, and the auto-restart only
+      // ever fires on boots that did NOT begin with a software reset.
     } else {
       if (g_usbNotReadySinceMs == 0) {
         g_usbNotReadySinceMs = millis();  // Episode begins
@@ -1150,7 +1305,7 @@ void usbCheckConnection(void) {
         g_usbConnectDelay = CONF_USB_HID_INIT_DELAY;  // Resume fast checks while the fresh enumeration settles
         g_usbNotReadySinceMs = millis();              // Fresh budget for the fresh enumeration
       } else if ((millis() - g_usbNotReadySinceMs >= CONF_USB_REENUM_AFTER_MS) && (g_usbReenumCount >= CONF_USB_REENUM_MAX)
-                 && (g_usbRestartArmed != CONF_USB_RESTART_MAGIC)) {
+                 && ((g_lastRebootReason & NRF_POWER_RESETREAS_SREQ_MASK) == 0)) {  // never auto-restart a boot that began with a software reset (the once-guard: the platform wipes .noinit, but RESETREAS survives)
         // The re-enumeration budget is spent and the HID interface is still
         // dead while serial lives — the host is not recovering this
         // composite, and no bus-level cycle left will change that (bench
@@ -1161,7 +1316,7 @@ void usbCheckConnection(void) {
         // enumeration the way every restart boot has; if it somehow wedges
         // again, the magic guard keeps this branch from firing and the page +
         // retry ticks carry on for the app/user to see honestly.
-        g_usbRestartArmed = CONF_USB_RESTART_MAGIC;
+        bootTrailStamp(5);  // witness v7: the USB-episode one-shot restart is firing
         Serial.print("USB restarting device to recover the HID interface at ");
         Serial.println(millis());
         screen.restartPage();
@@ -3214,6 +3369,7 @@ void btFeedbackLoop() {
 // Return     : void
 //****************************************//
 void performLedAction(ledStateStruct* args) {
+  bootTrailStamp(4);  // witness v7: an LED action is running
   switch (args->ledAction)  // Get LED action
   {
     case LED_ACTION_NONE:
@@ -3258,6 +3414,8 @@ void performLedAction(ledStateStruct* args) {
 //******************************************//
 void softwareReset() {
   if (USB_DEBUG) { Serial.println("USBDEBUG: softwareReset()"); }
+  g_shutdownInProgress = true;
+  bootTrailStamp(5);  // witness v7: a software reset is starting — the next boot's pt=5 names this path
   screen.restartPage();
   buzzer.playShutdownSound();
 

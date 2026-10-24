@@ -269,6 +269,10 @@ bool switchRemapAllowed(int actionNumber);
 void switchRemapApplyCell(int jack, int window, bool gamepad, int actionNumber);
 int switchRemapDefaultCell(int jack, int window, bool gamepad);
 
+// Witness v2 boot-trail (diagnostic, bench 2026-10-23): milestone stamps that
+// survive resets in .noinit; the HB line prints the last one reached.
+void bootTrailStamp(uint8_t step);
+
 // Screen page-transition continuations passed to LSScreen::scheduleTransition()
 // (the splash clear is LSScreen::finishSplashClear, a member so it can reset
 // _screenStateTimerId when it fires)
