@@ -39,12 +39,25 @@
 #define JOY_DIRECTION_INVERSE -1
 #define JOY_DIRECTION_FAULT 0           // Can be used to notify the end user that there is an issue with hall sensor setup
 
-#define JOY_DIRECTION_X -1              // Coordinate system for joystic axes. Depends on sensor arrangement
-#define JOY_DIRECTION_Y -1              // Coordinate system for joystic axes. Depends on sensor arrangement
+#define JOY_Z_DIRECTION_THRESHOLD 9     // The threshold used in z axis direction detection
 
-#define JOY_Z_DIRECTION_THRESHOLD 9     // The threshold used in z axis direction detection 
+// Consecutive failed sensor reads before the library is re-initialized
+// (4.5.7 review): the vendored Wire recovers the BUS, but a sensor that
+// browned out mid-session comes back in power-down with its write registers
+// zeroed while the library's regMap still claims master-controlled mode —
+// a silently dead cursor with no re-init path anywhere. N failed reads in
+// a row re-issue the A1B6 default config (bounded: a handful of I2C
+// transactions through the vendored Wire), converting a hard-dead cursor
+// into a self-healing blip.
+#define JOY_READ_FAIL_REINIT_LIMIT 5 
 
 #define JOY_RAW_XY_MAX 30.0             // The max raw x or y of a calibration point in mT
+
+// Minimum center-relative distance (mT) for a stored calibration corner to
+// count as a valid radius input (4.5.7 review — see setMinimumRadius): a
+// real corner sits 13-30 mT from the compensated center; anything closer is
+// a degenerate capture or garbage from an unvalidated settings load.
+#define JOY_MIN_CALIB_RADIUS 1.0
 
 #define JOY_INPUT_XY_MAX 1024           // The max range of mapped input from float to int(-1024 to 1024)
 
@@ -159,6 +172,36 @@ class LSJoystick {
     unsigned long _busRetryAtMs = 0;                                      // I2C backoff: no reads until this time (a flaky device on the
     unsigned long _busRetryIntervalMs = 20;                               // shared bus drags transfers until they crawl — see update())
     uint32_t _processCount = 0;                                           // Times the !skipInputChange block has run since boot (the frozen-pipeline smoking gun if 0)
+    uint8_t _consecReadFails = 0;                                         // Consecutive failed sensor reads (re-init at JOY_READ_FAIL_REINIT_LIMIT — see update())
+
+    // One bounded XENSIV read. Returns false (and leaves the caller's
+    // doubles untouched, i.e. 0.0) when the transfer failed — the caller
+    // MUST consult the bool (4.5.7 review): a discarded failure read as a
+    // real centered reading ({0,0} raw against a deflected previous point
+    // passes the skip gate and gets processed), so a flaky bus stuttered
+    // the cursor to false-center on every failed poll with no fault
+    // signal. The retired TLV493D fork held last-good values on bus errors;
+    // that failure semantic is restored here.
+    bool readMagneticField(double* xReading, double* yReading, double* zReading) {
+      if (_Tlv493dSensor.getMagneticField(xReading, yReading, zReading)) {
+        _consecReadFails = 0;
+        return true;
+      }
+      if (_consecReadFails < 255) _consecReadFails++;
+      return false;
+    }
+
+    // Sensor re-initialization after persistent read failures (see
+    // JOY_READ_FAIL_REINIT_LIMIT): re-issues the A1B6 master-controlled-mode
+    // configuration via setDefaultConfig() — which RE-WRITES the config
+    // registers with NO allocation. (begin()/init() malloc the register-map
+    // and bus objects every call with no matching free, so calling it here
+    // — up to ~10x/second on an absent sensor — would leak the heap to
+    // exhaustion; 4.5.7 review caught that.) executeInit stays implicitly
+    // out of it: the vendored Wire owns the bus and is never re-begun.
+    void recoverSensorConfig() {
+      _Tlv493dSensor.setDefaultConfig();
+    }
 
 };
 
@@ -328,15 +371,24 @@ int LSJoystick::getMagnetZDirection() {
 void LSJoystick::setMagnetZDirection() {
 
   float zReading = 0.0;
-  for (int i = 0 ; i < JOY_MAG_SAMPLE_SIZE ; i++){        // Get the average of 5 z direction reading 
+  int zGoodSamples = 0;
+  for (int i = 0 ; i < JOY_MAG_SAMPLE_SIZE ; i++){        // Get the average of the valid z direction readings
     // One XENSIV read returns x/y/z from the same register snapshot (the
     // old library's updateData()+getZ() pair is now a single call; each
-    // iteration is still one bounded I2C read of the live registers).
+    // iteration is still one bounded I2C read of the live registers). A
+    // failed read is NOT a sample (the bool contract — a failure leaves
+    // the outputs at 0.0, which would drag the average toward the FAULT
+    // band); the boot latch already treats an in-band average as FAULT
+    // with a self-heal from the first live reading.
     double xReading = 0.0, yReading = 0.0, zSample = 0.0;
-    _Tlv493dSensor.getMagneticField(&xReading, &yReading, &zSample);
+    if (!readMagneticField(&xReading, &yReading, &zSample)) continue;
     zReading += (float)zSample;
+    zGoodSamples++;
   }
-  zReading = ((float) zReading) / JOY_MAG_SAMPLE_SIZE;
+  // Average over the VALID samples (4.5.7 review): dividing by the full
+  // count when some reads failed attenuated a real ±Z toward the FAULT
+  // band. No valid sample at all stays 0.0 → FAULT (the intended fallback).
+  zReading = (zGoodSamples > 0) ? (zReading / zGoodSamples) : 0.0f;
    
   if (zReading < -1 * JOY_Z_DIRECTION_THRESHOLD)          // Set z direction to inverse 
   {
@@ -477,10 +529,15 @@ void LSJoystick::setOutputRange(int rangeLevel){
   // When operating as a mouse, the following function sets the upper limit of cursor value output each update
   if (_operatingMode == CONF_OPERATING_MODE_MOUSE){
     // Calculate the output range value
-    _rangeValue = (int)((0.125 * sq(rangeLevel)) + ( 0.3 * rangeLevel ) + 2);       // Polynomial 
-    // [0:2; 1:2; 2:3; 3:4; 4:5; 5:7; 6:8; 7:10; 8:12; 9:15; 10:18]
-    
-    // _rangeValue = (int)((1.05 * exp(( 0.175 * rangeLevel) + 1.1)) - 1);           // Exponential   
+    // NOTE (4.5.7 review): this is the long-shipped TRUNCATING polynomial —
+    // the bench-validated cursor feel (level 5, the shipped default, is
+    // 6 px/tick, not the 7 an old comment claimed). The table below
+    // documents the ACTUAL values so nobody "fixes" the comment by
+    // changing the cast and silently rescales every user's cursor:
+    //   [0:2; 1:2; 2:3; 3:4; 4:5; 5:6; 6:8; 7:10; 8:12; 9:14; 10:17]
+    _rangeValue = (int)((0.125 * sq(rangeLevel)) + ( 0.3 * rangeLevel ) + 2);       // Polynomial
+
+    // _rangeValue = (int)((1.05 * exp(( 0.175 * rangeLevel) + 1.1)) - 1);           // Exponential
     //Serial.print("_rangeValue:");
     //Serial.println(_rangeValue);
 
@@ -534,9 +591,17 @@ void LSJoystick::setMinimumRadius(){
   // Loop through calibration points and calculate the smallest magnitude from center point
   for (int i = 1; i < JOY_CALIBR_ARRAY_SIZE; i++) {
     tempRadius = (sqrt(sq(_magnetInputCalibration[i].x - _magnetInputCalibration[0].x) + sq(_magnetInputCalibration[i].y - _magnetInputCalibration[0].y)) / sqrt(2.0));
-    // Make sure the calibration point is valid and initial value of _inputRadius is charged 
-    if(magnitudePoint(_magnetInputCalibration[i]) > 0.0 && (tempRadius < _inputRadius)) {  // Set smallest magnitude as radius
-      _inputRadius = tempRadius; 
+    // Make sure the calibration point is valid and initial value of _inputRadius is charged.
+    // The validity test is CENTER-RELATIVE (4.5.7 review): the radius is a
+    // center-relative quantity, but the old guard only rejected a corner at
+    // exactly the ORIGIN — with a large compensated center (the reason
+    // center compensation exists), a degenerate corner captured essentially
+    // AT the center passed the guard, collapsed the radius toward zero, and
+    // turned any off-center input into clamped full-speed cursor motion.
+    // A corner closer than JOY_MIN_CALIB_RADIUS to the center is invalid;
+    // the default radius stands and the corner is ignored.
+    if(tempRadius >= JOY_MIN_CALIB_RADIUS && (tempRadius < _inputRadius)) {  // Set smallest valid magnitude as radius
+      _inputRadius = tempRadius;
     }
   }
   //Serial.println(_inputRadius);
@@ -566,6 +631,16 @@ pointFloatType LSJoystick::getInputCenter() {
 // Return     : void
 //*********************************//
 void LSJoystick::evaluateInputCenter() {
+  // Averaging a partially-filled buffer would fold uninitialized heap into
+  // the neutral (4.5.7 review): the center chain's 5-sample setTimer
+  // registration can in principle be refused by the pool — the samples are
+  // gathered one per calibrationTimer tick, and a refused registration
+  // leaves the buffer short. Wait for the full complement; the completion
+  // timeout that calls this only fires after the reading window, by which
+  // time a healthy chain has pushed all five (and value-initialized buffer
+  // storage plus this check keep a refused chain from poisoning the
+  // center with garbage).
+  if (_joystickCenterBuffer.getLength() < JOY_CENTER_BUFF_SIZE) return;
   float centerX = 0.0;
   float centerY = 0.0;
   pointFloatType centerPoint = {centerX, centerY};
@@ -591,9 +666,12 @@ void LSJoystick::evaluateInputCenter() {
 //*********************************//
 void LSJoystick::updateInputCenterBuffer() {
   // Single XENSIV read replaces the old updateData()+getY()+getX() trio —
-  // one bounded I2C transaction, one register snapshot.
+  // one bounded I2C transaction, one register snapshot. A failed read is
+  // skipped entirely (hold-last-value): pushing a false {0,0} center
+  // sample would drag the averaged center toward the origin and skew the
+  // neutral for the whole session.
   double xReading = 0.0, yReading = 0.0, zReading = 0.0;
-  _Tlv493dSensor.getMagneticField(&xReading, &yReading, &zReading);
+  if (!readMagneticField(&xReading, &yReading, &zReading)) return;
   _joystickCenterBuffer.pushElement({(float)yReading, (float)xReading});   // Joystick direction mapping
 }
 
@@ -609,8 +687,13 @@ void LSJoystick::updateInputCenterBuffer() {
 //*********************************//
 pointFloatType LSJoystick::getInputMax(int quad) {
   // Single XENSIV read replaces the old updateData()+getY()+getX() trio.
+  // A failed read is NOT a corner sample: {0,0} would replace a real held
+  // deflection with the origin on this step (hold the last good point by
+  // returning the stored corner below unchanged).
   double xReading = 0.0, yReading = 0.0, zReading = 0.0;
-  _Tlv493dSensor.getMagneticField(&xReading, &yReading, &zReading);
+  if (!readMagneticField(&xReading, &yReading, &zReading)) {
+    return (quad >= 0 && quad < JOY_CALIBR_ARRAY_SIZE) ? _magnetInputCalibration[quad] : pointFloatType{0.0f, 0.0f};
+  }
   // Get new x and y reading
   pointFloatType tempCalibrationPoint = {(float)yReading, (float)xReading};
 //  Serial.print("x:");
@@ -682,18 +765,60 @@ void LSJoystick::update() {
   // measurement wait; the XENSIV read path has no wait of its own, but a
   // dragged bus taxes ANY transaction — the backoff stays, µs-level
   // expectations unchanged.)
-  if ((long)(millis() - _busRetryAtMs) < 0) return;
+  // Gate on the backoff STATE, not just the deadline (4.5.7 review — a
+  // millis-wrap freeze otherwise): _busRetryAtMs is only ever assigned in
+  // the escalation branch below, so on a healthy device it stays 0 and the
+  // bare `(long)(millis() - 0) < 0` idiom becomes true for the whole
+  // millis() window [2^31, 2^32) — ~24.9 days of continuous uptime during
+  // which update() would return before ever reading the sensor (a frozen
+  // cursor that only clears at the ~49.7-day wrap). Tying the gate to
+  // `_busRetryIntervalMs > 20` (== isPollBackedOff()) means the deadline
+  // comparison only runs while a backoff is actually in force, where
+  // _busRetryAtMs was just set to a recent millis()+interval (wrap-safe).
+  if (_busRetryIntervalMs > 20 && (long)(millis() - _busRetryAtMs) < 0) return;
 
   unsigned long updateStartUs = micros();
 
-  // Single XENSIV read replaces the old updateData()+getY()+getX() trio and
-  // yields the Z from the same snapshot (the deferred latch below used to
-  // read the old library's cached Z; now it is this call's z directly). One
-  // bounded I2C read per tick, through the vendored Wire.
   double xReading = 0.0, yReading = 0.0, zReading = 0.0;
-  _Tlv493dSensor.getMagneticField(&xReading, &yReading, &zReading);
+  bool readOk = readMagneticField(&xReading, &yReading, &zReading);
+
+  // Measure the transaction and engage the slow-bus backoff on BOTH the
+  // success AND failure paths (4.5.7 review): a wedged bus's FAILED reads
+  // each pay the full ~50 ms Wire timeout, and the early return on failure
+  // used to skip this block entirely — so the backoff never engaged and
+  // update() ran at full poll rate, each tick paying the timeout (and, with
+  // the old leaking recover, allocating). The backoff now spaces failed
+  // reads the same way it spaces slow-but-successful ones; a fast read (the
+  // sensor is answering again) restores the base cadence immediately.
+  unsigned long updateMs = (micros() - updateStartUs) / 1000;
+  if (updateMs > 20) {  // Healthy is ~1 ms; past 20 ms the shared bus is being dragged
+    _busRetryIntervalMs *= 4;
+    if (_busRetryIntervalMs > 60000UL) _busRetryIntervalMs = 60000UL;
+    _busRetryAtMs = millis() + _busRetryIntervalMs;
+  } else {
+    _busRetryIntervalMs = 20;
+  }
+
+  // FAILED READ = HOLD LAST READING (4.5.7 review): the old fork returned
+  // last-good values on a bus error; the ported code discarded the bool, so
+  // every failure read as "magnet at center" — the cursor stuttered to
+  // zero-motion on flaky-bus polls while the user held a corner. On failure
+  // this update does nothing: raw/input/output buffers keep their last good
+  // values and no fault-freeze signal is emitted.
+  if (!readOk) {
+    // Persistent failures re-issue the sensor's master-controlled-mode
+    // configuration (a browned-out sensor returns in power-down while the
+    // library still believes it is measuring — see
+    // JOY_READ_FAIL_REINIT_LIMIT). Bounded and allocation-free (see
+    // recoverSensorConfig), attempted at most once per failure streak.
+    if (_consecReadFails >= JOY_READ_FAIL_REINIT_LIMIT) {
+      _consecReadFails = 0;
+      recoverSensorConfig();
+    }
+    return;
+  }
   // Get the new readings as a point
-  _rawPoint = {(float)yReading, (float)xReading};  // TODO 2025-Feb-25 This should be abstracted to a dedicated function   
+  _rawPoint = {(float)yReading, (float)xReading};  // TODO 2025-Feb-25 This should be abstracted to a dedicated function
   
   _skipInputChange = canSkipInputChange(_rawPoint);
   _joystickRawBuffer.pushElement(_rawPoint);                  // Add raw points to _joystickRawBuffer : DON'T MOVE THIS
@@ -726,15 +851,8 @@ void LSJoystick::update() {
     _outputPoint = processOutputResponse(_inputPoint);        // Process output by applying deadzone, speed control, and linearization
     _joystickOutputBuffer.pushElement(_outputPoint);          // Add new output point to _joystickOutputBuffer    
   }
-
-  unsigned long updateMs = (micros() - updateStartUs) / 1000;
-  if (updateMs > 20) {  // Healthy is ~1 ms; past 20 ms the shared bus is being dragged
-    _busRetryIntervalMs *= 4;
-    if (_busRetryIntervalMs > 60000UL) _busRetryIntervalMs = 60000UL;
-    _busRetryAtMs = millis() + _busRetryIntervalMs;
-  } else {
-    _busRetryIntervalMs = 20;
-  }
+  // (the slow-bus backoff timing block moved up to run on the failure path
+  // too — 4.5.7 review)
 }
 
 //*********************************//
@@ -923,12 +1041,15 @@ pointIntType LSJoystick::applyRadialDeadzone(pointIntType inputPoint, float inpu
 // 
 // Return     : skipInputChange : bool : skip processing if it's true
 //*********************************//
-bool LSJoystick::canSkipInputChange(pointFloatType inputPoint) {      
-  pointFloatType prevInputPoint = _joystickRawBuffer.getLastElement();           // Get the previous point from buffer 
+bool LSJoystick::canSkipInputChange(pointFloatType inputPoint) {
+  pointFloatType prevInputPoint = _joystickRawBuffer.getLastElement();           // Get the previous point from buffer
 
-  // If latest joystick measurement is less than JOY_INPUT_CHANGE_TOLERANCE (0.1 mT), then don't process 
-  bool skipInputChange = abs(_rawPoint.x - prevInputPoint.x) < JOY_INPUT_CHANGE_TOLERANCE 
-                      && abs(_rawPoint.y - prevInputPoint.y) < JOY_INPUT_CHANGE_TOLERANCE;
+  // If latest joystick measurement is less than JOY_INPUT_CHANGE_TOLERANCE (0.1 mT), then don't process
+  // (4.5.7 review): compare the ARGUMENT, not the member — the only caller
+  // passes the same value today, but the function is one call-site change
+  // away from comparing the wrong point.
+  bool skipInputChange = abs(inputPoint.x - prevInputPoint.x) < JOY_INPUT_CHANGE_TOLERANCE
+                      && abs(inputPoint.y - prevInputPoint.y) < JOY_INPUT_CHANGE_TOLERANCE;
 
   return skipInputChange;
 }
