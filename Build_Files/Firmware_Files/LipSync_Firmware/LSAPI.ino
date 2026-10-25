@@ -2005,7 +2005,8 @@ void getCommunicationMode(bool responseEnabled, bool apiEnabled, String optional
 //*********************************//
 void setCommunicationMode(bool responseEnabled, bool apiEnabled, int inputCommunicationMode) {
   String commandKey = "CM";
-  
+  int previousComMode = g_comMode;  // captured BEFORE anything mutates it (4.5.8: the reset-on-change compare must see the old value — the exact ordering bug that killed the OM reset for a year)
+
   if ((inputCommunicationMode >= CONF_COM_MODE_MIN) && (inputCommunicationMode <= CONF_COM_MODE_MAX)) {
     if ((inputCommunicationMode == CONF_COM_MODE_BLE) && (g_operatingMode == CONF_OPERATING_MODE_GAMEPAD)){
       printResponseInt(responseEnabled, apiEnabled, false, 3, "CM,1", true, inputCommunicationMode);    // Return error if user tries to change to Bluetooth mode while in Gamepad mode
@@ -2013,41 +2014,23 @@ void setCommunicationMode(bool responseEnabled, bool apiEnabled, int inputCommun
       // Store first, switch second: a refused store (settings budget,
       // LSMemory) must not flip the live mode the next boot would forget.
       g_comMode = inputCommunicationMode;
-      setCommunicationModeLed(g_comMode);
-      setLedDefault();
       printResponseInt(responseEnabled, apiEnabled, true, 0, "CM,1", true, inputCommunicationMode);
 
-      // The interface hand-off runs ONLY on the success path: a refused or
-      // rejected write leaves g_comMode unchanged, and re-beginning the
-      // current interface for a command the device just refused can block
-      // the serial handler for the full mount wait when the host is away.
-      // 4.5.7 bench fix: before the runtime SoftDevice enable
-      // (btmouse.begin -> Bluefruit.begin), the TIMER3 hang witness must be
-      // demoted off priority 0 — the SD reserves the top priority levels,
-      // and a priority-0 app IRQ across an SD enable deadlocked the enable
-      // on the bench (CM,1:2 -> no ack -> 30 s watchdog death). It stays at
-      // the SD-legal priority for the rest of the boot; initHangWitness
-      // re-picks correctly on the next boot.
-      if (inputCommunicationMode == CONF_COM_MODE_BLE && !needsInitialization) {
-        NVIC_SetPriority(TIMER3_IRQn, 4);
-      }
-      releaseOutputAction();
-      switch(g_comMode) {
-        case CONF_COM_MODE_USB:       // USB Mouse
-          btmouse.end();
-          usbmouse.begin();
-          break;
-        case CONF_COM_MODE_BLE:       // Bluetooth Mouse
-          usbmouse.end();
-          // Same device name as the boot path (4.5.7 review): btmouse.begin()
-          // defaulted to "LipSync" here, so after a runtime USB->BLE switch
-          // the device advertised under a DIFFERENT name than the one the
-          // user paired at boot.
-          {
-            String btName = String("LS_") + String(g_deviceUID);
-            btmouse.begin(btName.c_str());
-          }
-          break;
+      // 4.5.8 BENCH FIX — the live interface hand-off is GONE; a mode change
+      // now works like the operating-mode change: save, ack, software reset,
+      // and the next boot begins the right interface fresh. The bench caught
+      // the live hand-off dead-hanging the firmware twice (session logs
+      // 2026-10-25): the pre-hand-off setLedDefault() called
+      // Bluefruit.connected() on a never-begun SoftDevice (never returned —
+      // no ack, 30 s watchdog death), and even with that guarded, a runtime
+      // SoftDevice enable mid-session remained the fragile path. The reset
+      // flow is the one the bench validated (OM,1:x worked perfectly twice);
+      // the app's reconnect-after-reset flow handles the port drop. Same-mode
+      // writes stay a no-op ack (idempotent, the app's restore flow relies on
+      // it); the menu's mode change already reset (finishChangeMode), so this
+      // is consistent behavior, not new.
+      if (previousComMode != inputCommunicationMode) {
+        softwareReset();  // ack already printed; the reset flow is bench-proven
       }
     } else {
       printResponseInt(responseEnabled, apiEnabled, false, 3, "CM,1", true, inputCommunicationMode);
@@ -3434,7 +3417,9 @@ void doFactoryReset(bool responseEnabled, bool apiEnabled) {
   
   resetMemory();  // Format and reinitialize internal file system 
 
-  setCommunicationMode(false, false, CONF_COM_MODE_DEFAULT);
+  // (4.5.8: the com-mode default is applied by the ALIGNED pair below — the
+  // bare call that used to live here fired setCommunicationMode's reset
+  // mid-chain from a CM=2 state.)
   // 4.5.7 review: with the reset-on-change contract live again, a factory
   // reset from gamepad/safe mode used to fire changeOperatingMode's
   // softwareReset at THIS step — aborting the chain before the FR,1 ack and
@@ -3443,6 +3428,11 @@ void doFactoryReset(bool responseEnabled, bool apiEnabled) {
   // ends in its own deliberate softwareReset.
   g_operatingMode = CONF_OPERATING_MODE_DEFAULT;
   setOperatingMode(false, false, CONF_OPERATING_MODE_DEFAULT);
+  // Same alignment for the com mode (4.5.8): setCommunicationMode now also
+  // resets on change — without the align, a factory reset from a CM=2 state
+  // aborted here.
+  g_comMode = CONF_COM_MODE_DEFAULT;
+  setCommunicationMode(false, false, CONF_COM_MODE_DEFAULT);
   setDebugMode(false, false, CONF_DEBUG_MODE_DEFAULT);
   setJoystickInnerDeadzone(false, false, CONF_JOY_DEADZONE_INNER_DEFAULT);
   setJoystickOuterDeadzone(false, false, CONF_JOY_DEADZONE_OUTER_DEFAULT);
