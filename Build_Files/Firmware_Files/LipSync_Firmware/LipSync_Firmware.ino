@@ -198,7 +198,15 @@ void initHangWitness() {
   NRF_TIMER3->CC[0] = 31250;                       // 1 s
   NRF_TIMER3->SHORTS = TIMER_SHORTS_COMPARE0_CLEAR_Enabled << TIMER_SHORTS_COMPARE0_CLEAR_Pos;
   NRF_TIMER3->INTENSET = TIMER_INTENSET_COMPARE0_Msk;
-  NVIC_SetPriority(TIMER3_IRQn, 0);  // witness v9: HIGHEST priority — a hang that still blocks it can only be PRIMASK-level masking; a hang it now escapes was a lower/equal-priority handler
+  // witness v9 + bench fix: HIGHEST priority — a hang that still blocks it
+  // can only be PRIMASK-level masking. BUT the SoftDevice reserves the top
+  // priority levels when it is enabled: an app IRQ at priority 0 firing
+  // while the SD is up is illegal. On BLE boots the SD was enabled in
+  // beginComOpMode BEFORE this point, so the witness must take an SD-legal
+  // priority there; USB-only boots (SD never enabled) keep priority 0 for
+  // the freeze hunt. needsInitialization == false <=> the stack was begun
+  // (see LSBLE.h).
+  NVIC_SetPriority(TIMER3_IRQn, needsInitialization ? 0 : 4);
   NVIC_ClearPendingIRQ(TIMER3_IRQn);
   NVIC_EnableIRQ(TIMER3_IRQn);
   NRF_TIMER3->TASKS_START = 1;
@@ -243,6 +251,13 @@ int g_scrollNumRuns = 0;
 
 int outputAction;
 bool canOutputAction = true;
+// 4.5.7 bench fix: the hold duration (ms) of the input that is CURRENTLY
+// dispatching, for selectMenuItem's hold-to-confirm gate on the destructive
+// rows. Set fresh on every evaluateOutputAction pass (0 = no input in
+// flight — a stale value can never leak into a later decision), set from
+// the releasing input's elapsed right before performOutputAction, and set
+// to "always pass" by the serial CH,1 path (no hold concept on the wire).
+unsigned long g_menuInputHoldMs = 0;
 bool g_startupCenterReset = true;
 bool g_resetCenterComplete = false;  // global variable for center reset status
 bool g_calibrationError = false;     // Global variable for error in full calibration
@@ -2069,6 +2084,7 @@ void releaseOutputAction() {
 // Return     : void
 //****************************************//
 void evaluateOutputAction(inputStateStruct actionState, unsigned long actionMaxEndTime, int actionSize, const inputActionStruct actionProperty[], int inputClass) {
+  g_menuInputHoldMs = 0;  // fresh per pass — see the global's comment
   // Sip & puff disabled (SD): no new sap action may fire. The hold-release
   // and timer bookkeeping below still runs, so a drag/scroll engaged before
   // the restriction was applied still ends cleanly instead of sticking.
@@ -2179,6 +2195,7 @@ void evaluateOutputAction(inputStateStruct actionState, unsigned long actionMaxE
       // means nothing, and the actionTimer's scheduled releaseAll already
       // cleans up gamepad pulses.
       if (tempActionIndex != CONF_ACTION_NOTHING) {
+        g_menuInputHoldMs = actionState.elapsedTime;  // the hold-to-confirm gate reads this (see selectMenuItem)
         performOutputAction(tempActionIndex);
       }
 

@@ -278,6 +278,18 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 // mid-flow Select cannot hit selectMenuItem's unhandled page id.
 #define CONF_CENTER_RESET_FREEZE_MS 3000
 
+// Bench fix (4.5.7): destructive menu confirms (safe-menu Restart / Factory
+// Reset and their confirm pages) require the select to be HELD for at least
+// this long — the bench caught phantom input walking the safe menu into a
+// factory reset (repeated ~40 ms ghost clicks), and a deliberate destructive
+// action should be a deliberate hold anyway. The threshold must stay BELOW
+// the short window in force (a release at/over it maps to the long-window
+// row and never reaches selectMenuItem), so the gate computes it as half the
+// effective short window, floored at CONF_MENU_CONFIRM_HOLD_MIN_MS — above
+// any glitch class (a phantom click is 2-3 poll ticks), below any legal
+// window. Serial CH,1 presses bypass (no hold concept on the wire).
+#define CONF_MENU_CONFIRM_HOLD_MIN_MS 150
+
 // Upper bound on a honored menu-input freeze (4.5.7 review): the longest
 // real freeze is the ~3 s dwell/transition/center windows, so a remaining
 // freeze longer than this must be a stale/never-set _inputFrozenUntil

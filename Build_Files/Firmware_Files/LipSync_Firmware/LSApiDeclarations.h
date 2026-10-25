@@ -265,6 +265,7 @@ void fillJoystickPipelineDiagnostics(int out[14]);
 // allowlist check every remapped cell passes, and the cell apply/default
 // helpers shared by the SA/SB/SC/GA/GB/GC endpoints.
 void initSwitchActions();
+extern unsigned long g_menuInputHoldMs;  // (4.5.7 bench fix) hold duration of the input currently dispatching — see selectMenuItem's hold-to-confirm gate
 bool switchRemapAllowed(int actionNumber, bool gamepad);  // (4.5.7 review) column-aware: the gamepad cells reject the mouse hold modes
 void sanitizeInputWindows();                              // (4.5.7 review) boot-load validation for WS/WL/WM
 void switchRemapApplyCell(int jack, int window, bool gamepad, int actionNumber);

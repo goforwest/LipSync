@@ -160,6 +160,14 @@ bool LSBLEMouse::isPressed(uint8_t b)
 }
 
 bool LSBLEMouse::isConnected(void) {
+  // 4.5.7 bench fix: Bluefruit.connected() on a SoftDevice that was never
+  // begun (needsInitialization true) HANGS the firmware — the bench caught
+  // it live: CM,1:2 on a USB session reached setLedDefault() BEFORE the
+  // hand-off's btmouse.begin(), isConnected() never returned, no ack ever
+  // printed, and the 30 s watchdog killed the device. Every caller that can
+  // run pre-begin (setLedDefault's BLE branch, btFeedbackLoop) now gets an
+  // honest "not connected" instead of a dead loop.
+  if (needsInitialization) return false;
   return Bluefruit.connected();
 }
 

@@ -2021,6 +2021,16 @@ void setCommunicationMode(bool responseEnabled, bool apiEnabled, int inputCommun
       // rejected write leaves g_comMode unchanged, and re-beginning the
       // current interface for a command the device just refused can block
       // the serial handler for the full mount wait when the host is away.
+      // 4.5.7 bench fix: before the runtime SoftDevice enable
+      // (btmouse.begin -> Bluefruit.begin), the TIMER3 hang witness must be
+      // demoted off priority 0 — the SD reserves the top priority levels,
+      // and a priority-0 app IRQ across an SD enable deadlocked the enable
+      // on the bench (CM,1:2 -> no ack -> 30 s watchdog death). It stays at
+      // the SD-legal priority for the rest of the boot; initHangWitness
+      // re-picks correctly on the next boot.
+      if (inputCommunicationMode == CONF_COM_MODE_BLE && !needsInitialization) {
+        NVIC_SetPriority(TIMER3_IRQn, 4);
+      }
       releaseOutputAction();
       switch(g_comMode) {
         case CONF_COM_MODE_USB:       // USB Mouse
@@ -2990,6 +3000,7 @@ void controlHubMenu(bool responseEnabled, bool apiEnabled, int inputMenuControl)
         screen.activateMenu();
         break;     
       case CONF_MENU_CONTROL_SELECT:
+        g_menuInputHoldMs = 0xFFFFFFFFUL;  // serial presses bypass the hold-to-confirm gate (no hold concept on the wire)
         screen.selectMenuItem();
         break;
       case CONF_MENU_CONTROL_NEXT:
