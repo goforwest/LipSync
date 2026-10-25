@@ -127,6 +127,13 @@ void LSBLEMouse::end(void)
 
 void LSBLEMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t pan)
 {
+  // 4.5.10: the BLE stack comes up on its own task now (see the 16 KB
+  // init task in LipSync_Firmware.ino) — an SVC call on a never-begun or
+  // still-enabling SoftDevice HardFaults, which is a whole boot class
+  // worse than a dropped report. Skip until needsInitialization clears;
+  // the buttons state still mutates, so the first post-init movement
+  // report carries it.
+  if (needsInitialization) return;
   blehid.mouseReport(b, x, y, wheel, pan);
 }
 

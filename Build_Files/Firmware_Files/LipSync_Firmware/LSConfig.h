@@ -30,7 +30,7 @@
 
 #define CONF_LIPSYNC_VERSION_MAJOR  4
 #define CONF_LIPSYNC_VERSION_MINOR  5
-#define CONF_LIPSYNC_VERSION_REV    9
+#define CONF_LIPSYNC_VERSION_REV    10
 
 const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + "." + String(CONF_LIPSYNC_VERSION_MINOR) + "." + String(CONF_LIPSYNC_VERSION_REV);
 
@@ -311,7 +311,23 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 #define CONF_USB_RESTART_MAGIC 0x4C535255    // "LSRU" — the .noinit once-guard value: set right before the USB-recovery
                                              // restart, checked at the next boot so the auto-restart can never loop
 
-#define CONF_UPDATE_MODE_DWELL_MS 500  // Bounded dwell in enterUpdateMode() between the ack, the "Update mode" splash
+#define CONF_UPDATE_MODE_DWELL_MS 500
+
+// 4.5.10 bench fix: the BLE init (Bluefruit.begin -> SoftDevice enable ->
+// GATT table -> HID service -> advertising) runs on ITS OWN FreeRTOS task
+// with this statically-allocated stack. The core's loop task (which runs
+// setup() and loop()) gets a hardcoded 4096-byte stack with no functioning
+// overflow detection, and the BLE boot's kilobytes of extra call depth
+// silently corrupted it -> delayed HardFault -> the BLE boot loop (bench
+// 2026-10-25: gamepad boots work, BLE boots fault at ~2.6-4 s with
+// rst=0x4, pm=0, pt=4 every cycle). 16 KB matches the depth the stackup
+// needs with wide margin; .bss cost against 202 KB free.
+#define CONF_BLE_INIT_TASK_STACK_BYTES 16384
+// Priority 2 == TASK_PRIO_NORMAL (rtos.h): above the loop task (1), below
+// the SoftDevice event handler — the init runs promptly but never preempts
+// SD critical sections.
+#define CONF_BLE_INIT_TASK_PRIORITY 2
+#define CONF_BLE_DEVICE_NAME_SZ 32  // "LS_" + 8-hex-char UID + NUL, with margin  // Bounded dwell in enterUpdateMode() between the ack, the "Update mode" splash
                                         // and the reset into the bootloader: long enough for the ack to reach the host
                                         // over USB and for the OLED framebuffer push to complete (bounded by Wire), so
                                         // the splash is the frame the OLED keeps while the bootloader owns the device

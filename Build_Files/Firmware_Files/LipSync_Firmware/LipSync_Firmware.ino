@@ -18,6 +18,8 @@
 
 #include <WString.h>
 #include <Wire.h>
+#include <FreeRTOS.h>  // 4.5.10: the BLE init task's static allocation (see setup)
+#include <task.h>
 #include "LSUtils.h"
 #include "LSApiDeclarations.h"  // Explicit cross-tab declarations (roadmap item 5) — early so every tab sees them
 #include "LSConfig.h"
@@ -244,6 +246,25 @@ void bootTrailStamp(uint8_t step) {
   writeTrailByte(step);
 }
 
+// 4.5.10 BENCH FIX — the BLE init task. The core's loop task (which runs
+// setup() and loop()) has a hardcoded 4096-byte stack and configCHECK_FOR_
+// STACK_OVERFLOW=1 (mode 1 — misses overflow-and-return), and the BLE boot's
+// only-in-that-path call depth (Bluefruit.begin: SoftDevice enable, GATT
+// table, HID service, advertising assembly — kilobytes) silently corrupted
+// it: a delayed HardFault at ~2.6-4 s into the boot (rst=0x4, pm=0, pt=4 —
+// after the boot-center LED stamps, around readyToUse and the first
+// btmouse.move), instant reset, infinite BLE boot loop. The gamepad boot
+// (no Bluefruit.begin) worked perfectly on the same bench session. The BLE
+// init now runs on its own task with a 16 KB static stack, started at the
+// end of setup; every BLE call site in the loop is guarded so the pre-init
+// window is a no-op window, not a fault window.
+static volatile bool g_bleInitPending = false;   // a BLE boot deferred its init to the task
+static volatile bool g_bleInitDone = false;       // the task finished (success or failure)
+static char g_bleDeviceName[CONF_BLE_DEVICE_NAME_SZ] = {0};  // the advertising name (static: outlives setup's frame)
+static StackType_t g_bleInitStack[CONF_BLE_INIT_TASK_STACK_BYTES / sizeof(StackType_t)];
+static StaticTask_t g_bleInitTCB;
+static volatile bool g_hostHasSpoken = false;     // 4.5.10: the repeating boot header stops at the first host byte
+
 // Joystick module variables and structures
 int acceleration = 0;
 int g_scrollLevel = 0;
@@ -307,6 +328,28 @@ LSUSBMouse usbmouse;   // Create an instance of the USB mouse object
 LSBLEMouse btmouse;    // Create an instance of the BLE mouse object
 LSUSBGamepad gamepad;  // Create an instance of the USB gamepad object
 
+
+//***BLE INIT TASK BODY***//
+// Function   : bleInitTaskBody
+//
+// Description: Runs the full BLE stack bring-up (btmouse.begin ->
+//              initializeBluefruit: SoftDevice enable, DIS, HID, advertising)
+//              on a 16 KB static stack instead of the loop task's 4 KB.
+//              On failure the failing stage's BOOT line has already printed
+//              (initializeBluefruit checks every begin()); needsInitialization
+//              stays true and every guarded call site stays inert. The task
+//              suspends itself — it never returns.
+static void bleInitTaskBody(void* arg) {
+  (void)arg;
+  btmouse.begin(g_bleDeviceName);
+  g_bleInitDone = true;               // completion flag first...
+  if (needsInitialization) {          // ...then the verdict (true = a stage failed)
+    Serial.println(F("BOOT: BLE task FAILED (see stage line above)"));
+  } else {
+    Serial.println(F("BOOT: BLE task up"));
+  }
+  vTaskSuspend(NULL);  // a FreeRTOS task must never return
+}
 
 //***MICROCONTROLLER AND PERIPHERAL CONFIGURATION***//
 // Function   : setup
@@ -534,10 +577,22 @@ void setup() {
     bootTrailStamp(1);  // witness v7: setup complete (the only boot-phase code; deaths are all loop-phase)
   }
 
-  Serial.println(F("BOOT: setup done"));
+  // 4.5.10: the BLE init task starts LAST — after every sensor, screen and
+  // timer init has completed on the loop task's stack, so the two never
+  // contend for stack and the loop's guarded BLE calls stay inert until the
+  // stack is up (needsInitialization is the gate).
+  if (g_bleInitPending) {
+    Serial.println(F("BOOT: BLE task create"));
+    xTaskCreateStatic(bleInitTaskBody, "bleInit",
+                      CONF_BLE_INIT_TASK_STACK_BYTES / sizeof(StackType_t),
+                      NULL, CONF_BLE_INIT_TASK_PRIORITY,
+                      g_bleInitStack, &g_bleInitTCB);
+  }
 
   if (USB_DEBUG) { Serial.print("USBDEBUG: lastRebootReason: "); Serial.println(g_lastRebootReason); }
   if (USB_DEBUG) { Serial.println("USBDEBUG: Setup complete."); }
+
+  Serial.println(F("BOOT: setup done"));
 
 }  // end setup
 
@@ -552,11 +607,42 @@ void setup() {
 // Return     : void
 //*********************************//
 void loop() {
-  static bool firstLoopPass = true;
-  if (firstLoopPass) {
-    firstLoopPass = false;
-    Serial.println(F("BOOT: loop alive"));
+  // 4.5.10: any host byte stops the repeating boot header (below) — the
+  // app's connect sends SETTINGS within milliseconds of opening the port,
+  // so a connected session falls silent after one extra line at most.
+  if (Serial.available() > 0) {
+    g_hostHasSpoken = true;
   }
+
+  // REPEATING BOOT HEADER (4.5.10 bench fix): the one-shot boot trace was
+  // proven insufficient — the app opens the port AFTER the boot, and CDC
+  // output before an open port is discarded, so three sessions of BLE-boot
+  // deaths left the wire silent. The header now repeats every second for
+  // the first 30 s of the boot (or until the host speaks), carrying the
+  // reset reason and the LIVE BLE task state — any serial monitor opened
+  // mid-fault-loop captures the state within one second, and the last line
+  // before a death names the fault's neighborhood.
+  static unsigned long lastBootHeaderMs = 0;
+  if (!g_hostHasSpoken && millis() < 30000UL && (millis() - lastBootHeaderMs >= 1000UL)) {
+    lastBootHeaderMs = millis();
+    int bleState = 0;  // 0 = not a BLE boot
+    if (g_bleInitPending) {
+      if (g_bleInitDone) {
+        bleState = needsInitialization ? 3 : 2;  // 3 = failed, 2 = up
+      } else {
+        bleState = 1;  // task running
+      }
+    }
+    Serial.print(F("BOOT: 4.5.10 rst=0x"));
+    Serial.print(g_lastRebootReason, HEX);
+    Serial.print(F(" pt="));
+    Serial.print(g_bootTrailPrev);
+    Serial.print(F(" pm="));
+    Serial.print(g_hangMarkerPrev);
+    Serial.print(F(" ble="));
+    Serial.println(bleState);
+  }
+
   // Feed the hardware watchdog directly from the live loop (bench
   // 2026-10-18, the unbreakable safe-mode reset cycle): the heartbeat
   // witness proved that in a safe-mode boot the feed's soft timer on the
@@ -1636,9 +1722,12 @@ void beginComOpMode() {
           break;
         case CONF_COM_MODE_BLE:  // Bluetooth Mouse
           {
-            String btName = String("LS_") + String(g_deviceUID);  // Form Bluetooth name using device UID // TODO This may be limited to 15 characters
-            Serial.println(F("BOOT: BLE begin"));
-            btmouse.begin(btName.c_str());
+            // 4.5.10: the name is copied to a STATIC buffer and the init is
+            // DEFERRED to the 16 KB task (started at the end of setup) —
+            // the loop task's 4 KB stack must not carry Bluefruit.begin.
+            snprintf(g_bleDeviceName, sizeof(g_bleDeviceName), "LS_%s", g_deviceUID.c_str());
+            g_bleInitPending = true;
+            Serial.println(F("BOOT: BLE deferred to 16KB task"));
             USBDevice.attach();
           }
           break;
