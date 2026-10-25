@@ -65,6 +65,7 @@ void initializeBluefruit(const char* s) {
   // guarded (isConnected, btFeedbackLoop), no SVC call is made, and the
   // boot trace names the failure instead of faulting.
   if (!Bluefruit.begin()) {
+    g_bleInitStage = 1;
     Serial.println("BOOT: BLE FAILED at SoftDevice enable");
     return;
   }
@@ -75,10 +76,12 @@ void initializeBluefruit(const char* s) {
   bledis.setManufacturer("MakersMakingChange");
   bledis.setModel("LipSync Mouse");
   if (!bledis.begin()) {
+    g_bleInitStage = 2;
     Serial.println("BOOT: BLE FAILED at DIS begin");
     return;
   }
   if (!blehid.begin()) {
+    g_bleInitStage = 3;
     Serial.println("BOOT: BLE FAILED at HID begin");
     return;
   }
@@ -92,10 +95,12 @@ void initializeBluefruit(const char* s) {
   Bluefruit.Advertising.setInterval(32, 244);    // 20 ms - in unit of 0.625 ms (Interval:  fast mode = 20 ms, slow mode = 152.5 ms)
   Bluefruit.Advertising.setFastTimeout(30);      // number of seconds in fast mode
   if (!Bluefruit.Advertising.start(0)) {         // 0 = Don't stop advertising after n seconds
+    g_bleInitStage = 4;
     Serial.println("BOOT: BLE FAILED at advertising start");
     return;
   }
   Serial.println("BOOT: BLE advertising");
+  g_bleInitStage = 5;
   needsInitialization = false;  // FULL SUCCESS ONLY — every guarded call site keys on this
 }
 

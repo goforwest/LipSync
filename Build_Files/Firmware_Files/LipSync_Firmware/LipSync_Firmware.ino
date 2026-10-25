@@ -258,6 +258,7 @@ void bootTrailStamp(uint8_t step) {
 // init now runs on its own task with a 16 KB static stack, started at the
 // end of setup; every BLE call site in the loop is guarded so the pre-init
 // window is a no-op window, not a fault window.
+volatile int g_bleInitStage = 0;                 // 4.5.11: init-task progress/failure stage (see LSApiDeclarations.h)
 static volatile bool g_bleInitPending = false;   // a BLE boot deferred its init to the task
 static volatile bool g_bleInitDone = false;       // the task finished (success or failure)
 static char g_bleDeviceName[CONF_BLE_DEVICE_NAME_SZ] = {0};  // the advertising name (static: outlives setup's frame)
@@ -622,6 +623,17 @@ void loop() {
   // reset reason and the LIVE BLE task state — any serial monitor opened
   // mid-fault-loop captures the state within one second, and the last line
   // before a death names the fault's neighborhood.
+  // 4.5.11: the BLE boot's deferred USB attach — once, the moment the BLE
+  // task reports (success or failure), or after the fallback so serial
+  // recovery is always reachable.
+  static bool bleUsbAttached = false;
+  if (g_bleInitPending && !bleUsbAttached &&
+      (g_bleInitDone || millis() >= CONF_BLE_INIT_USB_ATTACH_FALLBACK_MS)) {
+    bleUsbAttached = true;
+    USBDevice.attach();
+    Serial.println(F("BOOT: USB attach (BLE boot)"));
+  }
+
   static unsigned long lastBootHeaderMs = 0;
   if (!g_hostHasSpoken && millis() < 30000UL && (millis() - lastBootHeaderMs >= 1000UL)) {
     lastBootHeaderMs = millis();
@@ -633,14 +645,16 @@ void loop() {
         bleState = 1;  // task running
       }
     }
-    Serial.print(F("BOOT: 4.5.10 rst=0x"));
+    Serial.print(F("BOOT: 4.5.11 rst=0x"));
     Serial.print(g_lastRebootReason, HEX);
     Serial.print(F(" pt="));
     Serial.print(g_bootTrailPrev);
     Serial.print(F(" pm="));
     Serial.print(g_hangMarkerPrev);
     Serial.print(F(" ble="));
-    Serial.println(bleState);
+    Serial.print(bleState);
+    Serial.print(F(" st="));
+    Serial.println(g_bleInitStage);  // 1=SD enable 2=DIS 3=HID 4=advertising 5=success
   }
 
   // Feed the hardware watchdog directly from the live loop (bench
@@ -1725,10 +1739,16 @@ void beginComOpMode() {
             // 4.5.10: the name is copied to a STATIC buffer and the init is
             // DEFERRED to the 16 KB task (started at the end of setup) —
             // the loop task's 4 KB stack must not carry Bluefruit.begin.
+            // 4.5.11: the USB ATTACH is deferred too — Seeed's core lacks
+            // the Adafruit USE_TINYUSB hooks (usb_softdevice_pre/post_enable
+            // are called in bluefruit.cpp but defined nowhere in this core),
+            // so nothing coordinates an attached USB device with the
+            // SoftDevice enable; the stock boot order is SD first. The
+            // loop attaches once the BLE task reports (or the fallback
+            // timer expires, keeping serial recovery reachable).
             snprintf(g_bleDeviceName, sizeof(g_bleDeviceName), "LS_%s", g_deviceUID.c_str());
             g_bleInitPending = true;
             Serial.println(F("BOOT: BLE deferred to 16KB task"));
-            USBDevice.attach();
           }
           break;
       }

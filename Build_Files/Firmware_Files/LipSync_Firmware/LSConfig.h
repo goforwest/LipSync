@@ -30,7 +30,7 @@
 
 #define CONF_LIPSYNC_VERSION_MAJOR  4
 #define CONF_LIPSYNC_VERSION_MINOR  5
-#define CONF_LIPSYNC_VERSION_REV    10
+#define CONF_LIPSYNC_VERSION_REV    11
 
 const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + "." + String(CONF_LIPSYNC_VERSION_MINOR) + "." + String(CONF_LIPSYNC_VERSION_REV);
 
@@ -327,7 +327,15 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 // the SoftDevice event handler — the init runs promptly but never preempts
 // SD critical sections.
 #define CONF_BLE_INIT_TASK_PRIORITY 2
-#define CONF_BLE_DEVICE_NAME_SZ 32  // "LS_" + 8-hex-char UID + NUL, with margin  // Bounded dwell in enterUpdateMode() between the ack, the "Update mode" splash
+#define CONF_BLE_DEVICE_NAME_SZ 32  // "LS_" + 8-hex-char UID + NUL, with margin
+
+// 4.5.11: on BLE boots the USB attach waits for the BLE init task's verdict
+// (the SoftDevice enable is the fragile call, and Seeed's core lacks the
+// Adafruit USE_TINYUSB coordination hooks between an attached USB device and
+// the SD enable — the stock boot order is SD first). On a FAILED init the
+// attach still happens after this fallback so serial recovery (CM,1:1) is
+// always reachable.
+#define CONF_BLE_INIT_USB_ATTACH_FALLBACK_MS 10000  // Bounded dwell in enterUpdateMode() between the ack, the "Update mode" splash
                                         // and the reset into the bootloader: long enough for the ack to reach the host
                                         // over USB and for the OLED framebuffer push to complete (bounded by Wire), so
                                         // the splash is the frame the OLED keeps while the bootloader owns the device

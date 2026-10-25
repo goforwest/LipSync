@@ -266,6 +266,12 @@ void fillJoystickPipelineDiagnostics(int out[14]);
 // helpers shared by the SA/SB/SC/GA/GB/GC endpoints.
 void initSwitchActions();
 extern unsigned long g_menuInputHoldMs;  // (4.5.7 bench fix) hold duration of the input currently dispatching — see selectMenuItem's hold-to-confirm gate
+// 4.5.11 bench: the BLE init task's progress/failure stage, printed in the
+// repeating boot header (the stage's own Serial line is discarded while the
+// port is closed). Codes: 0 = not started/running, 1 = SoftDevice enable
+// failed (Bluefruit.begin), 2 = DIS begin failed, 3 = HID begin failed,
+// 4 = advertising start failed, 5 = full success.
+extern volatile int g_bleInitStage;
 bool switchRemapAllowed(int actionNumber, bool gamepad);  // (4.5.7 review) column-aware: the gamepad cells reject the mouse hold modes
 void sanitizeInputWindows();                              // (4.5.7 review) boot-load validation for WS/WL/WM
 void switchRemapApplyCell(int jack, int window, bool gamepad, int actionNumber);
