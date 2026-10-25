@@ -48,32 +48,10 @@ class LSBLEMouse {
     void mouseReport(signed char b, signed char x, signed char y, signed char wheel = 0, signed char pan = 0);
 };
 
-typedef struct
-{
-  uint8_t modifiers;
-  uint8_t reserved;
-  uint8_t keys[6];
-} btKeyReport;
-
-
-class LSBLEKeyboard : public Print
-{
-  private:
-    btKeyReport _keyReport;
-    void keyboardReport(btKeyReport* keys);
-    uint8_t const _ascii2keycode[128][2] = {HID_ASCII_TO_KEYCODE};
-  public:
-    inline LSBLEKeyboard(void);
-    inline void begin(const char *s = "LipSync");
-    inline void end(void);
-    inline size_t write(uint8_t k);
-    inline size_t write(const uint8_t *buffer, size_t size);
-    inline size_t press(uint8_t m, uint8_t k);
-    inline size_t release(uint8_t m, uint8_t k);
-    inline void releaseAll(void);
-    inline bool isConnected(void);
-};
-
+// LSBLEKeyboard removed (4.5.7 review): never instantiated anywhere — a
+// v4.0-era leftover whose keyboardReport() carried a delay(2) per report,
+// the same copy-paste-invitation class that motivated 4.5.4's LSUSBKeyboard
+// removal. (The btKeyReport struct went with it.)
 
 void initializeBluefruit(const char* s) {
   Bluefruit.begin();
@@ -187,117 +165,7 @@ bool LSBLEMouse::isConnected(void) {
 
 
 
-/*****************************
-     KEYBOARD SECTION
- *****************************/
-
-LSBLEKeyboard::LSBLEKeyboard(void)
-{
-}
-
-void LSBLEKeyboard::begin(const char* s)
-{
-  if (needsInitialization) {
-    initializeBluefruit(s);
-    needsInitialization = false;
-  }
-}
-
-void LSBLEKeyboard::end(void)
-{
-}
-
-void LSBLEKeyboard::keyboardReport(btKeyReport* keys)
-{
-  blehid.keyboardReport(keys->modifiers, keys->keys);
-  delay(2);
-}
-
-
-size_t LSBLEKeyboard::press(uint8_t m, uint8_t k)
-{
-  uint8_t i;
-  _keyReport.modifiers = m;
-
-  // Add key if the it's not already present and if there is an empty spot.
-  if (_keyReport.keys[0] != k && _keyReport.keys[1] != k &&
-      _keyReport.keys[2] != k && _keyReport.keys[3] != k &&
-      _keyReport.keys[4] != k && _keyReport.keys[5] != k) {
-
-    for (i = 0; i < 6; i++) {
-      if (_keyReport.keys[i] == 0x00) {
-        _keyReport.keys[i] = k;
-        break;
-      }
-    }
-    if (i == 6) {
-      setWriteError();
-      return 0;
-    }
-  }
-  keyboardReport(&_keyReport);
-  return 1;
-}
-
-
-size_t LSBLEKeyboard::release(uint8_t m, uint8_t k)
-{
-  uint8_t i;
-  _keyReport.modifiers = 0x00;
-  // Check to see if the key is present and clear it if it exists.
-  for (i = 0; i < 6; i++) {
-    if (0 != k && _keyReport.keys[i] == k) {
-      _keyReport.keys[i] = 0x00;
-    }
-  }
-  keyboardReport(&_keyReport);
-  return 1;
-}
-
-void LSBLEKeyboard::releaseAll(void)
-{
-  _keyReport.keys[0] = 0;
-  _keyReport.keys[1] = 0;
-  _keyReport.keys[2] = 0;
-  _keyReport.keys[3] = 0;
-  _keyReport.keys[4] = 0;
-  _keyReport.keys[5] = 0;
-  _keyReport.modifiers = 0;
-  keyboardReport(&_keyReport);
-}
-
-size_t LSBLEKeyboard::write(uint8_t c)
-{
-  uint8_t keycode = 0;
-  uint8_t modifier = 0;
-  uint8_t uch = (uint8_t)c;
-
-  if (_ascii2keycode[c][0]) {
-    modifier = KEYBOARD_MODIFIER_LEFTSHIFT;
-  }
-
-  keycode = _ascii2keycode[uch][1];
-
-  uint8_t p = press(modifier, keycode);  // Keydown
-  release(modifier, keycode);            // Keyup
-  return p;              // Return the result of press()
-}
-
-size_t LSBLEKeyboard::write(const uint8_t *buffer, size_t size) {
-  size_t n = 0;
-  while (size--) {
-    if (*buffer != '\r') {
-      if (write(*buffer)) {
-        n++;
-      } else {
-        break;
-      }
-    }
-    buffer++;
-  }
-  return n;
-}
-
-bool LSBLEKeyboard::isConnected(void) {
-  return Bluefruit.connected();
-}
+// (KEYBOARD SECTION removed with LSBLEKeyboard — 4.5.7 review:
+//  never instantiated, and its keyboardReport carried delay(2) per
+//  report — the copy-paste-invitation class 4.5.4's LSUSBKeyboard
+//  removal set the precedent for)

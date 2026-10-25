@@ -72,8 +72,7 @@ class LSUSBMouse {
     inline bool isReady(void);
     inline bool isConnected(void);
     bool usbRetrying = false;
-    bool showTestPage = false;
-    bool timedOut = false;
+    bool timedOut = false;  // (showTestPage removed 4.5.7 review: write-only since it was added)
     // HID telemetry (bench 2026-10-16: cursor dead on 4.5.0 while the ready
     // page showed, sensor read fine and serial worked — the one fact that
     // splits "reports never attempted" from "reports attempted and refused"
@@ -209,8 +208,10 @@ void LSUSBMouse::begin(void)
     this->usb_hid.setPollInterval(1);
     this->usb_hid.setReportDescriptor(mouse_desc_hid_report, sizeof(mouse_desc_hid_report));
     //this->usb_hid.setStringDescriptor(MOUSE_DESCRIPTOR); // TODO this causes TinyUSB to crash 2025-Jan-20
-    this->usb_hid.begin();
-    _begun = true;
+    // Gate _begun on the returned bool (4.5.7 review): Adafruit_USBD_HID::begin()
+    // can fail (addInterface false) — a permanently believed-but-unregistered
+    // interface would never retry and never report.
+    _begun = this->usb_hid.begin();
   }
   if (USB_DEBUG) { Serial.println("USBDEBUG: Initializing USB HID Mouse");  }
 
@@ -293,7 +294,6 @@ void LSUSBMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t 
       // the latch keeps the handoff (and any nested report from begin()) from
       // recursing.
       timedOut = true;
-      showTestPage = true;
       usbCheckConnection();
     }
     return;
@@ -308,8 +308,8 @@ void LSUSBMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t 
       if (absX > maxAbsReport) maxAbsReport = absX;
       if (absY > maxAbsReport) maxAbsReport = absY;
     }
+    timedOut = false;  // Only an ACCEPTED report clears the episode (4.5.7 review): a ready-but-refused tick is still an outage symptom
   }
-  timedOut = false;
 }
 
 void LSUSBMouse::move(int8_t x, int8_t y) 
@@ -387,8 +387,7 @@ void LSUSBGamepad::begin(void)
   // Register the HID interface exactly once — see LSUSBMouse::begin(): a
   // retry must never re-add the interface to the USB configuration.
   if (!_begun) {
-    this->usb_hid.begin();
-    _begun = true;
+    _begun = this->usb_hid.begin();  // Gate on the returned bool — see LSUSBMouse::begin() (4.5.7 review)
   }
 
   unsigned long timerHidTimeoutBegin = millis();

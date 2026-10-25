@@ -211,18 +211,22 @@ bool processSerialMessage(String commandString, bool settingsFlag) {
 
   if (settingsFlag == false && commandString == "SETTINGS") {
     // SETTINGS received
+    bootTrailStamp(7);  // witness v7: an actual serial message is being dispatched (stamped HERE, not on every idle loop pass, so pt=7 names a real dispatch site — 4.5.7 review)
     printResponseInt(true, true, true, 0, commandString, false, 0);
     return true;  // Enter settings mode
   } else if (settingsFlag == true && commandString == "EXIT") {
+    bootTrailStamp(7);  // witness v7: an actual serial message is being dispatched
     // EXIT received
     printResponseInt(true, true, true, 0, commandString, false, 0);
     return false;  // Leave settings mode
   } else if (settingsFlag == true && isValidCommandFormat(commandString)) {
+    bootTrailStamp(7);  // witness v7: an actual serial message is being dispatched
     performCommand(commandString);  // Valid command — run it and leave settings mode
     return false;
   }
 
   // Unrecognized input in either mode
+  bootTrailStamp(7);  // witness v7: an actual serial message is being dispatched (unrecognized shape, but a dispatch)
   printResponseInt(true, true, false, 0, commandString, false, 0);
   return false;
 }
@@ -238,7 +242,6 @@ bool processSerialMessage(String commandString, bool settingsFlag) {
 // Return     : bool : The settings-mode flag to carry to the next pass
 //*********************************************************************//
 bool serialSettings(bool enabled) {
-  bootTrailStamp(7);  // witness v9: a serial command is being dispatched (the freeze lands between commands when the app is connected)
   bool settingsFlag = enabled;
 
   while (Serial.available() > 0) {
@@ -383,19 +386,34 @@ bool isValidCommandParameter(String inputParameterString) {
 //              It returns true if the string includes all numeric characters.
 //              It returns false if the string includes a non numeric character.
 //
+//              (4.5.7 review) A real numeric grammar, not a per-character
+//              test: the old form accepted '+'/'-'/'.' ANYWHERE, so
+//              "1-2-3" and "1.2.3" passed and relied on downstream range
+//              checks to catch the toInt() truncations. Optional single
+//              leading sign, digits, at most one decimal point.
+//
 // Parameters :  str : String : The input string
 //
 // Return     : boolean
 //******************************************//
 boolean isStrNumber(String str) {
-  boolean isNumber = false;
-  for (byte i = 0; i < str.length(); i++) {
-    isNumber = isDigit(str.charAt(i)) || str.charAt(i) == '+' || str.charAt(i) == '.' || str.charAt(i) == '-';
-    if (!isNumber) {
-      return false; // Non numeric character detected
-    }
+  if (str.length() == 0) return false;
+  unsigned int startIndex = 0;
+  boolean hasDecimal = false;
+  if (str.charAt(0) == '-' || str.charAt(0) == '+') {
+    startIndex = 1;
+    if (str.length() == 1) return false;  // A bare sign is not a number
   }
-  return true; // All numeric characters detected
+  for (unsigned int i = startIndex; i < str.length(); i++) {
+    char c = str.charAt(i);
+    if (isDigit(c)) continue;
+    if (c == '.' && !hasDecimal) {
+      hasDecimal = true;
+      continue;
+    }
+    return false;  // Non numeric character detected
+  }
+  return true;  // Valid numeric grammar
 }
 
 //***CHECK IF CHAR IS A VALID DELIMITER FUNCTION***//
@@ -593,7 +611,7 @@ int getOperatingMode(bool responseEnabled, bool apiEnabled) {
   int tempOperatingMode;
   tempOperatingMode = mem.readInt(CONF_SETTINGS_FILE, commandKey);
 
-  if ((tempOperatingMode < CONF_OPERATING_MODE_MIN) || (tempOperatingMode > CONF_OPERATING_MODE_MAX)) {
+  if ((tempOperatingMode < CONF_OPERATING_MODE_MIN) || (tempOperatingMode > CONF_OPERATING_MODE_SETTABLE_MAX)) {  // SAFE is not a stored value (4.5.7 review)
     tempOperatingMode = CONF_OPERATING_MODE_DEFAULT;
     mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempOperatingMode);
   }
@@ -636,7 +654,7 @@ void getOperatingMode(bool responseEnabled, bool apiEnabled, String optionalPara
 void setOperatingMode(bool responseEnabled, bool apiEnabled, int inputOperatingMode) {
   String commandKey = "OM";
 
-  if ((inputOperatingMode >= CONF_OPERATING_MODE_MIN) && (inputOperatingMode <= CONF_OPERATING_MODE_MAX)) {   
+  if ((inputOperatingMode >= CONF_OPERATING_MODE_MIN) && (inputOperatingMode <= CONF_OPERATING_MODE_SETTABLE_MAX)) {  // SETTABLE_MAX excludes SAFE (4.5.7 review)
     if ((g_comMode == CONF_COM_MODE_BLE) && (inputOperatingMode == CONF_OPERATING_MODE_GAMEPAD)){
       printResponseInt(responseEnabled, apiEnabled, false, 3, "OM,1", true, inputOperatingMode);    // Return error if user tries to change to Bluetooth mode while in Gamepad mode
     } else if (mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputOperatingMode)) {
@@ -644,7 +662,18 @@ void setOperatingMode(bool responseEnabled, bool apiEnabled, int inputOperatingM
       // refused write must never report SUCCESS or change the live mode, or
       // the app's readout and the device would disagree after a reboot.
       printResponseInt(responseEnabled, apiEnabled, true, 0, "OM,1", true, inputOperatingMode);
-      g_operatingMode = inputOperatingMode;
+      // THE 4.5.7 FIX: g_operatingMode is NOT assigned here anymore.
+      // changeOperatingMode() compares its argument against g_operatingMode
+      // and resets the device when they differ — assigning the global
+      // BEFORE the call (4.1.0 left the call commented out; uncommenting
+      // it without reordering) made the comparison always true, so the
+      // reset-on-change NEVER fired: a serial OM,1:2 left the gamepad HID
+      // interface never-begun while the live mode claimed gamepad — every
+      // report went out the mouse interface (the release toolchain's
+      // TinyUSB hardwires instance 0), with telemetry counting the
+      // misrouted reports as successes. The global now flips only inside
+      // changeOperatingMode, exactly as its contract reads; the ack above
+      // reaches the host during the reset's deliberate shutdown dwell.
       changeOperatingMode(inputOperatingMode);
     } else {
       printResponseInt(responseEnabled, apiEnabled, false, 3, "OM,1", true, inputOperatingMode);
@@ -653,9 +682,6 @@ void setOperatingMode(bool responseEnabled, bool apiEnabled, int inputOperatingM
   else {
     printResponseInt(responseEnabled, apiEnabled, false, 3, "OM,1", true, inputOperatingMode);
   }
-
-  // TODO: move softwareReset() here instead of in changeOperatingMode?
-
 }
 //***SET OPERATING MODE STATE API FUNCTION***//
 // Function   : setOperatingMode
@@ -1009,6 +1035,33 @@ void getJoystickInitialization(bool responseEnabled, bool apiEnabled, String opt
 // Return     : void
 //*********************************//
 void setJoystickInitialization(bool responseEnabled, bool apiEnabled) {
+  // 4.5.7 review: refuse up front when the joystick sensor is absent — the
+  // chain runs on calibrationTimer, which loop() only pumps when the sensor
+  // is connected, so on a sensorless safe boot the registration succeeded,
+  // the chain never fired, canOutputAction stayed false forever, and EVERY
+  // input (buttons, switches, sip & puff, the safe-mode menu itself) was
+  // dead until reboot — silently, with no ack and no FAIL. There is
+  // nothing to center without the sensor; answer FAIL,3 so the host's
+  // waiter resolves honestly.
+  if (!g_joystickSensorConnected) {
+    canOutputAction = true;
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "IN,1", true, 1);
+    return;
+  }
+  // 4.5.7 review: one timer chain per shared id set — a center started
+  // during an in-flight CALIBRATION overwrote the shared
+  // calibrationTimerId[1] reading-timer variable, so the corner's
+  // final-run check (which keys the flash persistence AND the CA,n ack
+  // line) read the center's 5-run timer, never matched the calibration's
+  // 10th run, and that corner silently never persisted while step 6 still
+  // reported "calibrated". Refuse honestly (the calibration's own internal
+  // step-5 center bypasses via g_calibrationCenterStep; overlapping
+  // CENTERS stay allowed by design — their completions are driven by their
+  // own pool slots, so only LED cosmetics share the stale id).
+  if (g_calibrationRunning && !g_calibrationCenterStep) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "IN,1", true, 1);
+    return;
+  }
   // Record who initiated the center (4.5.2, wire hygiene): the completion's
   // IN,1 line is an ack (SUCCESS) only when the serial API asked for it —
   // a device-initiated center (boot auto-center, Hub-menu Center Reset,
@@ -1064,13 +1117,25 @@ void getJoystickCalibration(bool responseEnabled, bool apiEnabled) {
   String commandKey;
   pointFloatType calibrationPointArray[5];
   calibrationPointArray[0] = js.getInputCenter();
+  // 4.5.7 review: while a full calibration is IN FLIGHT, this read must not
+  // touch the live corner slots — getInputMax is a max-accumulator against
+  // the stored slot, so a CA,0/EX read landing inside a corner's 2 s
+  // measurement window replaced the accumulating slot with the OLD stored
+  // corner, and the polluted corner was then persisted at window end (the
+  // user told "calibrated" while the corner silently kept its
+  // pre-calibration value). The read still answers the STORED values.
+  bool calibrationInFlight = g_calibrationRunning;
   for (int i = 1; i < 5; i++)
   {
     commandKey = "CA" + String(i);
     calibrationPointArray[i] = mem.readPoint(CONF_SETTINGS_FILE, commandKey);
-    js.setInputMax(i, calibrationPointArray[i]);
+    if (!calibrationInFlight) {
+      js.setInputMax(i, calibrationPointArray[i]);
+    }
   }
-  js.setMinimumRadius();                                                                              // Update the minimum cursor operating radius 
+  if (!calibrationInFlight) {
+    js.setMinimumRadius();  // Update the minimum cursor operating radius
+  }
   printResponseFloatPointArray(responseEnabled, apiEnabled, true, 0, "CA,0", true, "", 5, ',', calibrationPointArray);
 
 }
@@ -1105,6 +1170,33 @@ void getJoystickCalibration(bool responseEnabled, bool apiEnabled, String option
 // Return     : void
 //*********************************//
 void setJoystickCalibration(bool responseEnabled, bool apiEnabled) {
+  // 4.5.7 review: same run-gate refusal as setJoystickInitialization — the
+  // chain never fires on a sensorless boot (calibrationTimer is only pumped
+  // when the joystick sensor is connected), and this function must bail
+  // BEFORE js.clear() wipes the stored/live calibration and
+  // calibrationEndsByClosingMenu arms the menu close for a flow that will
+  // never run.
+  if (!g_joystickSensorConnected) {
+    canOutputAction = true;
+    screen.calibrationEndsByClosingMenu(false);
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "CA,1", true, 1);
+    return;
+  }
+  // 4.5.7 review: one calibration at a time — a second CA,1:1 while a run
+  // is in flight (a host timeout-retry lands ~4 s in; the first corner line
+  // arrives ~4.4 s in) used to js.clear() the accumulating corners
+  // mid-run, register a second concurrent chain, interleave two corner
+  // sequences on the wire, and let last-writer-wins persistence fight over
+  // the shared corner slots. Refuse honestly; the running chain finishes.
+  if (g_calibrationRunning) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "CA,1", true, 1);
+    return;
+  }
+  // Set at ACCEPTANCE, not at step 0 (4.5.7 review): the chain starts
+  // CONF_JOY_CALIB_START_DELAY (1 s) after this command, and CA,1 has no
+  // immediate ack — a host retry inside that window used to pass the
+  // step-0-set flag, js.clear() the accumulating state, and double-chain.
+  g_calibrationRunning = true;
   js.clear();                                                                                           // Clear previous calibration values
   // The initiator rides the chain's payload (CONF_CALIB_API_FLAG): the
   // per-corner lines print SUCCESS only for a host-requested calibration
@@ -1937,7 +2029,14 @@ void setCommunicationMode(bool responseEnabled, bool apiEnabled, int inputCommun
           break;
         case CONF_COM_MODE_BLE:       // Bluetooth Mouse
           usbmouse.end();
-          btmouse.begin();
+          // Same device name as the boot path (4.5.7 review): btmouse.begin()
+          // defaulted to "LipSync" here, so after a runtime USB->BLE switch
+          // the device advertised under a DIFFERENT name than the one the
+          // user paired at boot.
+          {
+            String btName = String("LS_") + String(g_deviceUID);
+            btmouse.begin(btName.c_str());
+          }
           break;
       }
     } else {
@@ -2000,13 +2099,18 @@ void setCommunicationMode(bool responseEnabled, bool apiEnabled, String optional
 //
 // Return     : void
 void toggleCommunicationMode(bool responseEnabled, bool apiEnabled) {
-  if (g_comMode < CONF_COM_MODE_MAX) {
-    g_comMode++;
-  }
-  else {
-    g_comMode = CONF_COM_MODE_MIN;
-  }
-  setCommunicationMode(responseEnabled, apiEnabled, g_comMode);
+  // 4.5.7 review: the live global used to be incremented BEFORE
+  // setCommunicationMode validated, and the wrap landed on
+  // CONF_COM_MODE_NONE (0) — a mode the setter accepts and persists but
+  // whose hand-off switch has no case (no interface begun) and whose boot
+  // path begins no HID: one extra press of a CHANGE_MODE-mapped switch
+  // silently killed the cursor and survived a power cycle. The toggle now
+  // computes the candidate locally, wraps BLE -> USB (never None), and
+  // leaves the global to setCommunicationMode's success path (a rejected
+  // BLE-in-gamepad toggle no longer leaves g_comMode claiming a mode the
+  // interfaces never entered).
+  int nextComMode = (g_comMode >= CONF_COM_MODE_MAX) ? CONF_COM_MODE_USB : (g_comMode + 1);
+  setCommunicationMode(responseEnabled, apiEnabled, nextComMode);
 }
 
 //***GET SOUND MODE STATE FUNCTION***//
@@ -2581,9 +2685,14 @@ void setInputWindowShort(bool responseEnabled, bool apiEnabled, unsigned long in
   String commandKey = "WS";
   unsigned long longEff = (g_inputWindowLongMs > 0) ? g_inputWindowLongMs : CONF_INPUT_WINDOW_LONG_DEFAULT_MS;
   unsigned long newEff = (inputWindowMs > 0) ? inputWindowMs : CONF_INPUT_WINDOW_SHORT_DEFAULT_MS;
-  if (((inputWindowMs == 0) ||
-       (inputWindowMs >= CONF_INPUT_WINDOW_SHORT_MIN_MS && inputWindowMs <= CONF_INPUT_WINDOW_SHORT_MAX_MS && newEff < longEff))
-      && mem.writeInt(CONF_SETTINGS_FILE, commandKey, (int)inputWindowMs)) {
+  // The reset-to-default (0) path is validated like any other value
+  // (4.5.7 review): the old `inputWindowMs == 0 ||` arm short-circuited the
+  // ordering check, so a legal sequence (WS,1:200; WL,1:400; WS,1:0)
+  // produced effective short=1000 > long=400 — an inverted window set
+  // where every quick puff matched the MAX row instead of the short one.
+  bool rangeOk = (inputWindowMs == 0) ||
+                 (inputWindowMs >= CONF_INPUT_WINDOW_SHORT_MIN_MS && inputWindowMs <= CONF_INPUT_WINDOW_SHORT_MAX_MS);
+  if (rangeOk && newEff < longEff && mem.writeInt(CONF_SETTINGS_FILE, commandKey, (int)inputWindowMs)) {
     // A refused store (settings budget, LSMemory) reports FAIL,3 and leaves
     // the live window untouched — all three window setters share this.
     g_inputWindowShortMs = (inputWindowMs > 0) ? inputWindowMs : 0;
@@ -2638,9 +2747,10 @@ void setInputWindowLong(bool responseEnabled, bool apiEnabled, unsigned long inp
   unsigned long shortEff = (g_inputWindowShortMs > 0) ? g_inputWindowShortMs : CONF_INPUT_WINDOW_SHORT_DEFAULT_MS;
   unsigned long maxEff = (g_inputWindowMaxMs > 0) ? g_inputWindowMaxMs : CONF_INPUT_WINDOW_MAX_DEFAULT_MS;
   unsigned long newEff = (inputWindowMs > 0) ? inputWindowMs : CONF_INPUT_WINDOW_LONG_DEFAULT_MS;
-  if (((inputWindowMs == 0) ||
-       (inputWindowMs >= CONF_INPUT_WINDOW_LONG_MIN_MS && inputWindowMs <= CONF_INPUT_WINDOW_LONG_MAX_MS && newEff > shortEff && newEff < maxEff))
-      && mem.writeInt(CONF_SETTINGS_FILE, commandKey, (int)inputWindowMs)) {
+  // Reset path validated like any other value — see setInputWindowShort (4.5.7 review).
+  bool rangeOk = (inputWindowMs == 0) ||
+                 (inputWindowMs >= CONF_INPUT_WINDOW_LONG_MIN_MS && inputWindowMs <= CONF_INPUT_WINDOW_LONG_MAX_MS);
+  if (rangeOk && newEff > shortEff && newEff < maxEff && mem.writeInt(CONF_SETTINGS_FILE, commandKey, (int)inputWindowMs)) {
     // See setInputWindowShort: a refused store reports FAIL,3.
     g_inputWindowLongMs = (inputWindowMs > 0) ? inputWindowMs : 0;
     printResponseInt(responseEnabled, apiEnabled, true, 0, "WL,1", true, (int)newEff);
@@ -2693,9 +2803,10 @@ void setInputWindowMax(bool responseEnabled, bool apiEnabled, unsigned long inpu
   String commandKey = "WM";
   unsigned long longEff = (g_inputWindowLongMs > 0) ? g_inputWindowLongMs : CONF_INPUT_WINDOW_LONG_DEFAULT_MS;
   unsigned long newEff = (inputWindowMs > 0) ? inputWindowMs : CONF_INPUT_WINDOW_MAX_DEFAULT_MS;
-  if (((inputWindowMs == 0) ||
-       (inputWindowMs >= CONF_INPUT_WINDOW_MAX_MIN_MS && inputWindowMs <= CONF_INPUT_WINDOW_MAX_MAX_MS && newEff > longEff))
-      && mem.writeInt(CONF_SETTINGS_FILE, commandKey, (int)inputWindowMs)) {
+  // Reset path validated like any other value — see setInputWindowShort (4.5.7 review).
+  bool rangeOk = (inputWindowMs == 0) ||
+                 (inputWindowMs >= CONF_INPUT_WINDOW_MAX_MIN_MS && inputWindowMs <= CONF_INPUT_WINDOW_MAX_MAX_MS);
+  if (rangeOk && newEff > longEff && mem.writeInt(CONF_SETTINGS_FILE, commandKey, (int)inputWindowMs)) {
     // See setInputWindowShort: a refused store reports FAIL,3.
     g_inputWindowMaxMs = (inputWindowMs > 0) ? inputWindowMs : 0;
     printResponseInt(responseEnabled, apiEnabled, true, 0, "WM,1", true, (int)newEff);
@@ -2753,8 +2864,10 @@ String getSwitchAction(bool responseEnabled, bool apiEnabled, String commandKey)
       // foreign settings file, but the whole point of the allowlist is that
       // one switch press can never erase settings or restart the device —
       // so a stored triple that fails it falls back to the compiled
-      // factory mapping instead of loading the forbidden cells.
-      if (!switchRemapAllowed(cells[0]) || !switchRemapAllowed(cells[1]) || !switchRemapAllowed(cells[2])) {
+      // factory mapping instead of loading the forbidden cells. The check
+      // is column-aware (4.5.7 review): a gamepad-column DRAG/SCROLL cell
+      // wedges the whole input path — those fall back too.
+      if (!switchRemapAllowed(cells[0], gamepad) || !switchRemapAllowed(cells[1], gamepad) || !switchRemapAllowed(cells[2], gamepad)) {
         for (int w = 0; w < CONF_SWITCH_REMAP_ROWS_PER_JACK; w++) cells[w] = switchRemapDefaultCell(jack, w, gamepad);
       }
     } else {
@@ -2799,7 +2912,10 @@ void setSwitchAction(bool responseEnabled, bool apiEnabled, String commandKey, i
     cells[0] = packed / 10000;
     cells[1] = (packed / 100) % 100;
     cells[2] = packed % 100;
-    accepted = switchRemapAllowed(cells[0]) && switchRemapAllowed(cells[1]) && switchRemapAllowed(cells[2]);
+    // Column-aware allowlist (4.5.7 review): the gamepad columns reject
+    // DRAG/SCROLL — mouse hold modes that wedge every input in gamepad
+    // mode (see CONF_SWITCH_REMAP_GAMEPAD_FORBIDDEN in LSConfig.h).
+    accepted = switchRemapAllowed(cells[0], gamepad) && switchRemapAllowed(cells[1], gamepad) && switchRemapAllowed(cells[2], gamepad);
   }
   if (accepted && mem.writeInt(CONF_SETTINGS_FILE, commandKey, packedWireValue)) {
     // A refused store (settings budget, LSMemory) reports FAIL,3 and leaves
@@ -2990,7 +3106,12 @@ int getDebugMode(bool responseEnabled, bool apiEnabled) {
     mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempDebugMode);
   }
 
-  setDebugState(tempDebugMode);
+  // NO setDebugState here (4.5.7 review): a READ re-applied the debug
+  // timers — every DM,0 (the EX dump, the app's connect load) enabled the
+  // joystick/scroll poll timers, undoing toggleSafeMode's shutdown for the
+  // rest of a safe boot and re-enabling the poll a running calibration
+  // deliberately disabled. The getter is a pure read; initDebug and
+  // setDebugMode own the state change.
 
   printResponseInt(responseEnabled, apiEnabled, true, 0, "DM,0", true, tempDebugMode);
 
@@ -3283,9 +3404,19 @@ void resetSettings(bool responseEnabled, bool apiEnabled, String optionalParamet
 //***************************//
 void doFactoryReset(bool responseEnabled, bool apiEnabled) {
 
-  // Set all LEDs to red to indicate factory reset process 
-  setLedState(LED_ACTION_ON, LED_CLR_RED, CONF_LED_ALL, 0, 0, CONF_LED_BRIGHTNESS_MAX);                           
-  performLedAction(ledCurrentState);  
+  // Exempt the whole reset chain from the hang witness (4.5.7 review): the
+  // ~22 sequential settings writes below (each a LittleFS read + remove +
+  // write, on top of the filesystem format) can cross the witness's 3 s
+  // loop-stall threshold on slow flash — and the chain unconditionally ends
+  // in softwareReset(), which sets this flag anyway; setting it here covers
+  // the writes with the same deliberate-shutdown semantics. A witness SREQ
+  // mid-reset would abort it with the FS formatted and most defaults never
+  // applied.
+  g_shutdownInProgress = true;
+
+  // Set all LEDs to red to indicate factory reset process
+  setLedState(LED_ACTION_ON, LED_CLR_RED, CONF_LED_ALL, 0, 0, CONF_LED_BRIGHTNESS_MAX);
+  performLedAction(ledCurrentState);
 
   // Factory reset process 
   Serial.println("FACTORY RESET TRIGGERED");
@@ -3293,6 +3424,13 @@ void doFactoryReset(bool responseEnabled, bool apiEnabled) {
   resetMemory();  // Format and reinitialize internal file system 
 
   setCommunicationMode(false, false, CONF_COM_MODE_DEFAULT);
+  // 4.5.7 review: with the reset-on-change contract live again, a factory
+  // reset from gamepad/safe mode used to fire changeOperatingMode's
+  // softwareReset at THIS step — aborting the chain before the FR,1 ack and
+  // most of the default-writes (the app's FR waiter timed out). Align the
+  // live mode first so the setter's comparison sees no change; the chain
+  // ends in its own deliberate softwareReset.
+  g_operatingMode = CONF_OPERATING_MODE_DEFAULT;
   setOperatingMode(false, false, CONF_OPERATING_MODE_DEFAULT);
   setDebugMode(false, false, CONF_DEBUG_MODE_DEFAULT);
   setJoystickInnerDeadzone(false, false, CONF_JOY_DEADZONE_INNER_DEFAULT);

@@ -122,6 +122,7 @@ class LSBuzzer {
     void playStartupSound();
     void playReadySound();
     void playErrorSound();
+    void playErrorCue();
     void playShutdownSound();
     void enable();
     void disable();
@@ -284,61 +285,91 @@ void LSBuzzer::playStartupSound(){
 }
 
 //*********************************//
-// Function   : playReadySound 
-// 
+// Function   : playReadySound
+//
 // Description: Sound to play to indicate that LipSync is ready to use.
-// 
+//
 // Arguments :  void
-// 
-// Return     : void
+//
+// Return :  void
 //*********************************//
-void LSBuzzer::playReadySound(){ 
+void LSBuzzer::playReadySound(){
+  // Fully blocking, both notes (4.5.7 review): this still queued its second
+  // note, and buzzer.update() fired that tone() from loop context ~500 ms
+  // after the ready page — contradicting the queue's own "nothing queues
+  // today" documentation (the 4.5.6 hunt's invariant) and landing inside
+  // the all-LEDs-on window ledWaitFeedback() left live. Called once per
+  // boot (the boot-center completion / first healthy USB tick), so the
+  // bounded 750 ms block buys the same guarantee playErrorSound has: the
+  // loop context NEVER fires a queued tone, and the PWM peripheral is
+  // released via noTone() before any later LED analogWrite().
   if (_buzzerOn && (_soundModeLevel != CONF_SOUND_MODE_OFF)){
     tone(CONF_BUZZER_PIN, NOTE_F5, 500);
-    queueNote(500, NOTE_C6, 250);  // Was delay(500) between the tones — the loop now runs through the pause
+    delay(500);
+    tone(CONF_BUZZER_PIN, NOTE_C6, 250);
+    delay(250);
+    noTone(CONF_BUZZER_PIN);
   }
 }
 
 //*********************************//
-// Function   : playErrorSound 
-// 
+// Function   : playErrorSound
+//
 // Description: Sound to play to indicate LipSync error.
-// 
+//
 // Arguments :  void
-// 
-// Return     : void
+//
+// Return :  void
 //*********************************//
 void LSBuzzer::playErrorSound(){
-  // THE FREEZE ROOT CAUSE FIX (bench 2026-10-23, cold-boot freeze hunt): the
-  // queued follow-up note was the ONLY tone() call that ever fired from
-  // loop() context — every other sound plays during setup, before the LED
-  // feedback machinery is live. The Seeed core's tone() claims ownership of
-  // hardware PWM2, the LED brightness writes analogWrite() onto the same
-  // shared PWM instances, and the hardware-error path is the ONE place both
-  // run interleaved (this sound + the ledError blink): the +500 ms queued
-  // note fired from the loop straight into the blink window, and the main
-  // loop froze there on 12/12 boots whose joystick sensor was dead at
-  // power-on (the watchdog closed every one; the bench even heard the
-  // second note silently swallowed on some boots — tone() returning
-  // without playing when the ownership takeover failed). Two fixes at the
-  // source: (1) the sound is now fully blocking and plays BOTH notes
-  // before the caller starts the LED error feedback — the error path runs
-  // once at boot on a degraded device ahead of the error pages, so a
-  // bounded ~1 s block (the pre-4.2.0 norm, watchdog budget 30 s) buys a
-  // loop context that never touches tone(); (2) the sound-mode gate every
-  // other tone has (this one beeped even with sound OFF — a long-standing
-  // gap). The queue machinery stays for any future user; nothing queues
-  // today, so buzzer.update() is a no-op and the loop never calls tone().
+  // THE FREEZE-HUNT SEQUENCING FIX (bench 2026-10-23) + THE HONEST PLATFORM
+  // FACTS (4.5.7 review): this sound plays both notes fully blocking and
+  // releases PWM2 via noTone() before the caller (hardwareErrorCheck) starts
+  // the LED error feedback — the two PWM users are sequenced rather than
+  // interleaved, which is kept exactly as bench-validated.
+  //
+  // What the 4.5.6 notes over-claimed ("the loop context never calls
+  // tone()") is corrected here: the Seeed core's Tone.cpp can only TAKE
+  // HwPWM2 (takeOwnership fails cleanly if owned or with pins in use — a
+  // swallowed note at worst, never a corrupted instance), the LED pins live
+  // on HwPWM0/HwPWM1 under analogWrite, and the remaining loop-context
+  // tone() callers are single fire-and-forget notes with a duration the
+  // core auto-releases (modeEngageTone, the calibration tones) plus this
+  // blocking pair. The QUEUED-note machinery no longer fires from the
+  // loop at all: nothing queues today (playReadySound was the last queuer
+  // and now blocks like this function), so buzzer.update() is a no-op.
   if (!_buzzerOn || (_soundModeLevel == CONF_SOUND_MODE_OFF)) return;
     tone(CONF_BUZZER_PIN, NOTE_G4, 500);
     delay(500);
     tone(CONF_BUZZER_PIN, NOTE_C4, 500);
     delay(500);
     // Release the PWM peripheral explicitly (Tone.cpp: noTone -> stopPlayback
-    // with release) — the LED feedback's analogWrite allocates the same
-    // instance right after this, and an ownership left behind here is how
-    // the peripheral ended up in the conflicted state that froze the loop.
+    // with release) — the LED feedback's analogWrite allocates the shared
+    // instances right after this.
     noTone(CONF_BUZZER_PIN);
+}
+
+//*********************************//
+// Function   : playErrorCue
+//
+// Description: One short, non-blocking error tone for refused interactions
+//              (e.g. selecting a mode while the mode lock is on, roadmap
+//              item 11) — "that input is locked", not "the device is
+//              broken". A single fire-and-forget note with a duration the
+//              core's tone timeout auto-releases; nothing queued, nothing
+//              blocking (4.5.7 review: the refusal path used to forward to
+//              the ~1 s double-note playErrorSound, freezing the whole
+//              loop — serial, joystick, pressure — on every refused press,
+//              while its own docstring claimed "one short queued error
+//              tone").
+//
+// Arguments :  void
+//
+// Return :  void
+//*********************************//
+void LSBuzzer::playErrorCue(){
+  if (!_buzzerOn || (_soundModeLevel == CONF_SOUND_MODE_OFF)) return;
+  tone(CONF_BUZZER_PIN, NOTE_G4, 150);
 }
 
 //*********************************//

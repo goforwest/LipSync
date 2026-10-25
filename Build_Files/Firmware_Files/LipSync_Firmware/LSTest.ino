@@ -34,6 +34,14 @@
 //****************************************//
 void activateTest(int inputTest) {
 
+  // Test mode deliberately stalls the main loop for many seconds at a time
+  // (LED sweeps, sound delays, the watchdog starvation test) — the TIMER3
+  // hang witness would SREQ the device ~4 s into tests that are SUPPOSED
+  // to take longer (4.5.7 review). Same exemption class as softwareReset's
+  // shutdown: a deliberate stall is not a hang. Cleared before "Test
+  // Complete" so normal operation resumes.
+  g_shutdownInProgress = true;
+
   switch (inputTest) {
     case (CONF_TEST_MODE_LED):
       testLED();
@@ -42,12 +50,13 @@ void activateTest(int inputTest) {
     case (CONF_TEST_MODE_BUZZER):
       testBuzzer();
       break;
-    
+
     case (CONF_TEST_MODE_WATCHDOG):
       testWatchdog();
       break;
 
   } // end switch inputTest
+  g_shutdownInProgress = false;
   Serial.println("Test Complete");
 }
 

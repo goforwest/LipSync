@@ -30,7 +30,7 @@
 
 #define CONF_LIPSYNC_VERSION_MAJOR  4
 #define CONF_LIPSYNC_VERSION_MINOR  5
-#define CONF_LIPSYNC_VERSION_REV    6
+#define CONF_LIPSYNC_VERSION_REV    7
 
 const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + "." + String(CONF_LIPSYNC_VERSION_MINOR) + "." + String(CONF_LIPSYNC_VERSION_REV);
 
@@ -66,12 +66,26 @@ const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + 
 #define CONF_BUZZER_PIN 10
 
 // Operating Mode Values
-#define CONF_OPERATING_MODE_MIN 0
+// 4.5.7 review: MIN is 1, not 0 — mode 0 ("None") has no beginComOpMode
+// case and no sender (the app only ever sends 1-3); a stored 0 used to
+// boot a device whose com-mode switch to BLE then polled an uninitialized
+// Bluefruit stack every second (the exact 1 s SoftDevice stall the 4.5.x
+// BLE-poll guard was written to prevent). The boot load clamps a stored 0
+// to the default mouse mode.
+#define CONF_OPERATING_MODE_MIN 1
 #define CONF_OPERATING_MODE_NONE 0
 #define CONF_OPERATING_MODE_MOUSE 1
 #define CONF_OPERATING_MODE_GAMEPAD 2
 #define CONF_OPERATING_MODE_SAFE 3
 #define CONF_OPERATING_MODE_MAX 3
+// The highest USER-SETTABLE / STORABLE operating mode (4.5.7 review): SAFE
+// (3) is an internal runtime state set by checkSafeMode/toggleSafeMode and
+// is NEVER a valid stored value — beginComOpMode has no SAFE case on a
+// normal boot, so a persisted OM=3 would come up with g_operatingMode=SAFE
+// but g_safeModeEnabled=false: no HID interface, all-red LEDs, no cursor,
+// and NOT the recoverable safe menu. The setter and the boot-load clamp
+// bound to GAMEPAD, not MAX.
+#define CONF_OPERATING_MODE_SETTABLE_MAX CONF_OPERATING_MODE_GAMEPAD
 
 #define CONF_OPERATING_MODE_DEFAULT CONF_OPERATING_MODE_MOUSE  // Default mode = Mouse
                                           // 0 = Operating Mode null
@@ -238,6 +252,11 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 #define CONF_SAFE_MODE_REASON_WATCHDOG 1
 #define CONF_SAFE_MODE_REASON_INPUT 2
 #define CONF_SAFE_MODE_REASON_HARDWARE 3
+// 4.5.7 review: three-or-more consecutive boots died in a TIMER3-witnessed
+// loop hang (SREQ resets preserve the retention streak — see
+// LSWatchdog.h's hang-streak block). The boot rests in safe mode with the
+// watchdog/witness not re-armed.
+#define CONF_SAFE_MODE_REASON_HANG 4
 
 // Hub Menu
 #define CONF_SPLASH_SCREEN_DURATION 10000   // 10 seconds - how long the splash screen stays on on startup
@@ -252,6 +271,19 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 #define CONF_MENU_CONTROL_NEXT 3
 #define CONF_MENU_CONTROL_CLOSE 4
 #define CONF_MENU_CONTROL_MAX 4
+
+// 4.5.7 review: menu input frozen for the center-reset flow's whole timer
+// chain (start delay + 5 readings + completion margin), so a mid-flow Next
+// cannot redraw the menu over the "do not move joystick" instruction and a
+// mid-flow Select cannot hit selectMenuItem's unhandled page id.
+#define CONF_CENTER_RESET_FREEZE_MS 3000
+
+// Upper bound on a honored menu-input freeze (4.5.7 review): the longest
+// real freeze is the ~3 s dwell/transition/center windows, so a remaining
+// freeze longer than this must be a stale/never-set _inputFrozenUntil
+// (which the signed-delta wrap would otherwise read as frozen for ~24.9
+// days). Margin well above the real maximum; see LSScreen::inputIsFrozen.
+#define CONF_SCREEN_INPUT_FREEZE_MAX_MS 15000
 
 
 #define CONF_USB_HID_TIMEOUT  5000           // 5 seconds - timeout for connecting to USB and continuing with the program
@@ -471,6 +503,27 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 #define CONF_PUFF_THRESHOLD 3.0                   // hPa
 #define CONF_PRESS_MIN_THRESHOLD 2.0              // hPa
 #define CONF_PRESS_MAX_THRESHOLD 150.0            // hPa
+
+// Pressure plausibility range (4.5.7 review): both pressure sensors read
+// absolute ~1013 hPa; anything outside this band is garbage from a flaky
+// ACK — the "> 0.00" validity test let garbage-positive pairs pass as
+// healthy readings and fire phantom sip/puff events (the exact
+// garbage-ACK failure mode the bench has recorded on unseated cables).
+#define CONF_PRESS_ABS_PLAUSIBLE_MIN 300.0   // hPa
+#define CONF_PRESS_ABS_PLAUSIBLE_MAX 1200.0  // hPa
+
+// Sip/puff release hysteresis (4.5.7 review): a hold ends only when the
+// pressure falls back through this fraction of the engage threshold.
+// The engage boundary used to be the release boundary, so sensor noise
+// while holding near a threshold oscillated NONE<->PUFF/SIP, emitting a
+// RELEASED per oscillation — repeated clicks and drags that ended on
+// their own. 70% is the standard mouth-interface release band. The
+// hysteresis only ever HOLDS an active hold (prev STARTED) — from a
+// RELEASED state, re-engagement requires the FULL threshold again, or a
+// pressure that merely re-crosses the release band re-armed a phantom
+// hold at 70% of the engage threshold (and fired a second action when
+// it later drained).
+#define CONF_PRESS_RELEASE_FRACTION 0.7
                                                                                       
 // Sip and puff main states 
 #define PRESS_SAP_MAIN_STATE_NONE 0   // No action 
@@ -522,7 +575,7 @@ const accStruct accProperty[]{
 /* LIPSYNC INPUT AND OUTPUT MAPPING */
 
 // Sip and Puff Action Mapping
-//  {INPUT ACTION, MOUSE MODE ACTION, GAMEPAD MODE ACTION, MENU MODE ACTION, minTime, maxTime}
+//  {INPUT ACTION, MOUSE MODE ACTION, GAMEPAD MODE ACTION, MENU MODE ACTION, SAFE-MODE ACTION, minTime, maxTime}
 const inputActionStruct sapActionProperty[]{
   { PRESS_SAP_MAIN_STATE_NONE,        CONF_ACTION_NOTHING,      CONF_ACTION_NOTHING,    CONF_ACTION_NOTHING, CONF_ACTION_NOTHING,                      0,     0 },
   
@@ -622,6 +675,19 @@ const int CONF_SWITCH_REMAP_ALLOWED[] = { CONF_ACTION_NOTHING,
                                           CONF_ACTION_CHANGE_MODE,
                                           CONF_ACTION_START_MENU };
 #define CONF_SWITCH_REMAP_ALLOWED_NUM (sizeof(CONF_SWITCH_REMAP_ALLOWED) / sizeof(CONF_SWITCH_REMAP_ALLOWED[0]))
+
+// GAMEPAD-column exclusions (4.5.7 review): drag and scroll are MOUSE-only
+// hold modes — in gamepad mode the legacy performOutputAction branch
+// clobbers the hold tracker, so a gamepad cell mapped to either one wedged
+// EVERY input on the device until a reboot or a serial center flow (the
+// release match keys on the hold tracker the clobber just erased), and the
+// action itself pressed a mouse button on an interface that was never
+// begun. The compiled gamepad columns contain only B1-B8, so this list
+// only ever rejects a caregiver mapping (SET answers FAIL,3; the boot-load
+// sanitizer falls back to the factory cell, same as any allowlist breach).
+const int CONF_SWITCH_REMAP_GAMEPAD_FORBIDDEN[] = { CONF_ACTION_DRAG,
+                                                   CONF_ACTION_SCROLL };
+#define CONF_SWITCH_REMAP_GAMEPAD_FORBIDDEN_NUM (sizeof(CONF_SWITCH_REMAP_GAMEPAD_FORBIDDEN) / sizeof(CONF_SWITCH_REMAP_GAMEPAD_FORBIDDEN[0]))
 
 // LED Action for all available output actions. This maps what happens with the lights when different actions are triggered.
 // ledOutputActionNumber, ledNumber, ledStartColor, ledEndColor, ledEndAction

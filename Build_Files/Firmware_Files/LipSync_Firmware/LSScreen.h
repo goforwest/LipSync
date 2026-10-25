@@ -43,6 +43,17 @@
 // Calibration pages
 #define CENTER_RESET_PAGE 21
 
+// Informational dwell pages (4.5.7 review — the CH,0:0 honesty fix): these
+// draw-only pages previously left _currentMenu at the page they
+// interrupted, so a remote polling after its press saw the OLD page for
+// the whole dwell (the exact drift class the endpoint exists to prevent).
+// Each names itself for its window, exactly as MODE_LOCKED_PAGE does; the
+// continuation restores the real page id.
+#define EXITING_PAGE 11          // "Exiting" (0.5 s) -> finishExitMenu
+#define CHANGING_MODE_PAGE 33    // "Changing mode." (2 s) -> finishChangeMode (softwareReset)
+#define FULL_CALIB_WARN_PAGE 552   // "Incorrect full calib. may cause drift." (3 s) -> fullCalibrationConfirmMenu
+#define FACTORY_RESET_WARN_PAGE 572 // "This will erase all custom settings" (2 s) -> factoryResetConfirm2Menu
+
 // Mode pages
 #define CONFIRM_MODE_CHANGE 31
 // The LK refusal interstitial (bench follow-up 2026-10-18, CH,0:0): the
@@ -262,6 +273,7 @@ private:
 
   uint8_t _hardwareErrorCode = 0; 
 
+  bool inputIsFrozen();  // (4.5.7 review) wrap/stale-safe menu-input freeze check
   void displayMenu();
   void displayCursor();
   void scrollLongText();
@@ -432,6 +444,31 @@ void LSScreen::update() {
 }
 
 //*********************************//
+// Function   : inputIsFrozen
+//
+// Description: True while a scheduled page transition or boot dwell owns the
+//              menu and input must be dropped. Wrap-safe AND stale-safe
+//              (4.5.7 review): a genuine freeze is always a short window in
+//              the FUTURE, so the remaining time is a small positive. The
+//              bare `(long)(millis() - _inputFrozenUntil) < 0` idiom flipped
+//              to "frozen" for the entire millis() window [T+2^31, T+2^32)
+//              — ~24.9 days — whenever _inputFrozenUntil was 0 (never set on
+//              a normal boot) or left far in the past, silently jamming the
+//              Hub menu for a 25-day stretch of a long-uptime device. Bound
+//              the honored window to well above the longest real freeze
+//              (the ~3 s dwell/transition/center windows) so a stale
+//              timestamp can never read as frozen.
+//
+// Arguments :  void
+//
+// Return     : bool : true = input frozen
+//*********************************//
+bool LSScreen::inputIsFrozen() {
+  long remaining = (long)(_inputFrozenUntil - millis());
+  return remaining > 0 && remaining <= (long)CONF_SCREEN_INPUT_FREEZE_MAX_MS;
+}
+
+//*********************************//
 // Function   : activateMenu
 //
 // Description: Changes display mode to active and loads main menu
@@ -441,14 +478,15 @@ void LSScreen::update() {
 // Return     : void
 //*********************************//
 void LSScreen::activateMenu() {
-  if ((long)(millis() - _inputFrozenUntil) < 0) return;  // A scheduled page transition owns the menu right now
+  if (inputIsFrozen()) return;  // A scheduled page transition owns the menu right now (wrap/stale-safe — see inputIsFrozen)
   if (!Wire.busHealthy()) return;  // Held I2C bus — the menu could not draw anyway; don't feed the timeout tax
 
   _lastActivityMillis = millis();
   _isActive = true;
   _countMenuScroll = 0;
   _operatingMode = getOperatingMode(false, false);
-  
+  _communicationMode = getCommunicationMode(false, false);  // 4.5.7 review: a live CM,1 switch (no reset) left the Mode page highlighting the stale com mode until reboot
+
   mainMenu();
 }
 
@@ -484,7 +522,7 @@ void LSScreen::deactivateMenu() {
 // Return     : void
 //*********************************//
 void LSScreen::closeMenu() {
-  if ((long)(millis() - _inputFrozenUntil) < 0) return;  // A scheduled page transition / boot dwell page owns the display right now
+  if (inputIsFrozen()) return;  // A scheduled page transition / boot dwell page owns the display right now (wrap/stale-safe — see inputIsFrozen)
   deactivateMenu();
 }
 
@@ -594,6 +632,7 @@ void LSScreen::factoryResetConfirm2Menu() {
   _currentMenuText = _factoryResetConfirm2Text;
   _cursorStart = 2;
   _currentSelection = 0;
+  _countMenuScroll = 0;  // 4.5.7 review: stale parent-menu scroll offset indexed past this 4-element array
 
   displayMenu();  //  Print items in current menu
 }
@@ -838,6 +877,16 @@ void LSScreen::splashScreen2() {
     //delay(2000);  //TODO - 2025-FEB-21 Why is this delay here?
     warningUSBDebugOn();
   } else {
+    // Delete-before-rearm (4.5.7 review): every writer of _screenStateTimerId
+    // first deletes any genuinely pending predecessor — the id only ever
+    // names a live timer (the continuations reset it when they fire), so a
+    // second arm could never leak an orphaned splash-clear/safe-mode timer
+    // whose late firing would blank whatever page owns the display then.
+    // The same guard applies at warningUSBDebugOn/restartPage/
+    // factoryResetPage/safeModePage.
+    if (_screenStateTimerId >= 0) {
+      _screenStateTimer.deleteTimer(_screenStateTimerId);
+    }
     _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::finishSplashClear>(CONF_SPLASH_SCREEN_DURATION, this);
   }
 
@@ -858,7 +907,8 @@ void LSScreen::splashScreen2() {
 // Return     : void
 //*********************************//
 void LSScreen::nextMenuItem() {
-  if ((long)(millis() - _inputFrozenUntil) < 0) return;  // A scheduled page transition owns the menu right now
+  if (inputIsFrozen()) return;  // A scheduled page transition owns the menu right now (wrap/stale-safe — see inputIsFrozen)
+  if (!_isActive) return;  // No open menu (4.5.7 review): the serial CH,1 vector used to keep driving the STALE page after a close — deactivateMenu never nulls _currentMenuText, so a NEXT painted a cursor over the ready splash and a SELECT executed the stale page's switch (a stale RESTART_PAGE row reset the device; a stale MORE walk reached the factory reset) while CH,0:0 truthfully answered "no menu". Physical inputs were already gated on isMenuActive(); the serial vector now gets the same gate.
   if (_currentMenuText == nullptr) return;  // No menu page is registered yet (the safe-mode/error boot pages set _isActive before safeModeMenu registers state)
 
   _lastActivityMillis = millis();
@@ -897,7 +947,8 @@ void LSScreen::nextMenuItem() {
 // Return     : void
 //*********************************//
 void LSScreen::selectMenuItem() {
-  if ((long)(millis() - _inputFrozenUntil) < 0) return;  // A scheduled page transition owns the menu right now
+  if (inputIsFrozen()) return;  // A scheduled page transition owns the menu right now (wrap/stale-safe — see inputIsFrozen)
+  if (!_isActive) return;  // No open menu (4.5.7 review) — see nextMenuItem(): a closed menu's stale page must not execute from the serial CH,1 vector
   if (_currentMenuText == nullptr) return;  // No menu page is registered yet (the safe-mode/error boot pages set _isActive before safeModeMenu registers state)
 
   _lastActivityMillis = millis();
@@ -933,6 +984,7 @@ void LSScreen::selectMenuItem() {
         _currentSelection = 0;
         mainMenu();
       } else {
+        _currentMenu = EXITING_PAGE;  // Name the dwell (4.5.7 review): a CH,0:0 poll during the 0.5 s window sees the page actually shown, not the confirm page it interrupted
         setupDisplay();
         _display.println("Exiting");
         flushDisplay();
@@ -1763,6 +1815,7 @@ void LSScreen::confirmModeChange() {
 // Return     : void
 //*********************************//
 void LSScreen::changeMode() {
+  _currentMenu = CHANGING_MODE_PAGE;  // Name the dwell (4.5.7 review): the remote's post-press poll sees "Changing mode." while the 2 s window runs — the device resets at its end, so no restore is needed
   setupDisplay();
   _display.println("Changing");
   _display.println("mode.");
@@ -1784,7 +1837,7 @@ void LSScreen::changeMode() {
 //*********************************//
 void LSScreen::cursorSpeedMenu(void) {
   _currentMenu = CURSOR_SP_MENU;
-  _cursorSpeedLevel = getCursorSpeed(true, false);
+  _cursorSpeedLevel = getCursorSpeed(false, false);  // (4.5.7 review) a read, not a change — no MANUAL wire line per visit
 
   _cursorSpMenuText[0] = "Speed: " + String(_cursorSpeedLevel);
 
@@ -1808,7 +1861,7 @@ void LSScreen::cursorSpeedMenu(void) {
 //*********************************//
 void LSScreen::scrollSpeedMenu(void) {
   _currentMenu = SCROLL_SP_MENU;
-  _scrollSpeedLevel = getScrollLevel(true, false);
+  _scrollSpeedLevel = getScrollLevel(false, false);  // (4.5.7 review) a read, not a change — no MANUAL wire line per visit
 
   _scrollSpMenuText[0] = "Speed: " + String(_scrollSpeedLevel);
 
@@ -1816,6 +1869,7 @@ void LSScreen::scrollSpeedMenu(void) {
   _currentMenuText = _scrollSpMenuText;
   _cursorStart = 1;
   _currentSelection = 0;
+  _countMenuScroll = 0;  // 4.5.7 review: stale More-menu scroll offset indexed past this 4-element array
 
   displayMenu();
 }
@@ -1833,7 +1887,7 @@ void LSScreen::scrollSpeedMenu(void) {
 //*********************************//
 void LSScreen::accelMenu(void) {
   _currentMenu = ACCEL_MENU;
-  _accelLevel = getJoystickAcceleration(true, false);
+  _accelLevel = getJoystickAcceleration(false, false);  // (4.5.7 review) a read, not a change — no MANUAL wire line per visit
 
   _accelMenuText[0] = "Accel: " + String(_accelLevel);
 
@@ -1841,6 +1895,7 @@ void LSScreen::accelMenu(void) {
   _currentMenuText = _accelMenuText;
   _cursorStart = 1;
   _currentSelection = 0;
+  _countMenuScroll = 0;  // 4.5.7 review: stale More-menu scroll offset indexed past this 4-element array
 
   displayMenu();
 }
@@ -1905,7 +1960,7 @@ void LSScreen::timingMenu(void) {
 //
 // Description: Format and display the adjust page for the selected input
 //              timing window (_timingWindowSel: 0 = short/WS, 1 = long/WL,
-//              2 = max/W3). Increase/Decrease step 250 ms; the API setter
+//              2 = max/WM). Increase/Decrease step 250 ms; the API setter
 //              clamps range and ordering, so a refused step re-reads as the
 //              unchanged value.
 //
@@ -1966,6 +2021,16 @@ void LSScreen::moreMenu() {
 // Return     : void
 //*********************************//
 void LSScreen::centerResetPage(void) {
+  // Freeze menu input for the flow's duration (4.5.7 review): the ~2.6 s
+  // timer-driven center used to leave the page live to the input poll — a
+  // Next redrew the CALIB menu over the "do not move joystick"
+  // instruction, and a Select fell through selectMenuItem's switch with
+  // no case for CENTER_RESET_PAGE (silently swallowed). Every comparable
+  // informational page freezes its window (modeLockedPage, the confirm
+  // dwells); the center flow's own timer chain is the continuation, so
+  // only the freeze is needed here. The complete page redraws when the
+  // chain ends.
+  _inputFrozenUntil = millis() + CONF_CENTER_RESET_FREEZE_MS;
   setupDisplay();
 
   _display.println("Center");
@@ -1974,6 +2039,17 @@ void LSScreen::centerResetPage(void) {
   _display.println("joystick");
 
   flushDisplay();
+
+  // 4.5.7 review: the flow's continuation lives on calibrationTimer, which
+  // only runs when the joystick sensor is connected — on a safe boot
+  // without one (the menu is serial-openable), this page registered no
+  // continuation and parked forever after its 3 s freeze. Without the
+  // sensor there is nothing to center: schedule the return instead.
+  if (!g_joystickSensorConnected) {
+    showCenterResetComplete = false;
+    scheduleTransition(2000, screenReturnToMenuTransitionDone);
+    return;
+  }
 
   // Perform cursor center
   showCenterResetComplete = true;
@@ -2013,6 +2089,17 @@ void LSScreen::centerResetCompletePage(void) {
 // Return     : void
 //*********************************//
 void LSScreen::fullCalibrationPage(void) {
+  _currentMenu = FULL_CALIB_PAGE;  // Name the run (4.5.7 review): CH,0:0 answers the page actually shown for a mid-run poll; a mid-run Select has no case here (dropped) until the prompts/completion re-register real menus
+  // 4.5.7 review: mirror centerResetPage's sensor guard — without the
+  // joystick sensor the flow's chain never runs (calibrationTimer is only
+  // pumped when the sensor is connected), and this page would sit
+  // indefinitely (no continuation, and the safe-mode menu timeout is
+  // disabled). The serial CA,1:1 path still gets its honest FAIL,3 from
+  // setJoystickCalibration's own guard; the menu path returns to the menu.
+  if (!g_joystickSensorConnected) {
+    scheduleTransition(2000, screenReturnToMenuTransitionDone);
+    return;
+  }
   setupDisplay();
 
   _display.println("Follow");
@@ -2034,6 +2121,15 @@ void LSScreen::fullCalibrationPage(void) {
 // Return     : void
 //*********************************//
 void LSScreen::fullCalibrationPrompt(int stepNum) {
+  // 4.5.7 review: roll the input freeze across the run's steps (each
+  // prompt re-arms a window that covers the step) — a mid-run NEXT used to
+  // repaint the confirm page's selection column over the instruction
+  // prompt, because the run registered no freeze. Step 6 (complete)
+  // schedules its own return-to-menu transition and must NOT freeze past
+  // it.
+  if (stepNum >= 1 && stepNum <= 5) {
+    _inputFrozenUntil = millis() + CONF_CENTER_RESET_FREEZE_MS;
+  }
   setupDisplay();
 
   switch (stepNum) {
@@ -2108,6 +2204,7 @@ void LSScreen::soundMenu(void) {
   _currentMenuText = _soundMenuText;
   _cursorStart = 2;
   _currentSelection = 0;
+  _countMenuScroll = 0;  // 4.5.7 review: stale More-menu scroll offset indexed past this 4-element array
 
   displayMenu();  //  Print items in current menu
 }
@@ -2217,6 +2314,7 @@ void LSScreen::adjustPuffThreshMenu(void) {
 // Return     : void
 //*********************************//
 void LSScreen::fullCalibrationConfirmPage(void) {
+  _currentMenu = FULL_CALIB_WARN_PAGE;  // Name the dwell (4.5.7 review): the 3 s warning window reads as itself on CH,0:0; the continuation restores FULL_CALIB_CONFIRM_PAGE
   setupDisplay();
   _display.println("Incorrect");
   _display.println("full calib.");
@@ -2283,6 +2381,7 @@ void LSScreen::factoryResetConfirm1Page(void) {
 void LSScreen::factoryResetConfirm2Page(void) {
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::factoryResetConfirm2Page()"); }
 
+  _currentMenu = FACTORY_RESET_WARN_PAGE;  // Name the dwell (4.5.7 review): the 2 s warning window reads as itself on CH,0:0; the continuation restores FACTORY_RESET_CONFIRM2_PAGE
   setupDisplay();
   _display.println("This will");
   _display.println("erase all");
@@ -2302,7 +2401,12 @@ void LSScreen::factoryResetConfirm2Page(void) {
 //              selectMenuItem() switches on; add the page's _cursorStart
 //              offset for the text-array row). Read-only, so
 //              it is safe mid-transition: during a scheduled page's frozen
-//              window the values still name what the Hub is showing.
+//              window the values name the page the Hub is actually showing
+//              (4.5.7 review: the draw-only informational dwells now NAME
+//              themselves — EXITING_PAGE, CHANGING_MODE_PAGE,
+//              FULL_CALIB_WARN_PAGE, FACTORY_RESET_WARN_PAGE — exactly as
+//              MODE_LOCKED_PAGE already did; the continuation restores the
+//              real page id).
 //
 // Arguments :  out : int[3] : filled with [active, pageId, row]
 //
@@ -2403,6 +2507,7 @@ void LSScreen::modeLockedPage(void) {
 // Return     : void
 //*********************************//
 void LSScreen::finishModeLocked(void) {
+  _transitionTimerId = -1;  // The scheduled transition just fired — its slot is free; keep the id honest (the one continuation that broke this invariant before the 4.5.7 review)
   modeMenu();
 }
 
@@ -2419,7 +2524,12 @@ void LSScreen::infoMenu(void) {
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::infoPage()"); }
 
   _infoMenuText[1] = "V"+CONF_LIPSYNC_VERSION_STRING;
-  _infoMenuText[2] = "LS_"+g_deviceUID;
+  // Clip the ID line (4.5.7 review): "LS_" + the 8-hex-char UID is 11
+  // characters = 132 px at size 2 against the 128-px panel — the tail of
+  // the UID was cut off mid-glyph. Truncate to the 10 characters that fit.
+  String idLine = "LS_" + g_deviceUID;
+  if (idLine.length() > 10) idLine = idLine.substring(0, 10);
+  _infoMenuText[2] = idLine;
 
   _currentMenu = INFO_MENU;
   _currentMenuLength = _infoMenuLen;
@@ -2545,6 +2655,9 @@ void LSScreen::warningUSBDebugOn(void) {
   _display.println("for user.");
   flushDisplay();
 
+  if (_screenStateTimerId >= 0) {  // Delete-before-rearm — see splashScreen2 (4.5.7 review)
+    _screenStateTimer.deleteTimer(_screenStateTimerId);
+  }
   _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::finishSplashClear>(CONF_SPLASH_SCREEN_DURATION, this);
 }
 
@@ -2569,6 +2682,9 @@ void LSScreen::restartPage() {
   flushDisplay();
 
   const int RESTART_TIMEOUT = 3000;
+  if (_screenStateTimerId >= 0) {  // Delete-before-rearm — see splashScreen2 (4.5.7 review)
+    _screenStateTimer.deleteTimer(_screenStateTimerId);
+  }
   _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::finishSplashClear>(RESTART_TIMEOUT, this);
 }
 
@@ -2592,6 +2708,9 @@ void LSScreen::factoryResetPage() {
 
   flushDisplay();
   const int RESET_TIMEOUT = 3000;
+  if (_screenStateTimerId >= 0) {  // Delete-before-rearm — see splashScreen2 (4.5.7 review)
+    _screenStateTimer.deleteTimer(_screenStateTimerId);
+  }
   _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::finishSplashClear>(RESET_TIMEOUT, this);
 }
 
@@ -2652,6 +2771,9 @@ void LSScreen::safeModePage(int safeModeReason) {
         case CONF_SAFE_MODE_REASON_INPUT:
         {
           _display.println(" Hub");
+          if (_screenStateTimerId >= 0) {  // Delete-before-rearm — see splashScreen2 (4.5.7 review)
+            _screenStateTimer.deleteTimer(_screenStateTimerId);
+          }
           _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::safeModeMenu>(CONF_SAFEMODE_MENU_TIMEOUT, this);
           _safeModeReasonText = "Hub";
           
@@ -2660,6 +2782,9 @@ void LSScreen::safeModePage(int safeModeReason) {
         case CONF_SAFE_MODE_REASON_WATCHDOG:
         {
           _display.println(" Watchdog");
+          if (_screenStateTimerId >= 0) {  // Delete-before-rearm — see splashScreen2 (4.5.7 review)
+            _screenStateTimer.deleteTimer(_screenStateTimerId);
+          }
           _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::safeModeMenu>(CONF_SAFEMODE_MENU_TIMEOUT, this);
           _safeModeReasonText = "Watchdog";
           break;
@@ -2695,9 +2820,31 @@ void LSScreen::safeModePage(int safeModeReason) {
             _hardwareErrorCode |= 1 << 3;
           }
           {
+            // snprintf (4.5.7 review): the 4-bit code's worst case
+            // "ERROR-015" + NUL is exactly 10 — a fifth error bit would
+            // have overflowed the fixed buffer.
             char buffer[10];
-            sprintf(buffer, "ERROR-%03u", _hardwareErrorCode);
+            snprintf(buffer, sizeof(buffer), "ERROR-%03u", _hardwareErrorCode);
             _safeModeReasonText = String(buffer);
+          }
+          if (_screenStateTimerId >= 0) {  // Delete-before-rearm — see splashScreen2 (4.5.7 review)
+            _screenStateTimer.deleteTimer(_screenStateTimerId);
+          }
+          _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::safeModeMenu>(CONF_SAFEMODE_MENU_TIMEOUT, this);
+          break;
+        }
+        case CONF_SAFE_MODE_REASON_HANG:
+        {
+          // 4.5.7 review: repeated witnessed loop hangs settled here (see
+          // checkSafeMode/LSWatchdog.h) — same single continuation to the
+          // safe menu as the other reasons. Without an explicit case the
+          // switch's default armed NO continuation and the safe menu never
+          // registered (a latent trap for any reason value outside 1-3).
+          _display.println(" Repeated");
+          _display.println(" hang");
+          _safeModeReasonText = "Hang";
+          if (_screenStateTimerId >= 0) {  // Delete-before-rearm — see splashScreen2 (4.5.7 review)
+            _screenStateTimer.deleteTimer(_screenStateTimerId);
           }
           _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::safeModeMenu>(CONF_SAFEMODE_MENU_TIMEOUT, this);
           break;

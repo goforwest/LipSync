@@ -33,11 +33,20 @@ JsonDocument doc;
 // Initialize FileSystem
 File file(InternalFS);
 
+// Crash-safe settings persistence (4.5.7 review): writes go to a temp file
+// and are then RENAMED over the target — LittleFS's lfs_rename is an atomic
+// metadata commit, so a power cut at ANY instant leaves either the complete
+// old file or the complete new one. The old remove-then-write pattern lost
+// the whole file (every calibration, every caregiver restriction) to a
+// reset landing in the window, and doFactoryReset's ~22 sequential writes
+// multiplied that window 22-fold.
+#define CONF_SETTINGS_TMP_FILE "/settings.tmp"
+
 class LSMemory {
   public:
-    LSMemory();   
-    void begin();                                                   
-    void initialize(String fileString, String jsonString);   
+    LSMemory();
+    void begin();
+    void initialize(String fileString, String jsonString);
     void clear(String fileString);
     void format();
     String readAll(String fileString);
@@ -53,6 +62,9 @@ class LSMemory {
     bool writeFloat(String fileString, String key, float value);
     bool writeString(String fileString, String key, String value);
     bool writePoint(String fileString, String key, pointFloatType value);
+    bool isLastReadOk() { return _lastReadOk; }
+  private:
+    bool _lastReadOk = true;  // The most recent readObject deserialized a real document (4.5.7 review)
 };
 
 
@@ -96,40 +108,68 @@ void LSMemory::begin() {
 void LSMemory::initialize(String fileString, String jsonString) {
   const char* fileName = fileString.c_str();
 
-  file.open(fileName, FILE_O_READ);
-  if ( file )
+  // A settings file that exists must also PARSE (4.5.7 review): a power cut
+  // or partial write in the old remove-then-write window, or flash
+  // corruption, could leave a truncated or empty file — and the old code
+  // kept such a file forever (every read failed, every write serialized
+  // the failed document and re-emptied the file, and the device silently
+  // ran on garbage while initialize() reported success because open()
+  // succeeded). A file that does not deserialize is re-seeded with the
+  // compiled default, so one bad write heals at the next boot instead of
+  // bricking every future one.
+  bool fileHealthy = false;
+  if (file.open(fileName, FILE_O_READ))
   {
     uint32_t readlen;
     char buffer[BUFFER_SIZE] = { 0 };
     readlen = file.read(buffer, sizeof(buffer));
-
-    delay(5);
+    if (readlen >= sizeof(buffer)) readlen = sizeof(buffer) - 1;  // 4.5.7 review: the one-byte overflow at exactly 512 bytes
     buffer[readlen] = 0;
     file.close();
     delay(5);
-  } else
+    // A file that exists must deserialize to a real OBJECT (4.5.7 review,
+    // hardened): deserializeJson succeeding is not enough — the literal
+    // "null" (what a corrupt-read write could have stored, see writeObject)
+    // parses cleanly yet carries no settings, so doc.isNull() must also be
+    // false. Otherwise a stray "null" would be treated as healthy and never
+    // re-seeded.
+    fileHealthy = (readlen > 0) && !deserializeJson(doc, String(buffer)) && !doc.isNull();
+  }
+  if (fileHealthy) {
+    return;  // Nothing to do — the stored settings parse
+  }
+
+  // Seed (or re-seed) the compiled default. It must fit the budget by
+  // construction — if it ever does not, a new settings key grew the file
+  // past the 4.1.0 downgrade cliff and the host-side size test should
+  // have caught it first. Refuse the write rather than seeding every boot
+  // with a file the downgrade path would truncate.
+  if (jsonString.length() > CONF_SETTINGS_FILE_BUDGET) {
+    Serial.print("ERROR: compiled default settings (");
+    Serial.print((int)jsonString.length());
+    Serial.print(" bytes) exceed the ");
+    Serial.print(CONF_SETTINGS_FILE_BUDGET);
+    Serial.println("-byte budget — refusing to initialize settings file");
+    return;
+  }
+  // Remove the old file before writing the seed (4.5.7 review — the
+  // append-mode trap): Adafruit_LittleFS FILE_O_WRITE does NOT truncate —
+  // it opens RDWR|CREAT and seeks to END — so writing the seed over an
+  // existing corrupt file APPENDED the default after the garbage
+  // ([garbage][default]: still unparseable), and every boot appended
+  // another copy, growing the file forever and never healing. A fresh seed
+  // write here is boot-time-only, so remove-then-write is sufficient
+  // crash-safety: a power cut mid-reseed leaves no/partial file, which the
+  // NEXT boot's re-seed heals.
+  InternalFS.remove(fileName);
+  delay(1);
+  if( file.open(fileName, FILE_O_WRITE) )
   {
-    // The compiled default must fit the budget by construction — if it ever
-    // does not, a new settings key grew the file past the 4.1.0 downgrade
-    // cliff and the host-side size test should have caught it first. Refuse
-    // the write here rather than seeding every boot with a file the
-    // downgrade path would truncate.
-    if (jsonString.length() > CONF_SETTINGS_FILE_BUDGET) {
-      Serial.print("ERROR: compiled default settings (");
-      Serial.print((int)jsonString.length());
-      Serial.print(" bytes) exceed the ");
-      Serial.print(CONF_SETTINGS_FILE_BUDGET);
-      Serial.println("-byte budget — refusing to initialize settings file");
-      return;
-    }
-    if( file.open(fileName, FILE_O_WRITE) )
-    {
-      const char* jsonChar = jsonString.c_str();
-      file.write(jsonChar, strlen(jsonChar));
-      delay(1);
-      file.close();
-      delay(1);
-    }
+    const char* jsonChar = jsonString.c_str();
+    file.write(jsonChar, strlen(jsonChar));
+    delay(1);
+    file.close();
+    delay(1);
   }
 }
 
@@ -203,10 +243,18 @@ long LSMemory::size(String fileString) {
 String LSMemory::readAll(String fileString){
   const char* fileName = fileString.c_str();
 
-  file.open(fileName, FILE_O_READ);
+  // Check the open (4.5.7 review): File::read on an unopened handle passes
+  // a NULL lfs_file_t into littlefs — a verified HardFault chain (vector-
+  // table garbage passes the BADF check, the ctz walk hits an unmapped
+  // block, the raw flash read dereferences it). A missing/unopenable file
+  // reads as empty; the callers' defaults apply.
+  if (!file.open(fileName, FILE_O_READ)) {
+    return "";
+  }
   uint32_t readlen;
   char buffer[BUFFER_SIZE] = { 0 };
   readlen = file.read(buffer, sizeof(buffer));
+  if (readlen >= sizeof(buffer)) readlen = sizeof(buffer) - 1;  // 4.5.7 review: the one-byte overflow at exactly 512 bytes
 
   delay(1);
   buffer[readlen] = 0;
@@ -233,9 +281,7 @@ String LSMemory::readAll(String fileString){
 //                     guard refused (or the file could not be opened)
 //*********************************//
 bool LSMemory::writeAll(String fileString, String jsonString){
-
     const char* fileName = fileString.c_str();
-
     const char* jsonChar = jsonString.c_str();
 
     if (strlen(jsonChar) > CONF_SETTINGS_FILE_BUDGET) {
@@ -249,20 +295,31 @@ bool LSMemory::writeAll(String fileString, String jsonString){
       Serial.println(" bytes) — firmware 4.1.0's 512-byte reader would truncate it");
       return false;
     }
-    
-    InternalFS.remove(fileName);
+
+    // Crash-safe replace (4.5.7 review): write the new content to a temp
+    // file, close, then rename over the target — LittleFS's rename is an
+    // atomic metadata commit, so a reset at ANY instant leaves either the
+    // complete old file or the complete new one. The old remove-then-write
+    // lost the entire settings file (calibration, caregiver restrictions)
+    // to a power cut inside the window — and doFactoryReset's ~22
+    // sequential writes multiplied that window 22-fold.
+    InternalFS.remove(CONF_SETTINGS_TMP_FILE);
     delay(1);
-    
-    if (!file.open(fileName, FILE_O_WRITE)) {
+
+    if (!file.open(CONF_SETTINGS_TMP_FILE, FILE_O_WRITE)) {
       return false;
     }
     delay(1);
-    
+
     file.write(jsonChar, strlen(jsonChar));
     delay(1);
     file.close();
-    return true;
 
+    if (!InternalFS.rename(CONF_SETTINGS_TMP_FILE, fileName)) {
+      InternalFS.remove(CONF_SETTINGS_TMP_FILE);  // Leave no stale temp behind
+      return false;
+    }
+    return true;
 }
 
 
@@ -276,23 +333,42 @@ bool LSMemory::writeAll(String fileString, String jsonString){
 // Return     : obj : JsonObject : A Json Object of the file contents
 //*********************************//
 JsonObject LSMemory::readObject(String fileString){
-  
+
   uint32_t readLength;
   const char* fileName = fileString.c_str();
   char jsonBuffer[BUFFER_SIZE] = { 0 };
-  file.open(fileName, FILE_O_READ);
+  // Check the open — see readAll() (4.5.7 review): an unopened read is a
+  // NULL-handle HardFault, not an empty result. A missing/unopenable file
+  // marks the read failed so writes refuse (writeObject's isNull guard)
+  // and the next boot's re-seed heals.
+  if (!file.open(fileName, FILE_O_READ)) {
+    _lastReadOk = false;
+    return doc.as<JsonObject>();
+  }
   delay(1);
   readLength = file.read(jsonBuffer, sizeof(jsonBuffer));
+  if (readLength >= sizeof(jsonBuffer)) readLength = sizeof(jsonBuffer) - 1;  // 4.5.7 review: the one-byte overflow at exactly 512 bytes
   delay(1);
   jsonBuffer[readLength] = 0;
 
   // Deserialize he JSON documetn
   DeserializationError deserializationError = deserializeJson(doc, String(jsonBuffer));
 
-  // Test is parsing suceeds
+  // Test is parsing suceeds. The error prints ONCE PER BOOT (4.5.7
+  // review): readObject runs inside every serial setter/getter, so the
+  // old unconditional print landed mid-response on every exchange while
+  // the file was corrupt — the exact wire-corruption class the 4.5.1
+  // timer-print cleanup eliminated. The failed state is still observable
+  // through isLastReadOk(), and initialize()'s re-seed heals the file at
+  // the next boot.
+  _lastReadOk = !deserializationError;
   if (deserializationError) {
-    Serial.print("ERROR: deserializeJson() failed: ");
-    Serial.println(deserializationError.f_str());
+    static bool reportedDeserializeFailure = false;
+    if (!reportedDeserializeFailure) {
+      reportedDeserializeFailure = true;
+      Serial.print("ERROR: deserializeJson() failed (reported once per boot): ");
+      Serial.println(deserializationError.f_str());
+    }
   }
 
   JsonObject obj = doc.as<JsonObject>();
@@ -376,12 +452,27 @@ pointFloatType LSMemory::readPoint(String fileString, String key){
 // Return     : bool : true when written, false when the budget guard refused
 //*********************************//
 bool LSMemory::writeObject(String fileString, String key, JsonObject obj){
-
     const char* fileName = fileString.c_str();
-    
+
     String jsonString;
     serializeJson(obj, jsonString);
     const char* jsonChar = jsonString.c_str();
+
+    // Refuse a write whose source document did not deserialize (4.5.7
+    // review, hardened): when the settings file is corrupt, readObject()
+    // returns a NULL JsonObject, the setter's obj[key]=value is a silent
+    // no-op, and serializeJson() of a null document produces the 4-byte
+    // string "null" — NOT an empty string. The earlier strlen==0 guard
+    // therefore let "null" through (and, being valid JSON, it parsed clean
+    // next boot so initialize() never re-seeded — a permanent settings
+    // loss). obj.isNull() catches the null-document case directly; the
+    // "null"/empty string checks are belt-and-braces.
+    if (obj.isNull() || jsonString == "null" || strlen(jsonChar) == 0) {
+      Serial.print("ERROR: settings write refused for key ");
+      Serial.print(key);
+      Serial.println(" — the settings file did not parse (it will be re-seeded at the next boot)");
+      return false;
+    }
 
     if (strlen(jsonChar) > CONF_SETTINGS_FILE_BUDGET) {
       Serial.print("ERROR: settings file budget refused for key ");
@@ -393,18 +484,24 @@ bool LSMemory::writeObject(String fileString, String key, JsonObject obj){
       Serial.println(" bytes) — firmware 4.1.0's 512-byte reader would truncate it");
       return false;
     }
-    
-    InternalFS.remove(fileName);
+
+    // Crash-safe replace — see writeAll() (4.5.7 review).
+    InternalFS.remove(CONF_SETTINGS_TMP_FILE);
     delay(1);
-    
-    if (!file.open(fileName, FILE_O_WRITE)) {
+
+    if (!file.open(CONF_SETTINGS_TMP_FILE, FILE_O_WRITE)) {
       return false;
     }
     delay(1);
-    
+
     file.write(jsonChar, strlen(jsonChar));
     delay(1);
     file.close();
+
+    if (!InternalFS.rename(CONF_SETTINGS_TMP_FILE, fileName)) {
+      InternalFS.remove(CONF_SETTINGS_TMP_FILE);  // Leave no stale temp behind
+      return false;
+    }
     return true;
 }
 
