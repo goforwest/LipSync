@@ -71,9 +71,19 @@ namespace ifx {
                         iic->beginTransmission(iicAddress);
 
                         uint8_t bytesWritten = (uint8_t) iic->write(txBuffer, txLen);
-                        iic->endTransmission(true);
+                        // LipSync port (4.5.7 review): Arduino write() only buffers locally —
+                        // endTransmission() is what clocks the bytes out and reports the
+                        // outcome (2 = address NACK, 3 = data NACK, 4 = timeout). Discarding
+                        // it made a NACKed register write (e.g. the master-controlled-mode
+                        // configuration in TLx493D_A1B6_setDefaultConfig, when the sensor is
+                        // half-wedged after a brownout) report success, leaving the library
+                        // believing a measurement mode the sensor never entered — a
+                        // permanently dead cursor with no fault signal. The upstream bug is
+                        // faithfully vendored; this bounded, correctness-only fix is ported
+                        // into our copy and recorded in LIPSYNC.md.
+                        uint8_t txResult = iic->endTransmission(true);
 
-                        if( bytesWritten != txLen ) {
+                        if( bytesWritten != txLen || txResult != 0 ) {
                             return false;
                         }
                     }

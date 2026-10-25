@@ -91,13 +91,34 @@ the sketch). Reads via `getMagneticField()`/`getMagneticFieldAndTemperature()`.
 
 ## Provenance note
 
-This copy is unmodified upstream. If the bounding guarantees above ever
-regress (an upstream change reintroducing an unbounded wait or a per-read
-write-wait-read cycle), port the old fork's bounding into this copy BEFORE
-updating — the guarantees are load-bearing for the 20 ms poll loop and the
-watchdog math, not cosmetic. (The powerdown-mode variant once considered for
-battery reasons is closed as moot: see the status paragraph — the LipSync
+This copy is upstream plus **one bounded, correctness-only port** (4.5.7
+review): `TwoWireWrapper::transfer()` now propagates `endTransmission()`'s
+result — Arduino `write()` only buffers locally, and the discarded return
+made a NACKed register write (the master-controlled-mode configuration after
+a sensor brownout) report success while the sensor never entered measurement
+mode, a silently dead cursor with no fault signal. If the bounding guarantees
+above ever regress (an upstream change reintroducing an unbounded wait or a
+per-read write-wait-read cycle), port the old fork's bounding into this copy
+BEFORE updating — the guarantees are load-bearing for the 20 ms poll loop and
+the watchdog math, not cosmetic. (The powerdown-mode variant once considered
+for battery reasons is closed as moot: see the status paragraph — the LipSync
 hardware has no internal battery to trade against.)
+
+## Documented limitation (4.5.7 review): gen-1 data validity is unchecked
+
+`TLx493D_A1B6_readRegistersAndCheck()` is an upstream passthrough to the plain
+single read — unlike gen-2/3, no FRM (frame-counter) consistency check, no
+all-0xFF rejection, no T/PD status-bit inspection exists on the A1B6 path, so
+the 10-byte burst is accepted unconditionally. Time-boundedness covers WHEN a
+read returns, not WHAT it returns: a burst can straddle the sensor's own
+frame update (a torn x/y/z across adjacent frames — absorbed by the
+firmware's 0.1 mT skip gate and deadzones at rest), and a frozen or garbage
+register page after a sensor brownout is delivered as fully valid data. The
+firmware covers the harmful half at its own layer: LSJoystick checks
+`getMagneticField()`'s bool and holds the last reading on failure, plus a
+consecutive-failure re-init. Anything more belongs in a future upstream
+contribution (wiring the gen-2/3 validity machinery for gen 1), not in this
+vendoring.
 
 ---
 

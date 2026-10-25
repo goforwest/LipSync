@@ -47,12 +47,19 @@ static volatile uint32_t* pincfg_reg(uint32_t pin)
 // wedges (a sensor browned-out mid-transaction holding SDA low, a damaged
 // interface cable), the event never fires and readPressure()/getEvent() never
 // return — the whole main loop hangs until the hardware watchdog resets the
-// device (30 s of dead USB). Every wait below is bounded by
-// WIRE_TRANSACTION_TIMEOUT_MS; on timeout the bus is recovered (bounded STOP,
-// then the NXP I2C bus-clear: up to 9 SCL clocks to release a slave stuck
-// mid-byte) and the call reports failure, which the firmware's sensor-health
-// layer turns into "sensor unhealthy" instead of a hang. 50 ms is ~25x the
-// duration of a full 100 kHz transaction, so healthy buses are unaffected.
+// device (30 s of dead USB). Every CALL below is bounded by one
+// WIRE_TRANSACTION_TIMEOUT_MS deadline shared across its waits (the waits are
+// sequential, so per-wait bounds would stack ~3x per call and ~21x per
+// composite operation like an SSD1306 framebuffer push); on timeout the bus is
+// recovered (bounded STOP, then the NXP I2C bus-clear: up to 9 SCL clocks,
+// each verified to actually rise, to release a slave stuck mid-byte) and the
+// call reports failure, which the firmware's sensor-health layer turns into
+// "sensor unhealthy" instead of a hang. 50 ms is ~25x the duration of a full
+// 100 kHz transaction, so healthy buses are unaffected. Data-phase waits exit
+// early on EVENTS_ERROR exactly as upstream did; the STOP/SUSPEND waits never
+// do — the TWIM will not accept a new START until the previous STOP completes,
+// so returning before EVENTS_STOPPED wedged the NEXT transaction and fired a
+// spurious recovery per poll of a merely absent (NACKing) device.
 const uint32_t WIRE_TRANSACTION_TIMEOUT_MS = 50;
 
 // Bus-held reporting (LipSync patch): a transaction that hits the bounded
@@ -80,16 +87,29 @@ unsigned long TwoWire::lastRecoveryMs()
   return wireRecoveryCount == 0 ? 0 : wireLastRecoveryMs;
 }
 
-// Waits for *eventReg (or EVENTS_ERROR, which callers handle). Returns true
-// when the event fired; false on timeout.
-static bool wireWaitEvent(NRF_TWIM_Type * twim, volatile uint32_t * eventReg, uint32_t timeoutMs)
+// Waits for *eventReg. Returns true when the event fired; false when the
+// per-call deadline passed.
+//
+// errorEarlyExit (the 4.5.7 review fix): the data-phase waits (RXSTARTED/
+// LASTRX/TXSTARTED/LASTTX) mirror upstream's `while(!EVENT && !ERROR)` and
+// may return early on EVENTS_ERROR — the caller's error path owns the
+// transaction from there. The STOP/SUSPEND waits must NOT: upstream waited
+// for EVENTS_STOPPED unconditionally, and the nRF52 TWIM will not accept a
+// new START task until the previous STOP sequence completes. Returning from
+// the STOP wait while the STOP is still ~10 µs from completing on the wire
+// left the next transaction (a BusIO read µs later, a back-to-back checkI2C
+// probe) landing mid-STOP — ignored, timing out the full 50 ms, and firing
+// a spurious recovery on a perfectly healthy bus — once per poll of a merely
+// NACKing (absent) device, plus a stale EVENTS_STOPPED that permanently
+// defeated this wait on the read path. A STOP after a NACK completes in µs,
+// so waiting for it costs nothing on healthy or NACKing buses.
+static bool wireWaitEvent(NRF_TWIM_Type * twim, volatile uint32_t * eventReg, uint32_t deadlineMs, bool errorEarlyExit)
 {
   if (*eventReg) { return true; }
-  uint32_t start = millis();
   while (!*eventReg)
   {
-    if (twim->EVENTS_ERROR) { return true; }  // caller's error path handles it
-    if (millis() - start >= timeoutMs) { return false; }
+    if (errorEarlyExit && twim->EVENTS_ERROR) { return true; }  // caller's error path handles it
+    if ((int32_t)(millis() - deadlineMs) >= 0) { return false; }
   }
   return true;
 }
@@ -128,6 +148,15 @@ static void wireRecoverBus(NRF_TWIM_Type * twim, uint32_t pinSDA, uint32_t pinSC
     delayMicroseconds(5);
     nrf_gpio_pin_set(pinSCL);
     delayMicroseconds(5);
+    // Count the clock only when SCL actually rose (the 4.5.7 review fix):
+    // SCL is open-drain, so pin_set only releases it — a slave stretching
+    // the clock (or a bus too loaded to rise in 5 µs) turns every "clock"
+    // into a no-op while the loop still counts nine of them and declares
+    // the bus cleared. The NXP bus-clear procedure requires SCL high before
+    // each counted clock; if it will not rise, the slave will not let go and
+    // no amount of clocking here can help — stop early and let the 1 s
+    // busHealthy window pace the next attempt.
+    if (!nrf_gpio_pin_read(pinSCL)) { break; }
     if (nrf_gpio_pin_read(pinSDA)) { break; }  // SDA released — the bus is free
   }
 
@@ -274,24 +303,47 @@ uint8_t TwoWire::requestFrom(uint8_t address, size_t quantity, bool stopBit)
     return 0;
   }
 
+  // rxBuffer._aucBuffer is SERIAL_BUFFER_SIZE (64) bytes and TWIM DMA writes
+  // MAXCNT bytes straight into it — clamp the request or a caller asking for
+  // more would overrun the buffer (the 4.5.7 review fix; current callers ask
+  // for 10 at most).
+  if (quantity > sizeof(rxBuffer._aucBuffer))
+  {
+    quantity = sizeof(rxBuffer._aucBuffer);
+  }
+
   size_t byteRead = 0;
   rxBuffer.clear();
 
+  // One deadline per CALL, not per wait (the 4.5.7 review fix): the waits
+  // inside one transaction are sequential, so three 50 ms waits stacked to a
+  // 150 ms call — and a composite operation like an SSD1306 framebuffer push
+  // (~21 transactions) could stretch a wedged-bus episode to seconds,
+  // straddling the firmware's 3 s loop-hang witness. Bounding the whole call
+  // to one WIRE_TRANSACTION_TIMEOUT_MS keeps the worst case per transaction
+  // at ~50 ms + recovery.
+  uint32_t deadline = millis() + WIRE_TRANSACTION_TIMEOUT_MS;
+
   _p_twim->ADDRESS = address;
 
+  // Pre-flight clear (mirrors endTransmission): a previous transaction's
+  // STOP can still be in flight when this call starts, and a stale
+  // EVENTS_STOPPED would make the STOP wait below return instantly forever
+  // after — never actually waiting again until a recovery cleared it.
+  _p_twim->EVENTS_STOPPED = 0x0UL;
   _p_twim->TASKS_RESUME = 0x1UL;
   _p_twim->RXD.PTR = (uint32_t)rxBuffer._aucBuffer;
   _p_twim->RXD.MAXCNT = quantity;
   _p_twim->TASKS_STARTRX = 0x1UL;
 
-  if (!wireWaitEvent(_p_twim, &_p_twim->EVENTS_RXSTARTED, WIRE_TRANSACTION_TIMEOUT_MS))
+  if (!wireWaitEvent(_p_twim, &_p_twim->EVENTS_RXSTARTED, deadline, true))
   {
     wireRecoverBus(_p_twim, _uc_pinSDA, _uc_pinSCL);
     return 0;
   }
   _p_twim->EVENTS_RXSTARTED = 0x0UL;
 
-  if (!wireWaitEvent(_p_twim, &_p_twim->EVENTS_LASTRX, WIRE_TRANSACTION_TIMEOUT_MS))
+  if (!wireWaitEvent(_p_twim, &_p_twim->EVENTS_LASTRX, deadline, true))
   {
     wireRecoverBus(_p_twim, _uc_pinSDA, _uc_pinSCL);
     return 0;
@@ -301,7 +353,7 @@ uint8_t TwoWire::requestFrom(uint8_t address, size_t quantity, bool stopBit)
   if (stopBit || _p_twim->EVENTS_ERROR)
   {
     _p_twim->TASKS_STOP = 0x1UL;
-    if (!wireWaitEvent(_p_twim, &_p_twim->EVENTS_STOPPED, WIRE_TRANSACTION_TIMEOUT_MS))
+    if (!wireWaitEvent(_p_twim, &_p_twim->EVENTS_STOPPED, deadline, false))
     {
       wireRecoverBus(_p_twim, _uc_pinSDA, _uc_pinSCL);
       return 0;
@@ -311,7 +363,7 @@ uint8_t TwoWire::requestFrom(uint8_t address, size_t quantity, bool stopBit)
   else
   {
     _p_twim->TASKS_SUSPEND = 0x1UL;
-    if (!wireWaitEvent(_p_twim, &_p_twim->EVENTS_SUSPENDED, WIRE_TRANSACTION_TIMEOUT_MS))
+    if (!wireWaitEvent(_p_twim, &_p_twim->EVENTS_SUSPENDED, deadline, false))
     {
       wireRecoverBus(_p_twim, _uc_pinSDA, _uc_pinSCL);
       return 0;
@@ -322,6 +374,10 @@ uint8_t TwoWire::requestFrom(uint8_t address, size_t quantity, bool stopBit)
   if (_p_twim->EVENTS_ERROR)
   {
     _p_twim->EVENTS_ERROR = 0x0UL;
+    // Read-1-to-clear ERRORSRC here too (the 4.5.7 review fix): leaving it
+    // latched meant endTransmission's next exact-`==` classification read
+    // the accumulated bits and reported 4 where the failure was a 2 or a 3.
+    _p_twim->ERRORSRC = _p_twim->ERRORSRC;
   }
 
   byteRead = rxBuffer._iHead = _p_twim->RXD.AMOUNT;
@@ -352,6 +408,9 @@ uint8_t TwoWire::endTransmission(bool stopBit)
 {
   transmissionBegun = false ;
 
+  // One deadline per CALL — see requestFrom().
+  uint32_t deadline = millis() + WIRE_TRANSACTION_TIMEOUT_MS;
+
   // Start I2C transmission
   _p_twim->ADDRESS = txAddress;
 
@@ -364,7 +423,7 @@ uint8_t TwoWire::endTransmission(bool stopBit)
 
   _p_twim->TASKS_STARTTX = 0x1UL;
 
-  if (!wireWaitEvent(_p_twim, &_p_twim->EVENTS_TXSTARTED, WIRE_TRANSACTION_TIMEOUT_MS))
+  if (!wireWaitEvent(_p_twim, &_p_twim->EVENTS_TXSTARTED, deadline, true))
   {
     wireRecoverBus(_p_twim, _uc_pinSDA, _uc_pinSCL);
     return 4;  // Other error
@@ -372,7 +431,7 @@ uint8_t TwoWire::endTransmission(bool stopBit)
   _p_twim->EVENTS_TXSTARTED = 0x0UL;
 
   if (txBuffer.available()) {
-    if (!wireWaitEvent(_p_twim, &_p_twim->EVENTS_LASTTX, WIRE_TRANSACTION_TIMEOUT_MS))
+    if (!wireWaitEvent(_p_twim, &_p_twim->EVENTS_LASTTX, deadline, true))
     {
       wireRecoverBus(_p_twim, _uc_pinSDA, _uc_pinSCL);
       return 4;  // Other error
@@ -383,7 +442,7 @@ uint8_t TwoWire::endTransmission(bool stopBit)
   if (stopBit || _p_twim->EVENTS_ERROR)
   {
     _p_twim->TASKS_STOP = 0x1UL;
-    if (!wireWaitEvent(_p_twim, &_p_twim->EVENTS_STOPPED, WIRE_TRANSACTION_TIMEOUT_MS))
+    if (!wireWaitEvent(_p_twim, &_p_twim->EVENTS_STOPPED, deadline, false))
     {
       wireRecoverBus(_p_twim, _uc_pinSDA, _uc_pinSCL);
       return 4;  // Other error
@@ -393,7 +452,7 @@ uint8_t TwoWire::endTransmission(bool stopBit)
   else
   {
     _p_twim->TASKS_SUSPEND = 0x1UL;
-    if (!wireWaitEvent(_p_twim, &_p_twim->EVENTS_SUSPENDED, WIRE_TRANSACTION_TIMEOUT_MS))
+    if (!wireWaitEvent(_p_twim, &_p_twim->EVENTS_SUSPENDED, deadline, false))
     {
       wireRecoverBus(_p_twim, _uc_pinSDA, _uc_pinSCL);
       return 4;  // Other error

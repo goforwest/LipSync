@@ -19,10 +19,22 @@ in older firmware.
 
 - Every TWIM event wait is bounded by `WIRE_TRANSACTION_TIMEOUT_MS`
   (50 ms — ~25x a full 100 kHz transaction, so healthy buses are
-  unaffected).
+  unaffected). Since 4.5.7 the bound is one deadline **per call** shared
+  across the call's sequential waits (per-wait bounds stacked to ~150 ms
+  per transaction and ~21 transactions per SSD1306 framebuffer push);
+  the STOP/SUSPEND waits never exit early on `EVENTS_ERROR` (the TWIM
+  rejects a new START until the previous STOP completes — an early
+  return manufactured a 50 ms wedge plus a spurious recovery on every
+  poll of a merely absent device, and a stale `EVENTS_STOPPED` that
+  disarmed the read path's STOP wait until the next recovery);
+  `requestFrom` pre-clears `EVENTS_STOPPED`, clamps the read length to
+  the 64-byte `rxBuffer`, and clears `ERRORSRC` on its error path so
+  `endTransmission`'s next classification reads clean bits.
 - On timeout, `wireRecoverBus()` runs: a bounded STOP, then the peripheral
   is disconnected and disabled, the pins are driven as GPIO for the NXP
-  I2C bus-clear (I2C-bus spec 3.1.16: up to 9 SCL clocks to release a
+  I2C bus-clear (I2C-bus spec 3.1.16: up to 9 SCL clocks — each verified
+  to actually rise, since SCL is open-drain and a clock-stretching slave
+  turns unverified clocks into silent no-ops — to release a
   slave stuck mid-byte), and the TWIM is re-attached and re-enabled. The
   pins' `PIN_CNF` registers are then restored to the `begin()`
   configuration (input, pull-up, open-drain) — the bus-clear leaves SCL as
