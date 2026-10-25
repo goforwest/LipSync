@@ -3,7 +3,7 @@ name: Compress Firmware Files
 on:
   push:
     branches:
-      - '**' # Runs on ALL branches
+      - '**' # Runs on ALL branches (the v4.1 double-fire caller was removed — 4.5.7 review)
     paths:
       - "Build_Files/Firmware_Files/LipSync_Firmware/**"
   workflow_dispatch: # Allows manual triggering of the workflow
@@ -18,6 +18,10 @@ jobs:
 
       - name: Zip Firmware Files
         run: |
+          # (4.5.7 review) Rebuild the archive from scratch: `zip -r` only
+          # adds/updates entries, so a file deleted or renamed from the tree
+          # lived on in the committed zip forever.
+          rm -f Build_Files/Firmware_Files/LipSync_Firmware.zip
           cd Build_Files/Firmware_Files/LipSync_Firmware
           zip -r ../LipSync_Firmware.zip ./
 
@@ -28,4 +32,3 @@ jobs:
           git add Build_Files/Firmware_Files/LipSync_Firmware.zip
           git commit -m "Automated update: Compress firmware files"
           git push
-        continue-on-error: true
