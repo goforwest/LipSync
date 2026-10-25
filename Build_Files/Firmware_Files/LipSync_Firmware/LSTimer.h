@@ -40,20 +40,31 @@ class LSTimer {
     const static int DEFCALL_RUNONLY = 1;                                         // Call the callback function but don't delete the timer
     const static int DEFCALL_RUNANDDEL = 2;                                       // Call the callback function and delete the timer
     const static int MAX_INT = 65535;                                             // Maximum integer used to prevent overrun
+    // The time type of the stored clock fields. On the nRF52840 (ILP32)
+    // `unsigned long` is 32 bits and millis() wraps at 49.7 days — the wrap
+    // arithmetic in run()/elapsedTime() is written for exactly that width.
+    // The host test suite overrides this to uint32_t BEFORE including this
+    // header so a 64-bit host `unsigned long` cannot silently widen the
+    // fields (the wrap class would be structurally untestable there); on
+    // the device the default is the Arduino millis() type.
+    #ifndef LSTIMER_MILLIS_T
+    #define LSTIMER_MILLIS_T unsigned long
+    #endif
+    typedef LSTIMER_MILLIS_T ls_millis_t;
     typedef void (*timerCallbackPtr)(void);                                       // Define a function pointer type for a callback function with no parameters.
     typedef void (*timerCallbackParamPtr)(T *);                                   // Define a function pointer type for a callback function with parameters.
     typedef struct {                                                              // Define timer structure
-      unsigned long previousTime;                                                 // Last time the timer was triggered 
+      ls_millis_t previousTime;                                                    // Last time the timer was triggered
       void* callback;                                                             // Pointer to the callback function
       T* param;                                                                   // Pointer to the function parameter
       boolean hasParam;                                                           // Check if callback takes a parameter
-      unsigned long intervalTime;                                                 // Time between triggers
+      ls_millis_t intervalTime;                                                   // Time between triggers
       unsigned maxNumRuns;                                                        // Number of runs to be executed
       unsigned numRuns;                                                           // Number of executed runs
       boolean enabled;                                                            // Check if timer is enabled
-      unsigned long startDelayTime;                                               // Initial start delay
-      boolean startDelayEnabled;                                                  // Check if offset is enabled
-      unsigned toBeCalled;                                                        // Deferred function call
+      ls_millis_t startDelayTime;                                                  // Initial start delay
+      boolean startDelayEnabled;                                                   // Check if offset is enabled
+      unsigned toBeCalled;                                                         // Deferred function call
     } timer_t;
     
     // Stopwatch slots (startTimer) hold callback == NULL, which is the SAME
@@ -154,8 +165,8 @@ LSTimer<T>::LSTimer() { // TODO 2025-Feb-07 Consider adding overridden function 
 template<typename T>
 void LSTimer<T>::run() {
     int i;  // Timer index
-    unsigned long current_millis; //  Current time
-    unsigned long delay_millis;  //  
+    ls_millis_t current_millis; //  Current time
+    ls_millis_t delay_millis;  //
 
     // Get the current time
     current_millis = millis();
@@ -171,8 +182,8 @@ void LSTimer<T>::run() {
               delay_millis = timer[i].startDelayTime;
             } else {
               delay_millis = timer[i].intervalTime;
-            } 
-            
+            }
+
             // Check if it's time to process timer
             if ((current_millis - timer[i].previousTime) >= delay_millis) {
 
@@ -182,11 +193,14 @@ void LSTimer<T>::run() {
                 // Check if the timer callback has to be executed
                 if (timer[i].enabled) {
 
-                    //  If a timer is triggered, increment the number of runs
-                    if (timer[i].numRuns == (MAX_INT-1)) { // -1 ensures that even / odd remain consistent
-                      timer[i].numRuns = 1;  // Reset to avoid overflow
-                    } else {
-                      timer[i].numRuns++;  //  Increment the number of times   
+                    //  If a timer is triggered, increment the number of runs.
+                    //  SATURATE at MAX_INT (4.5.7 review): the old wrap
+                    //  (65534 -> 1) could never reach a maxNumRuns of
+                    //  65535, silently turning such a timer into
+                    //  RUN_FOREVER. Saturating preserves the >= comparison
+                    //  for every maxNumRuns value.
+                    if (timer[i].numRuns < MAX_INT) {
+                      timer[i].numRuns++;  //  Increment the number of times
                     }
 
                     //  Always executed RUN_FOREVER timers
@@ -207,16 +221,36 @@ void LSTimer<T>::run() {
     }
 
     //  Trigger the timers that needs to be run
+    //  (4.5.7 review):
+    //  - RUNONLY: the toBeCalled mark is cleared BEFORE the callback runs,
+    //    so a nested run() on the SAME pool cannot double-fire the slot in
+    //    the same millisecond (the host suite pins it).
+    //  - RUNANDDEL: INVOKE first, then delete — the ORIGINAL, bench-validated
+    //    order. An earlier 4.5.7 draft deleted before invoking so a
+    //    self-rearming callback could reuse its own slot on a FULL pool,
+    //    but deleteTimer() memsets the slot and the final-run callback then
+    //    read getNumRuns() == 0 instead of N — which silently killed every
+    //    corner persistence and CA,n ack in the calibration flows (they key
+    //    their last-reading branch on getNumRuns(...) == N). The full-pool
+    //    self-rearm case is unreachable in this firmware (each pool runs
+    //    far fewer live slots than MAX_TIMERS; the usbConnectTimer pool
+    //    holds exactly one), so the original order stands and the limitation
+    //    is documented instead: a self-rearm from inside its own final
+    //    callback on a FULL pool is refused (counted) and the chain ends
+    //    after its current fire.
     for (i = 0; i < MAX_TIMERS; i++) {
-      
+
       if (timer[i].toBeCalled != DEFCALL_DONTRUN){    // Check if timer should be run, if not equal to DONTRUN (either RUNONLY or RUNANDDEL)
+          if (timer[i].toBeCalled == DEFCALL_RUNONLY){
+            timer[i].toBeCalled = DEFCALL_DONTRUN;  // Cleared BEFORE the invoke: a nested run() cannot double-fire this slot
+          }
           if (timer[i].hasParam) {
             (*(timerCallbackParamPtr)timer[i].callback)(timer[i].param);
           } else {
             (*(timerCallbackPtr)timer[i].callback)();
           }
 
-          if (timer[i].toBeCalled == DEFCALL_RUNANDDEL){  // Check if timer should be deleted 
+          if (timer[i].toBeCalled == DEFCALL_RUNANDDEL){  // Check if timer should be deleted
             deleteTimer(i);
           }
       }
@@ -272,6 +306,23 @@ template<typename T>
 int LSTimer<T>::setupTimer(unsigned long interval, unsigned long startDelay, boolean on, boolean h, unsigned n, void* f, T* p) {
     int freeTimerIndex;
 
+    // A zero-interval RUN_FOREVER timer is a main-loop livelock (4.5.7
+    // review): delay 0 is always elapsed and previousTime += 0 never
+    // advances the anchor, so run() would fire the callback on EVERY pass,
+    // thousands of times per second, while still feeding the watchdog.
+    // setTimeout(0)/setTimer(0, n) stay legal (bounded, "fire immediately").
+    if (interval == 0 && n == RUN_FOREVER) {
+        refusedRegistrations++;
+        if (!refusalPrinted || (millis() - lastRefusalPrintMs) > 30000UL) {
+          refusalPrinted = true;
+          lastRefusalPrintMs = millis();
+          Serial.print("ERROR: LSTimer refused a 0-interval RUN_FOREVER registration (");
+          Serial.print(refusedRegistrations);
+          Serial.println(" total) -- it would livelock run(); NOT registered");
+        }
+        return -1;
+    }
+
     freeTimerIndex = findFirstFreeSlot();
     if (freeTimerIndex < 0 || f == NULL) {
         // Registration refused — count it, and make it impossible to miss
@@ -290,7 +341,7 @@ int LSTimer<T>::setupTimer(unsigned long interval, unsigned long startDelay, boo
             Serial.print(refusedRegistrations);
             Serial.print(" total, ");
             Serial.print(getNumAvailableTimers());
-            Serial.println(" slots free) — the timer/callback was NOT registered");
+            Serial.println(" slots free) -- the timer/callback was NOT registered");
         }
         return -1;
     }
@@ -505,7 +556,7 @@ int LSTimer<T>::startTimer() {
             Serial.print(refusedRegistrations);
             Serial.print(" total, ");
             Serial.print(getNumAvailableTimers());
-            Serial.println(" slots free) — the stopwatch was NOT started");
+            Serial.println(" slots free) -- the stopwatch was NOT started");
         }
         return -1;
     }
@@ -553,7 +604,7 @@ unsigned long LSTimer<T>::elapsedTime(int timerId) {
         return 0;
     }
 
-    unsigned long current_millis, diff_millis;
+    ls_millis_t current_millis, diff_millis;
 
     // Get current time
     current_millis = millis();
