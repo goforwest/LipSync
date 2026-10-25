@@ -344,6 +344,20 @@ void setup() {
 
   Serial.begin(115200);
 
+  // BOOT TRACE (4.5.9 bench round 3): a handful of short lines naming each
+  // boot milestone. The bench's BLE boot looped with zero wire visibility
+  // (the app could not even open the port), so every boot now announces its
+  // reset reason up front and the milestones below name the death site even
+  // inside a fast fault loop — the last line printed IS the fault's
+  // address. Unprefixed lines are proven app-tolerated (three sessions of
+  // HB/ERROR lines dropped as undecodable, no waiter false-match possible).
+  Serial.print(F("BOOT: 4.5.9 rst=0x"));
+  Serial.print(g_lastRebootReason, HEX);
+  Serial.print(F(" pt="));
+  Serial.print(g_bootTrailPrev);
+  Serial.print(F(" pm="));
+  Serial.println(g_hangMarkerPrev);
+
   initMemory();  // Initialize Memory
 
   //initUID(); // Intilize unique identifier
@@ -520,6 +534,8 @@ void setup() {
     bootTrailStamp(1);  // witness v7: setup complete (the only boot-phase code; deaths are all loop-phase)
   }
 
+  Serial.println(F("BOOT: setup done"));
+
   if (USB_DEBUG) { Serial.print("USBDEBUG: lastRebootReason: "); Serial.println(g_lastRebootReason); }
   if (USB_DEBUG) { Serial.println("USBDEBUG: Setup complete."); }
 
@@ -536,6 +552,11 @@ void setup() {
 // Return     : void
 //*********************************//
 void loop() {
+  static bool firstLoopPass = true;
+  if (firstLoopPass) {
+    firstLoopPass = false;
+    Serial.println(F("BOOT: loop alive"));
+  }
   // Feed the hardware watchdog directly from the live loop (bench
   // 2026-10-18, the unbreakable safe-mode reset cycle): the heartbeat
   // witness proved that in a safe-mode boot the feed's soft timer on the
@@ -1574,6 +1595,11 @@ void beginComOpMode() {
   initCommunicationMode();  // Retrieve communication mode from memory (None, USB, Bluetooth)
   initOperatingMode();      // Retrieve operating mode from memory (USB Mouse, Bluetooth Mouse, Gamepad)
 
+  Serial.print(F("BOOT: com-op om="));
+  Serial.print(g_operatingMode);
+  Serial.print(F(" cm="));
+  Serial.println(g_comMode);
+
   // Cross-validate the loaded pair (4.5.7 review): the setters reject
   // gamepad+BLE, but the boot loaders clamp each value to its own range
   // only — a hand-edited/old settings file with OM=2+CM=2 booted a device
@@ -1595,25 +1621,36 @@ void beginComOpMode() {
   // A host needs at least a connect-detect + bus-reset cycle (ms) after
   // attach before it can fetch a descriptor, so every enumeration now sees
   // the complete composite.
-  USBDevice.attach();
-
+  // 4.5.9: USB attach moved INTO the mode branches. USB and gamepad boots
+  // keep the bench-validated order (attach, then begin — the host sees the
+  // complete composite); BLE boots now begin the SoftDevice stack FIRST and
+  // attach after — a fresh diagnostic axis for the BLE boot loop, and the
+  // ordering the stock BLE-mouse examples use (no USB composite to build
+  // beyond CDC on that path).
   switch (g_operatingMode) {
     case CONF_OPERATING_MODE_MOUSE:
       switch (g_comMode) {
         case CONF_COM_MODE_USB:  // USB Mouse
+          USBDevice.attach();
           usbmouse.begin();
           break;
         case CONF_COM_MODE_BLE:  // Bluetooth Mouse
-          String btName = String("LS_") + String(g_deviceUID);  // Form Bluetooth name using device UID // TODO This may be limited to 15 characters
-          btmouse.begin(btName.c_str());
+          {
+            String btName = String("LS_") + String(g_deviceUID);  // Form Bluetooth name using device UID // TODO This may be limited to 15 characters
+            Serial.println(F("BOOT: BLE begin"));
+            btmouse.begin(btName.c_str());
+            USBDevice.attach();
+          }
           break;
       }
       break;
     case CONF_OPERATING_MODE_GAMEPAD:  // USB Gamepad
+      USBDevice.attach();
       gamepad.begin();
       break;
       // default: (SAFE is handled by the early return above)
   }
+  Serial.println(F("BOOT: interfaces up"));
 
 
   if (USB_DEBUG) {

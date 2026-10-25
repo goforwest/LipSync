@@ -54,14 +54,34 @@ class LSBLEMouse {
 // removal. (The btKeyReport struct went with it.)
 
 void initializeBluefruit(const char* s) {
-  Bluefruit.begin();
+  // 4.5.9 bench round 3: every begin()/start() is CHECKED and the failure is
+  // printed. A failed SoftDevice enable previously cascaded into the
+  // GATT/DIS/HID/advertising SVC calls on a dead stack — an SVC call with
+  // the SD down HardFaults, the Seeed core's HardFault handler is an
+  // INSTANT reset, and the BLE boot looped forever (bench 2026-10-25: the
+  // first real CM=2 boot on this firmware line — every earlier CM=2 boot was
+  // a safe-mode CDC-only boot that never touched Bluefruit). On failure we
+  // bail with needsInitialization still true: every BLE call site is
+  // guarded (isConnected, btFeedbackLoop), no SVC call is made, and the
+  // boot trace names the failure instead of faulting.
+  if (!Bluefruit.begin()) {
+    Serial.println("BOOT: BLE FAILED at SoftDevice enable");
+    return;
+  }
+  Serial.println("BOOT: BLE stack up");
   Bluefruit.Periph.setConnInterval(9, 16);  // min = 9*1.25=11.25 ms, max = 16*1.25=20ms
   Bluefruit.setTxPower(4);                  // Check bluefruit.h for supported values
   Bluefruit.setName(s);
   bledis.setManufacturer("MakersMakingChange");
   bledis.setModel("LipSync Mouse");
-  bledis.begin();
-  blehid.begin();
+  if (!bledis.begin()) {
+    Serial.println("BOOT: BLE FAILED at DIS begin");
+    return;
+  }
+  if (!blehid.begin()) {
+    Serial.println("BOOT: BLE FAILED at HID begin");
+    return;
+  }
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
   Bluefruit.Advertising.addTxPower();
   Bluefruit.Advertising.addAppearance(BLE_APPEARANCE_HID_KEYBOARD);
@@ -71,10 +91,12 @@ void initializeBluefruit(const char* s) {
   Bluefruit.Advertising.restartOnDisconnect(true);
   Bluefruit.Advertising.setInterval(32, 244);    // 20 ms - in unit of 0.625 ms (Interval:  fast mode = 20 ms, slow mode = 152.5 ms)
   Bluefruit.Advertising.setFastTimeout(30);      // number of seconds in fast mode
-  Bluefruit.Advertising.start(0);                // 0 = Don't stop advertising after n seconds
-
-  // Serial.println("Initializing Bluetooth");
-  if (USB_DEBUG) { Serial.println("Initializing Bluetooth");}
+  if (!Bluefruit.Advertising.start(0)) {         // 0 = Don't stop advertising after n seconds
+    Serial.println("BOOT: BLE FAILED at advertising start");
+    return;
+  }
+  Serial.println("BOOT: BLE advertising");
+  needsInitialization = false;  // FULL SUCCESS ONLY — every guarded call site keys on this
 }
 
 
@@ -92,7 +114,9 @@ void LSBLEMouse::begin(const char* s)
   _buttons = 0;
   if (needsInitialization) {
     initializeBluefruit(s);
-    needsInitialization = false;
+    // needsInitialization is now cleared by initializeBluefruit itself, ONLY
+    // on full success (4.5.9) — a failed begin leaves every guarded call site
+    // safely reporting "not connected" instead of touching a dead stack.
   }
 }
 
