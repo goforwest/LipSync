@@ -77,10 +77,10 @@ void LSInput::begin() {
 }
 
 void LSInput::clear() {
-    
-  inputStateStruct inputPrevState = {INPUT_MAIN_STATE_NONE, INPUT_SEC_STATE_WAITING, 0};
 
-  inputBuffer.pushElement(inputPrevState);
+  inputStateStruct initialInputState = {INPUT_MAIN_STATE_NONE, INPUT_SEC_STATE_WAITING, 0};
+
+  inputBuffer.pushElement(initialInputState);
 
   inputStateTimerId = inputStateTimer.startTimer();
 }
@@ -95,8 +95,8 @@ void LSInput::update() {
   // for each input pin, do a digital read and create a single number to represent the collective states
   for (int i = 0; i < _inputNumber; i++){
     inputState[i] = !digitalRead(_inputPinArray[i]);
-    inputAllState+= pow(2,i) * inputState[i];  // create single integer to represent combination of button presses
-  }  
+    inputAllState += (1 << i) * inputState[i];  // create single integer to represent combination of button presses (integer shift, not pow())
+  }
   
   inputPrevState = inputBuffer.getLastElement();
   
@@ -134,7 +134,23 @@ void LSInput::update() {
            && inputPrevState.elapsedTime >= INPUT_REACTION_TIME) {
         
         inputCurrState = {inputPrevState.mainState, INPUT_SEC_STATE_RELEASED, inputPrevState.elapsedTime};
-      } // prev: press x,released  current : none 
+      } // prev: press x,started  current : none or press y, elapsed < reaction time
+      // (4.5.7 review — the fall-through that became a latch): a press
+      // visible for less than one reaction window used to match NO branch
+      // here, so the STALE inputCurrState was re-pushed with the timer
+      // restarted every tick — the machine latched {x, STARTED, ~0}
+      // forever (quick taps silently eaten until a >=2-tick press), the
+      // LM=3 LEDs showed a held input that wasn't, and while latched on
+      // combo x a real press of y took the >=-reaction branch and merged
+      // into inputAllState = x|y — a glitch on jack 1 plus a real press
+      // of jack 3 could fire the S13 combo row's START_MENU on release.
+      // A sub-reaction press is a GLITCH by this machine's own definition:
+      // discard it. If another input is already down, the WAITING entry
+      // re-arms its fresh STARTED on the next tick.
+      else if(inputPrevState.secondaryState == INPUT_SEC_STATE_STARTED) {
+
+        inputCurrState = {inputAllState, INPUT_SEC_STATE_WAITING, 0};
+      } // prev: press x,released  current : none
       else if(inputPrevState.secondaryState == INPUT_SEC_STATE_RELEASED && inputAllState == INPUT_MAIN_STATE_NONE) {
         
         inputCurrState = {inputAllState, INPUT_SEC_STATE_WAITING, 0};

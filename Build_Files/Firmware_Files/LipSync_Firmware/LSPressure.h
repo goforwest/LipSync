@@ -71,10 +71,9 @@ extern bool g_ambientPressureSensorConnected;     // Ambient pressure sensor con
 class LSPressure {
   public:
     LSPressure();                                       // Constructor
-    void begin();                                    
-    void clear();  
-    void update();                                      // Update the pressure buffer and sip and puff buffer with new readings 
-    void setFilterMode(int mode);                       // Set filter Mode: None or Average
+    void begin();
+    void clear();
+    void update();                                      // Update the pressure buffer and sip and puff buffer with new readings
     void setPressureMode(int mode);                     // Set Sip and Puff Pressure Mode : ABS or DIFF pressure
     int getPressureMode();                              // Get Sip and Puff Pressure Mode : ABS or DIFF pressure
     void setRefTolerance(float value);                  // Set reference pressure change tolerance value that is used to update the reference pressure
@@ -99,10 +98,9 @@ class LSPressure {
       Adafruit_LPS22 _lps22;                              // Create an object of Adafruit_LPS2X class for ambient pressure
       sensors_event_t _lps22Pressure;                     // Ambient temperature event object 
       sensors_event_t _lps22Temperature;                  // Ambient pressure event object                           
-      LSCircularBuffer <pressureStruct> _pressureBuffer;  // Create a buffer of type pressureStruct to push pressure readings 
-      LSCircularBuffer <inputStateStruct> _sapBuffer;     // Create a buffer of type inputStateStruct to push sap states 
-      int _filterMode;                                    // Filter Mode : NONE or AVERAGE     
-      int _pressureMode;                                  // Pressure Mode: DIFF or ABS pressure 
+      LSCircularBuffer <pressureStruct> _pressureBuffer;  // Create a buffer of type pressureStruct to push pressure readings
+      LSCircularBuffer <inputStateStruct> _sapBuffer;     // Create a buffer of type inputStateStruct to push sap states
+      int _pressureMode;                                  // Pressure Mode: DIFF or ABS pressure
       float _sapPressureAbs;                              // Main Pressure reading (Sip and Puff Absolute) [hPa]
       float _ambientPressure;                             // Reference Pressure reading (Ambient Absolute) [hPa]
       float _offsetPressure;                              // Offset Pressure [hPa] (Difference between two sensors)
@@ -232,19 +230,9 @@ void LSPressure::clear()
 
 }
 
-//*********************************//
-// Function   : setFilterMode 
-// 
-// Description: Set the filter mode ( Currently not used )
-// 
-// Arguments :  mode : int : Each filter mode will have a number 
-// 
-// Return     : void
-//*********************************//
-void LSPressure::setFilterMode(int mode)
-{
-  _filterMode = mode;
-}
+// setFilterMode/_filterMode removed (4.5.7 review): dead since 4.2.0 — the
+// mode was stored and never read (the PRESS_FILTER_* defines remain
+// documented above for the differential-mode semantics).
 
 //*********************************//
 // Function   : getPressureMode 
@@ -440,7 +428,12 @@ void LSPressure::updatePressure()
     _lastProbeMs = nowMs;
     float probeAbs = _lps35hw.readPressure();
     _lps22.getEvent(&_lps22Pressure, &_lps22Temperature);
-    if (probeAbs > 0.00 && _lps22Pressure.pressure > 0.00) {
+    // Plausibility range, not just "> 0" (4.5.7 review): both sensors read
+    // absolute ~1013 hPa — a garbage-positive pair (the flaky-ACK failure
+    // mode the bench has recorded on unseated cables) passed the old test
+    // as "valid" and could fire phantom sip/puff events.
+    if (probeAbs > CONF_PRESS_ABS_PLAUSIBLE_MIN && probeAbs < CONF_PRESS_ABS_PLAUSIBLE_MAX
+        && _lps22Pressure.pressure > CONF_PRESS_ABS_PLAUSIBLE_MIN && _lps22Pressure.pressure < CONF_PRESS_ABS_PLAUSIBLE_MAX) {
       if (++_goodProbeCount >= PRESS_PROBE_GOOD_LIMIT) {
         _sensorsHealthy = true;
         _goodProbeCount = 0;
@@ -453,21 +446,22 @@ void LSPressure::updatePressure()
     return;
   }
 
-  _sapPressureAbs = _lps35hw.readPressure();        // Update mouthpiece pressure value 
+  _sapPressureAbs = _lps35hw.readPressure();        // Update mouthpiece pressure value
 
-  // If pressure mode is differential  
+  // If pressure mode is differential
   float tempAmbientPressure = 0.00;
   if(_pressureMode == PRESS_MODE_DIFF) {
-    _lps22.getEvent(&_lps22Pressure, &_lps22Temperature); 
-    tempAmbientPressure = _lps22Pressure.pressure;  // Set a temporary reference value to new reference pressure reading 
-    
-    if(tempAmbientPressure > 0.00) { // If ambient pressure is valid, update the ambient pressure value 
-      _ambientPressure = tempAmbientPressure; 
-    } 
+    _lps22.getEvent(&_lps22Pressure, &_lps22Temperature);
+    tempAmbientPressure = _lps22Pressure.pressure;  // Set a temporary reference value to new reference pressure reading
+
+    if(tempAmbientPressure > CONF_PRESS_ABS_PLAUSIBLE_MIN && tempAmbientPressure < CONF_PRESS_ABS_PLAUSIBLE_MAX) { // If ambient pressure is plausible, update the ambient pressure value
+      _ambientPressure = tempAmbientPressure;
+    }
   }
 
-  // Make sure pressure readings are valid 
-  bool validReading = (_sapPressureAbs > 0.00 && (_pressureMode != PRESS_MODE_DIFF || tempAmbientPressure > 0.00));
+  // Make sure pressure readings are valid (plausibility range — see the re-probe above)
+  bool validReading = (_sapPressureAbs > CONF_PRESS_ABS_PLAUSIBLE_MIN && _sapPressureAbs < CONF_PRESS_ABS_PLAUSIBLE_MAX
+                       && (_pressureMode != PRESS_MODE_DIFF || (_ambientPressure > CONF_PRESS_ABS_PLAUSIBLE_MIN && _ambientPressure < CONF_PRESS_ABS_PLAUSIBLE_MAX)));
 
   // Stepped offset measurement: this tick's reading IS the sample, so the old
   // 5-read blocking re-measure (up to 15 s of frozen main loop on a bad
@@ -514,12 +508,22 @@ void LSPressure::updateState()  //  TODO 2025-Feb-22 This code should be abstrac
 {
   _sapStateTimer.run();                       // Update main state timer
   _sapPrevState = _sapBuffer.getLastElement();  // Get the previous state
-  
+
   float pressureValue = getSapPressure();    // Get latest pressure value
 
   // check for sip and puff conditions
   if (!_sensorsHealthy) {
     _sapMainState = PRESS_SAP_MAIN_STATE_NONE; // Never act on readings from unhealthy sensors
+  } else if (_offsetUpdateRunning) {
+    // Boot/re-probe offset gather (4.5.7 review): until the offset lands,
+    // sapPressure is the RAW inter-sensor offset — exactly the quantity the
+    // offset exists to cancel — and on a device whose raw offset exceeds a
+    // low user threshold the old code entered PUFF/SIP STARTED on the first
+    // tick, then the offset landed ~250 ms later, the pressure collapsed,
+    // and the RELEASED fired the short-window action (a phantom click a few
+    // hundred ms after boot). "Until it completes, sip and puff stay inert"
+    // is now actually true.
+    _sapMainState = PRESS_SAP_MAIN_STATE_NONE;
   } else if (pressureValue > _puffThreshold) {
     _sapMainState = PRESS_SAP_MAIN_STATE_PUFF; // Puff detected
   }
@@ -527,13 +531,58 @@ void LSPressure::updateState()  //  TODO 2025-Feb-22 This code should be abstrac
 
     _sapMainState = PRESS_SAP_MAIN_STATE_SIP; // Sip detected
   }
+  else if (_sapPrevState.mainState == PRESS_SAP_MAIN_STATE_PUFF
+           && _sapPrevState.secondaryState == PRESS_SAP_SEC_STATE_STARTED
+           && pressureValue > _puffThreshold * CONF_PRESS_RELEASE_FRACTION) {
+    // Release hysteresis (4.5.7 review): the engage boundary used to be the
+    // release boundary, so sensor noise while holding near a threshold
+    // oscillated NONE<->PUFF and emitted a RELEASED (a phantom click, or a
+    // drag that ended on its own) per oscillation. A held puff stays a puff
+    // until the pressure falls back through CONF_PRESS_RELEASE_FRACTION of
+    // the engage threshold.
+    _sapMainState = PRESS_SAP_MAIN_STATE_PUFF;
+  }
+  else if (_sapPrevState.mainState == PRESS_SAP_MAIN_STATE_SIP
+           && _sapPrevState.secondaryState == PRESS_SAP_SEC_STATE_STARTED
+           && pressureValue < -1 * _sipThreshold * CONF_PRESS_RELEASE_FRACTION) {
+    _sapMainState = PRESS_SAP_MAIN_STATE_SIP;  // Same hysteresis, sip side
+  }
   else {                                      // Neither sip nor puff detected
     _sapMainState = PRESS_SAP_MAIN_STATE_NONE;
   }
 
+  // Sensor fault mid-hold must not emit an action-bearing RELEASED (4.5.7
+  // review): when the sensors go unhealthy while a sip/puff is HELD,
+  // _sapMainState is forced NONE above, and the transition block below
+  // would read prev = {PUFF/SIP, STARTED} and emit {PUFF/SIP, RELEASED,
+  // elapsed} — which evaluateOutputAction (it consults no health flag)
+  // fires as a real action: a phantom click/drag/menu the instant a cable
+  // is jostled mid-puff. Settle straight to idle instead; the hold was
+  // interrupted by a fault, not released. (markSensorsUnhealthy already
+  // zeroed _sapMainState; this suppresses the spurious release event.)
+  if (!_sensorsHealthy && _sapPrevState.secondaryState == PRESS_SAP_SEC_STATE_STARTED) {
+    _sapCurrState = {PRESS_SAP_MAIN_STATE_NONE, PRESS_SAP_SEC_STATE_WAITING, 0};
+    _sapBuffer.pushElement(_sapCurrState);
+    _sapStateTimer.restartTimer(_sapStateTimerId);
+    return;
+  }
+
   // Update the state using logic
   // None:None, Sip:Sip, Puff:Puff
-  if(_sapPrevState.mainState == _sapMainState){ // Current state is same as previous
+  if(_sapPrevState.mainState == _sapMainState
+     && _sapPrevState.secondaryState != PRESS_SAP_SEC_STATE_RELEASED){ // Current state is same as previous, and the previous was not a just-emitted release
+    // 4.5.7 review — restore parity with LSInput (which has had this
+    // `!= RELEASED` guard all along): without it, a re-DETECTED same action
+    // after a release (an unsteady/wavering puff crossing the hysteresis
+    // boundary, a double-puff, or boundary noise) matched here and
+    // updateLastElement'd {PUFF, RELEASED, elapsed}, LATCHING the RELEASED
+    // secondary state — and because evaluateOutputAction fires on
+    // (mainState, RELEASED, elapsed window) with no caller-side edge
+    // detection, it re-fired the release action on EVERY 50 ms poll as
+    // elapsed swept the action windows (a burst of phantom clicks / menu
+    // activations) while a genuine new puff went unrecognized. With the
+    // guard, a same-action-after-release correctly falls to the transition
+    // block below and re-arms STARTED (a fresh, single action).
     _sapCurrState = {_sapMainState, _sapPrevState.secondaryState, _sapStateTimer.elapsedTime(_sapStateTimerId)};
     _sapBuffer.updateLastElement(_sapCurrState);
   } 
@@ -568,11 +617,21 @@ void LSPressure::updateState()  //  TODO 2025-Feb-22 This code should be abstrac
       _sapStateTimer.restartTimer(_sapStateTimerId);  
   }
 
-  // No action in 1 minute : reset timer
-  //if(_sapPrevState.secondaryState==PRESS_SAP_SEC_STATE_WAITING && _sapStateTimer.elapsedTime(_sapStateTimerId)>PRESS_SAP_ACTION_TIMEOUT){  //TODO 2025-Feb-22 Remove?
-  if(_sapStateTimer.elapsedTime(_sapStateTimerId) > PRESS_SAP_ACTION_TIMEOUT) {
+  // No action in 1 minute : reset timer — ONLY while idle (4.5.7 review):
+  // the unconditional form restarted the stopwatch mid-hold, wrapping a
+  // >60 s hold's elapsed back to (T - 60 s) so the release classified into
+  // the wrong window (a 63 s sealed-tube puff fired START_MENU; a 61 s one
+  // engaged drag), and re-measured the offset DURING the hold — the new
+  // offset absorbed the held pressure, zeroed the reading ~250 ms later,
+  // and emitted a phantom RELEASED that fired the short-window action,
+  // then suppressed legitimate puffs until the next idle re-measure. The
+  // WAITING guard below is the original intent (its remains were left in
+  // a comment by the 4.2.0 rewrite); the LSInput sibling kept it all
+  // along.
+  if(_sapPrevState.secondaryState == PRESS_SAP_SEC_STATE_WAITING
+    && _sapStateTimer.elapsedTime(_sapStateTimerId) > PRESS_SAP_ACTION_TIMEOUT) {
       if (_sensorsHealthy) startOffsetUpdate();  // Stepped re-measure (was the blocking updateOffsetPressure()); skipped while unhealthy
-      _sapStateTimer.restartTimer(_sapStateTimerId);    // Reset and start the timer      
+      _sapStateTimer.restartTimer(_sapStateTimerId);    // Reset and start the timer
   }
 }
 

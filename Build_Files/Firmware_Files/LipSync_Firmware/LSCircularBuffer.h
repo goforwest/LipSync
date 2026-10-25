@@ -38,7 +38,7 @@ class LSCircularBuffer {
 
   private:
     uint16_t cBufferSize;
-    T *cBufferData;
+    T *cBufferData = nullptr;  // null until begin() (the destructor checks)
     int16_t cBufferLastPtr;
     uint8_t cBufferElementsUsed;
 };
@@ -74,25 +74,36 @@ LSCircularBuffer<T>::LSCircularBuffer()
 template<typename T>
 LSCircularBuffer<T>::~LSCircularBuffer()
 {
-  delete[] cBufferData;
+  // begin() may never have run (LSPressure::begin is skipped when the
+  // pressure sensors are absent) — delete[] on an uninitialized pointer
+  // is UB. Only free what was allocated.
+  if (cBufferData) delete[] cBufferData;
 }
 
 //*********************************//
-// Function   : begin 
-// 
+// Function   : begin
+//
 // Description: create LSCircularBuffer type with arguments
-// 
+//
 // Arguments :  uint16_t inputSize: number of elements
-// 
-// Return     : void
+//
+// Return :  void
 //*********************************//
 template<typename T>
 void LSCircularBuffer<T>::begin(uint16_t inputSize)
 {
-  cBufferData = new T[inputSize];
+  // Value-initialize the storage (4.5.7 review): `new T[n]` left POD
+  // elements as uninitialized heap, and getLastElement()/getElement() have
+  // no empty-state check — a buffer whose begin() ran but whose seeding
+  // push never did (LSPressure::begin is skipped when the pressure
+  // sensors are absent, yet ps.getState() is still reachable from
+  // joystickLoop's CF gate) read uninitialized memory into live logic.
+  // Zeros are the harmless reading for every instantiation here (state
+  // structs, points, pressures).
+  cBufferData = new T[inputSize]();
   cBufferLastPtr = 0;
-  cBufferElementsUsed = 0;  
-  cBufferSize = inputSize; 
+  cBufferElementsUsed = 0;
+  cBufferSize = inputSize;
 }
 
 //*********************************//
