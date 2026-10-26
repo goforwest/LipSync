@@ -121,35 +121,34 @@ void initializeBluefruit(const char* s) {
   if (sdAlreadyEnabled) {
     (void) sd_softdevice_disable();  // MBR-serviced SVC: legal whether or not the SD is up
   }
-  // 4.5.15 bench round 9: pcode=0x1001 DECODED — NRF_ERROR_SDM_INCORRECT_
-  // INTERRUPT_CONFIGURATION: the SDM scans the NVIC at enable time and
-  // refuses if any ENABLED interrupt sits at an SD-reserved priority
-  // level (0-3). The bench's probe (pstep=1) proved our own mirrored
-  // sd_softdevice_enable() fails with exactly that code on every BLE boot;
-  // the vendored Wire enabled TWIM at priority 3 (inherited from upstream)
-  // and our BLE boot reaches this task only AFTER the screen/sensor
-  // polling has enabled it. The stock example (which works on this unit)
-  // never touches Wire; 4.1.0 worked only because its Bluefruit.begin()
-  // ran BEFORE any Wire.begin(). The Wire now takes priority 4 at the
-  // source (see Wire_nRF52.cpp), and this sweep is the belt-and-braces
-  // plus the on-wire proof: every enabled IRQ below the boundary is
-  // recorded (bad1=/bad2= bit masks, IRQ n = bit n — the BOOT/HB lines
-  // carry them) and demoted to 4 BEFORE the probe runs, so sd_softdevice_
-  // enable sees a legal NVIC no matter what any future boot path enables.
-  // demoted= counts the demotions; bad1/bad2 hold the PRE-demotion state
-  // so the log names the true offender even on a boot where the demotion
-  // saved it.
+  // 4.5.17 bench round 11: THE PRIORITY MODEL, CORRECTED BY THE BENCH. The
+  // classic "app must use 4-7 with the SoftDevice" rule is WRONG for this
+  // S140 6.1.1 — the actual SD-reserved set is {0, 1, 4}, stated verbatim
+  // by the core's own TinyUSB port ("Priorities 0, 1, 4 (nRF52) are
+  // reserved for SoftDevice"), and proven on this bench: the stock example
+  // passes sd_softdevice_enable's check with USBD enabled at priority 2,
+  // while EVERY failing BLE boot in the hunt carried an enabled interrupt
+  // at exactly 4 — the 4.5.13 witness (TIMER3 at 4 has blocked every enable
+  // since 4.5.10, when the BLE init moved after the witness arms), the
+  // 4.5.15 Wire "fix", and the 4.5.15/16 sweep's own USBD demotions. The
+  // source fixes this round put everything we own at priority 7 (legal
+  // under BOTH models, never masked by FreeRTOS's BASEPRI=2 sections);
+  // this sweep is the belt-and-braces: any enabled IRQ found at 0, 1 or 4
+  // is recorded (bad1=/bad2= bit masks, IRQ n = bit n — the BOOT/HB lines
+  // carry them) and demoted to 7 (dem= counts) BEFORE the probe runs, so
+  // the enable sees a legal NVIC whatever any future boot path enables.
   {
     for (int irq = 0; irq < 48; irq++) {  // nRF52840: 48 external IRQs (0-47)
       const uint32_t bit = 1UL << (irq & 31);
       volatile uint32_t* iser = (irq < 32) ? &NVIC->ISER[0] : &NVIC->ISER[1];
-      if ((*iser & bit) && NVIC_GetPriority((IRQn_Type)irq) < 4) {
+      const uint32_t prio = NVIC_GetPriority((IRQn_Type)irq);
+      if ((*iser & bit) && (prio == 0 || prio == 1 || prio == 4)) {
         if (irq < 32) {
           g_bleIrqBad1 |= bit;
         } else {
           g_bleIrqBad2 |= bit;
         }
-        NVIC_SetPriority((IRQn_Type)irq, 4);
+        NVIC_SetPriority((IRQn_Type)irq, 7);
         g_bleProbeDemoted++;
       }
     }

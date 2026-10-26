@@ -219,18 +219,15 @@ void TwoWire::begin(void) {
   _p_twim->PSEL.SDA = _uc_pinSDA;
 
   NVIC_ClearPendingIRQ(_IRQn);
-  // 4.5.15 bench round 9: priority 3 was inherited verbatim from upstream —
-  // and it is inside the SoftDevice-reserved range (0-3). sd_softdevice_
-  // enable() scans the NVIC and refuses with NRF_ERROR_SDM_INCORRECT_
-  // INTERRUPT_CONFIGURATION (0x1001 — the exact code the 4.5.14 probe
-  // captured on every BLE boot) if ANY enabled interrupt sits below the
-  // boundary. 4.1.0's BLE worked only by ORDER (its Bluefruit.begin() ran
-  // before any Wire.begin() enabled this IRQ), not by legality. Priority 4
-  // is legal for both the SoftDevice (first app-legal level) and FreeRTOS
-  // (>= configMAX_SYSCALL_INTERRUPT_PRIORITY=2 on this core), and the TWIM
-  // handler calls no kernel APIs. Upstream (Seeeduino:nrf52 1.1.13
-  // libraries/Wire) carries the same 3.
-  NVIC_SetPriority(_IRQn, 4);
+  // 4.5.15/4.5.17 bench rounds 9-11: upstream enables this at priority 3,
+  // which the bench proved legal — but the actual S140 6.1.1 SD-reserved
+  // set is {0, 1, 4} (the core's own TinyUSB port documents it; the stock
+  // example passes sd_softdevice_enable's check with USBD at 2), so the
+  // first attempt at this fix (priority 4, based on the wrong "app-legal
+  // = 4-7" model) was itself illegal and contributed to the 0x1001. Priority
+  // 7 is legal under both models, never masked by FreeRTOS's BASEPRI=2
+  // critical sections, and the TWIM handler calls no kernel APIs.
+  NVIC_SetPriority(_IRQn, 7);
   NVIC_EnableIRQ(_IRQn);
 }
 
@@ -260,10 +257,10 @@ void TwoWire::begin(uint8_t address) {
   _p_twis->INTENSET = TWIS_INTEN_STOPPED_Msk | TWIS_INTEN_ERROR_Msk | TWIS_INTEN_WRITE_Msk | TWIS_INTEN_READ_Msk;
 
   NVIC_ClearPendingIRQ(_IRQn);
-  // 4.5.15: see the master-path comment above — priority 3 is
-  // SoftDevice-illegal; the slave path is unused by this firmware but is
-  // fixed for the same reason.
-  NVIC_SetPriority(_IRQn, 4);
+  // 4.5.17: see the master-path comment above — priority 7, legal under
+  // both SD reservation models; the slave path is unused by this firmware
+  // but is fixed for the same reason.
+  NVIC_SetPriority(_IRQn, 7);
   NVIC_EnableIRQ(_IRQn);
 
   _p_twis->ENABLE = (TWIS_ENABLE_ENABLE_Enabled << TWIS_ENABLE_ENABLE_Pos);

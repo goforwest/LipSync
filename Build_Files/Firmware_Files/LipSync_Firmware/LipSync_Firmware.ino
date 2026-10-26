@@ -209,22 +209,22 @@ void initHangWitness() {
   NRF_TIMER3->SHORTS = TIMER_SHORTS_COMPARE0_CLEAR_Enabled << TIMER_SHORTS_COMPARE0_CLEAR_Pos;
   NRF_TIMER3->INTENSET = TIMER_INTENSET_COMPARE0_Msk;
   // witness v9 + bench fix: HIGHEST priority — a hang that still blocks it
-  // can only be PRIMASK-level masking. BUT the SoftDevice reserves the top
-  // priority levels when it is enabled: an app IRQ at priority 0 firing
-  // while the SD is up is illegal. 4.5.10 moved the BLE init to a task that
-  // runs AFTER this arm, which silently broke this function's old
-  // "needsInitialization == false <=> the stack was already begun" shortcut
-  // (the stale comment below claimed the SD was enabled in beginComOpMode
-  // BEFORE this point): on every BLE boot the witness armed at priority 0
-  // — needsInitialization was still true, the init had merely been DEFERRED
-  // — and the init task then enabled the SoftDevice UNDER an app IRQ
-  // parked on an SD-reserved level. The bench's ble=3 st=1 verdict
-  // (sd_softdevice_enable fails on every BLE boot, 2026-10-26) is that
-  // window. The arm-time rule is now: priority 0 ONLY on a boot that will
-  // never bring the SD up (USB/safe-mode — the freeze hunt keeps its
-  // sharpest tool); any boot with the BLE init still pending takes the
-  // SD-legal priority 4 from the moment the witness arms.
-  NVIC_SetPriority(TIMER3_IRQn, (needsInitialization && !g_bleInitPending) ? 0 : 4);
+  // can only be PRIMASK-level masking. BUT the SoftDevice reserves specific
+  // priority levels when it is enabled, and the bench (2026-10-26, rounds
+  // 8-11) pinned the ACTUAL reserved set for this S140 6.1.1 to {0, 1, 4} —
+  // the core's own TinyUSB port states it verbatim ("Priorities 0, 1, 4
+  // (nRF52) are reserved for SoftDevice"), the stock example passes the
+  // SDM's enable check with USBD at priority 2, and every failing BLE boot
+  // in the hunt had an enabled interrupt at exactly 4 — including this
+  // witness itself, whose 4.5.13 move to 4 (based on the WRONG "app-legal
+  // = 4-7" model) blocked sd_softdevice_enable with 0x1001 on every BLE
+  // boot since 4.5.10, when the BLE init moved AFTER the witness arms.
+  // Priority 7 is legal under BOTH models (classic 4-7 and the confirmed
+  // {0,1,4}-reserved), never masked by FreeRTOS's BASEPRI=2 critical
+  // sections, and still preempts any thread-mode hang — the witness's
+  // actual job. USB-only boots (SD never comes up) keep priority 0 for
+  // the freeze hunt.
+  NVIC_SetPriority(TIMER3_IRQn, (needsInitialization && !g_bleInitPending) ? 0 : 7);
   NVIC_ClearPendingIRQ(TIMER3_IRQn);
   NVIC_EnableIRQ(TIMER3_IRQn);
   NRF_TIMER3->TASKS_START = 1;
