@@ -16,6 +16,7 @@
   If not, see <http://www.gnu.org/licenses/>
 */
 #include <bluefruit.h>
+#include <nrf_sdm.h>
 
 #define MOUSE_LEFT 1
 #define MOUSE_RIGHT 2
@@ -64,6 +65,28 @@ void initializeBluefruit(const char* s) {
   // bail with needsInitialization still true: every BLE call site is
   // guarded (isConnected, btFeedbackLoop), no SVC call is made, and the
   // boot trace names the failure instead of faulting.
+  // 4.5.13 bench round 6: the 2026-10-26 session finally captured the
+  // verdict — ble=3 st=1 on every BLE boot: Bluefruit.begin() itself fails,
+  // the SoftDevice enable is the dying stage. Two candidate causes, both
+  // fixed this round:
+  // (1) The hang witness (TIMER3) armed at priority 0 BEFORE this task ran
+  //     — an SD-reserved level — because needsInitialization is still true
+  //     while the init is merely DEFERRED (the witness's arm-time shortcut
+  //     was written for the pre-4.5.10 world where the enable happened
+  //     before the arm). The witness now takes the SD-legal priority 4 on
+  //     any boot with the init pending (see initHangWitness).
+  // (2) The bootloader may have left the SoftDevice ENABLED when it jumped
+  //     to the app (this board updates through that bootloader — every
+  //     flash lands here), and sd_softdevice_enable() on an already-enabled
+  //     SD fails outright. Probe first — the result rides the BOOT/HB lines
+  //     as sd= (0 = down, 1 = leftover) — and disable a leftover so begin()
+  //     starts from the clean slate it expects.
+  uint8_t sdAlreadyEnabled = 0;
+  (void) sd_softdevice_is_enabled(&sdAlreadyEnabled);
+  g_bleSdWasEnabled = (sdAlreadyEnabled != 0) ? 1 : 0;
+  if (sdAlreadyEnabled) {
+    (void) sd_softdevice_disable();  // MBR-serviced SVC: legal whether or not the SD is up; the enable below re-brings it with OUR clock config
+  }
   if (!Bluefruit.begin()) {
     g_bleInitStage = 1;
     Serial.println("BOOT: BLE FAILED at SoftDevice enable");

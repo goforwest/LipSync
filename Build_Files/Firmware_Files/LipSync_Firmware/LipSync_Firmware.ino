@@ -193,6 +193,14 @@ void writeTrailByte(uint8_t step)  { NRF_POWER->GPREGRET2 = (NRF_POWER->GPREGRET
 // interrupts, the IRQ never fires and the hardware DOG still ends it
 // (pt=0) — that split (pm=1 vs pm=0) is itself decisive: IRQs-live hang vs
 // IRQs-masked hang.
+//
+// 4.5.13: declared up here because initHangWitness() reads it at ARM time.
+// A BLE boot has the SoftDevice enable still PENDING when the witness arms
+// (the init task starts at the very END of setup), so the witness must
+// take an SD-legal priority from the start — see the priority note in the
+// body below. g_bleInitPending is set by beginComOpMode long before this
+// point in setup.
+static volatile bool g_bleInitPending = false;   // a BLE boot deferred its init to the task
 void initHangWitness() {
   NRF_TIMER3->MODE = TIMER_MODE_MODE_Timer << TIMER_MODE_MODE_Pos;
   NRF_TIMER3->BITMODE = TIMER_BITMODE_BITMODE_32Bit << TIMER_BITMODE_BITMODE_Pos;
@@ -203,12 +211,20 @@ void initHangWitness() {
   // witness v9 + bench fix: HIGHEST priority — a hang that still blocks it
   // can only be PRIMASK-level masking. BUT the SoftDevice reserves the top
   // priority levels when it is enabled: an app IRQ at priority 0 firing
-  // while the SD is up is illegal. On BLE boots the SD was enabled in
-  // beginComOpMode BEFORE this point, so the witness must take an SD-legal
-  // priority there; USB-only boots (SD never enabled) keep priority 0 for
-  // the freeze hunt. needsInitialization == false <=> the stack was begun
-  // (see LSBLE.h).
-  NVIC_SetPriority(TIMER3_IRQn, needsInitialization ? 0 : 4);
+  // while the SD is up is illegal. 4.5.10 moved the BLE init to a task that
+  // runs AFTER this arm, which silently broke this function's old
+  // "needsInitialization == false <=> the stack was already begun" shortcut
+  // (the stale comment below claimed the SD was enabled in beginComOpMode
+  // BEFORE this point): on every BLE boot the witness armed at priority 0
+  // — needsInitialization was still true, the init had merely been DEFERRED
+  // — and the init task then enabled the SoftDevice UNDER an app IRQ
+  // parked on an SD-reserved level. The bench's ble=3 st=1 verdict
+  // (sd_softdevice_enable fails on every BLE boot, 2026-10-26) is that
+  // window. The arm-time rule is now: priority 0 ONLY on a boot that will
+  // never bring the SD up (USB/safe-mode — the freeze hunt keeps its
+  // sharpest tool); any boot with the BLE init still pending takes the
+  // SD-legal priority 4 from the moment the witness arms.
+  NVIC_SetPriority(TIMER3_IRQn, (needsInitialization && !g_bleInitPending) ? 0 : 4);
   NVIC_ClearPendingIRQ(TIMER3_IRQn);
   NVIC_EnableIRQ(TIMER3_IRQn);
   NRF_TIMER3->TASKS_START = 1;
@@ -259,7 +275,7 @@ void bootTrailStamp(uint8_t step) {
 // end of setup; every BLE call site in the loop is guarded so the pre-init
 // window is a no-op window, not a fault window.
 volatile int g_bleInitStage = 0;                 // 4.5.11: init-task progress/failure stage (see LSApiDeclarations.h)
-static volatile bool g_bleInitPending = false;   // a BLE boot deferred its init to the task
+volatile int8_t g_bleSdWasEnabled = -1;          // 4.5.13: the init task's SD probe: -1 = not probed yet, 0 = the SoftDevice was down (normal), 1 = it was ALREADY enabled when the app started (bootloader leftover — see LSBLE.h)
 static volatile bool g_bleInitDone = false;       // the task finished (success or failure)
 static char g_bleDeviceName[CONF_BLE_DEVICE_NAME_SZ] = {0};  // the advertising name (static: outlives setup's frame)
 static StackType_t g_bleInitStack[CONF_BLE_INIT_TASK_STACK_BYTES / sizeof(StackType_t)];
@@ -635,7 +651,9 @@ void loop() {
       Serial.print(F(" ble="));
       Serial.print(bleStateFinal);
       Serial.print(F(" st="));
-      Serial.println(g_bleInitStage);
+      Serial.print(g_bleInitStage);
+      Serial.print(F(" sd="));
+      Serial.println(g_bleSdWasEnabled);  // -1 = probe not run (init still in flight), 0 = SD was down, 1 = SD was ALREADY enabled (bootloader leftover)
     }
     g_hostHasSpoken = true;
   }
@@ -681,7 +699,9 @@ void loop() {
     Serial.print(F(" ble="));
     Serial.print(bleState);
     Serial.print(F(" st="));
-    Serial.println(g_bleInitStage);  // 1=SD enable 2=DIS 3=HID 4=advertising 5=success
+    Serial.print(g_bleInitStage);  // 1=SD enable 2=DIS 3=HID 4=advertising 5=success
+    Serial.print(F(" sd="));
+    Serial.println(g_bleSdWasEnabled);  // -1 = probe not run yet, 0 = SD was down, 1 = SD was already up (bootloader leftover)
   }
 
   // Feed the hardware watchdog directly from the live loop (bench
@@ -774,7 +794,9 @@ void loop() {
     Serial.print(g_displayConnected ? 1 : 0);
     if (bleInitFailed) {
       Serial.print(F(" ble=3 st="));
-      Serial.println(g_bleInitStage);
+      Serial.print(g_bleInitStage);
+      Serial.print(F(" sd="));
+      Serial.println(g_bleSdWasEnabled);
     } else {
       Serial.println();
     }
@@ -3666,6 +3688,28 @@ void ledBtScanEffect() {
   }
 }
 
+//***LED BLUETOOTH FAILED EFFECT FUNCTION***//
+// Function   : ledBtFailedEffect
+//
+// Description: This function performs the BLE-init-failed blink (red) —
+// btFeedbackLoop re-arms it per poll while the init task has reported
+// failure, the logless user's "Bluetooth is broken" cue (bench 2026-10-26:
+// the user watched a fully dark device and had no way to know the stack
+// had never come up). Reuses the CONF_TIMER_LED_BT slot — it can never
+// coexist with the scan blink above: the scan blink requires
+// needsInitialization false, this one requires it true.
+//
+// Return     : void
+//****************************************//
+void ledBtFailedEffect() {
+  if (ledStateTimer.getNumRuns(ledTimerId[CONF_TIMER_LED_BT]) % 2) {
+    led.setLedColor(CONF_BT_LED_NUMBER, LED_CLR_NONE, CONF_BT_LED_BRIGHTNESS);
+
+  } else {
+    led.setLedColor(CONF_BT_LED_NUMBER, LED_CLR_RED, CONF_BT_LED_BRIGHTNESS);
+  }
+}
+
 //***LED ERROR EFFECT FUNCTION***//
 // Function   : ledErrorEffect
 //
@@ -3786,8 +3830,8 @@ void setLedDefault() {
     case CONF_OPERATING_MODE_MOUSE:
       {
         if (g_comMode == CONF_COM_MODE_USB) {
-          led.setLedColor(CONF_LED_MICRO, LED_CLR_PURPLE, led.getLedBrightness());  // Set micro LED to purple if it's in BLE MODE
-        } else if (g_comMode == CONF_COM_MODE_BLE && btmouse.isConnected()) {    // Set micro LED to blue if it's in BLE MODE
+          led.setLedColor(CONF_LED_MICRO, LED_CLR_PURPLE, led.getLedBrightness());  // USB: micro LED purple (stock v4.1 visual, kept — the v4.1 comment claimed this was the BLE indication, but the branch conditions and their comments were swapped)
+        } else if (g_comMode == CONF_COM_MODE_BLE && btmouse.isConnected()) {    // BLE connected: micro LED solid blue — while DISCONNECTED btFeedbackLoop blinks it blue when advertising is up, red when init failed, dark while init is in flight
           led.setLedColor(CONF_BT_LED_NUMBER, LED_CLR_BLUE, led.getLedBrightness());
         }
         break;
@@ -3822,7 +3866,22 @@ void btFeedbackLoop() {
   // call is wasted — and on safe-mode boots the Bluefruit stack may never
   // have been initialized, where btmouse.isConnected() blocks the SoftDevice
   // for a full second (observed live as a flat 1 s main-loop tax).
-  if (g_comMode != CONF_COM_MODE_BLE || needsInitialization) return;  // needsInitialization: the SoftDevice must actually have been begun (4.5.7 review) — a stored/live state with CM=BLE but no BLE begin() blocks 1 s per poll here
+  if (g_comMode != CONF_COM_MODE_BLE) return;
+  // needsInitialization: the SoftDevice must actually have been begun (4.5.7
+  // review) — a stored/live state with CM=BLE but no BLE begin() blocks 1 s
+  // per poll on isConnected(). 4.5.13: if the init task has FINISHED while
+  // needsInitialization is still true, the stack never came up (ble=3) —
+  // blink the BT LED red per poll so a user without a log sees the degraded
+  // state instead of a dark device; re-armed without deleting exactly like
+  // the scan blink below (a delete would reset the cadence every second).
+  // While the init is still in flight (g_bleInitDone false) the state is
+  // transient — stay dark and return.
+  if (needsInitialization) {
+    if (g_bleInitPending && g_bleInitDone) {
+      ledTimerId[CONF_TIMER_LED_BT] = ledStateTimer.setTimer(CONF_BT_SCAN_BLINK_DELAY, 0, ((CONF_BT_SCAN_BLINK_NUMBER * 2) + 1), ledBtFailedEffect);
+    }
+    return;
+  }
 
   // Get the current bluetooth connection state
   bool tempIsConnected = btmouse.isConnected();

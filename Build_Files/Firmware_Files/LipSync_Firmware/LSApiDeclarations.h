@@ -272,6 +272,11 @@ extern unsigned long g_menuInputHoldMs;  // (4.5.7 bench fix) hold duration of t
 // failed (Bluefruit.begin), 2 = DIS begin failed, 3 = HID begin failed,
 // 4 = advertising start failed, 5 = full success.
 extern volatile int g_bleInitStage;
+// 4.5.13: the init task's SoftDevice probe, printed as sd= on the BOOT/HB
+// lines: -1 = not probed yet (init still in flight), 0 = the SD was down
+// when the app started (normal), 1 = the SD was ALREADY enabled (the
+// bootloader left it up — LSBLE.h disables it before begin()).
+extern volatile int8_t g_bleSdWasEnabled;
 bool switchRemapAllowed(int actionNumber, bool gamepad);  // (4.5.7 review) column-aware: the gamepad cells reject the mouse hold modes
 void sanitizeInputWindows();                              // (4.5.7 review) boot-load validation for WS/WL/WM
 void switchRemapApplyCell(int jack, int window, bool gamepad, int actionNumber);
