@@ -684,16 +684,9 @@ void loop() {
   // reset reason and the LIVE BLE task state — any serial monitor opened
   // mid-fault-loop captures the state within one second, and the last line
   // before a death names the fault's neighborhood.
-  // 4.5.11: the BLE boot's deferred USB attach — once, the moment the BLE
-  // task reports (success or failure), or after the fallback so serial
-  // recovery is always reachable.
-  static bool bleUsbAttached = false;
-  if (g_bleInitPending && !bleUsbAttached &&
-      (g_bleInitDone || millis() >= CONF_BLE_INIT_USB_ATTACH_FALLBACK_MS)) {
-    bleUsbAttached = true;
-    USBDevice.attach();
-    Serial.println(F("BOOT: USB attach (BLE boot)"));
-  }
+  // 4.5.11's deferred BLE-boot attach (wait for the task verdict, or a
+  // 10 s fallback) is RETIRED as of 4.5.18 — beginComOpMode attaches at
+  // the stock point, before the SoftDevice comes up (see its comment).
 
   static unsigned long lastBootHeaderMs = 0;
   if (!g_hostHasSpoken && millis() < 30000UL && (millis() - lastBootHeaderMs >= 1000UL)) {
@@ -721,7 +714,7 @@ void loop() {
     Serial.print(F(" sd="));
     Serial.print(g_bleSdWasEnabled);  // -1 = probe not run yet, 0 = SD was down, 1 = SD was already up (bootloader leftover)
     Serial.print(F(" pstep="));
-    Serial.print(g_bleProbeStep);     // 4.5.14: the begin()-mirror probe's verdict (11 = all passed, 1..10 = that call failed)
+    Serial.print(g_bleProbeStep);     // build shape: 11 = probe-mirror build (passed), 12 = direct-begin build (4.5.18+), 0/1..10 = historical
     Serial.print(F(" pcode=0x"));
     Serial.print(g_bleProbeCode, HEX);
     Serial.print(F(" need=0x"));
@@ -1841,13 +1834,14 @@ void beginComOpMode() {
             // 4.5.10: the name is copied to a STATIC buffer and the init is
             // DEFERRED to the 16 KB task (started at the end of setup) —
             // the loop task's 4 KB stack must not carry Bluefruit.begin.
-            // 4.5.11: the USB ATTACH is deferred too — Seeed's core lacks
-            // the Adafruit USE_TINYUSB hooks (usb_softdevice_pre/post_enable
-            // are called in bluefruit.cpp but defined nowhere in this core),
-            // so nothing coordinates an attached USB device with the
-            // SoftDevice enable; the stock boot order is SD first. The
-            // loop attaches once the BLE task reports (or the fallback
-            // timer expires, keeping serial recovery reachable).
+            // 4.5.18: the USB attach is RESTORED TO THE STOCK ORDER —
+            // enumerated BEFORE the SoftDevice comes up, exactly like the
+            // stock blehid_mouse example and 4.1.0. The 4.5.11 deferral
+            // was built on a since-RETRACTED claim (the core's USB/SD
+            // coexistence hooks DO exist and begin() runs them itself),
+            // and it left our boot attaching into a live SoftDevice — a
+            // deviation no working recipe performs.
+            USBDevice.attach();
             snprintf(g_bleDeviceName, sizeof(g_bleDeviceName), "LS_%s", g_deviceUID.c_str());
             g_bleInitPending = true;
             Serial.println(F("BOOT: BLE deferred to 16KB task"));
