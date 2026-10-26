@@ -289,6 +289,10 @@ extern volatile uint32_t g_bleProbeNeed;
 extern volatile uint32_t g_bleIrqBad1;
 extern volatile uint32_t g_bleIrqBad2;
 extern volatile uint8_t g_bleProbeDemoted;
+// 4.5.19 (expert consult): the RAW err_t the failing DIS/HID begin returned —
+// on the st=2 path this is sd_ble_gatts_service_add's own error code
+// (0x4=NO_MEM, 0x7=INVALID_PARAM, 0xF=FORBIDDEN, 0x10=INVALID_ADDR).
+extern volatile uint32_t g_bleInitRc;
 bool switchRemapAllowed(int actionNumber, bool gamepad);  // (4.5.7 review) column-aware: the gamepad cells reject the mouse hold modes
 void sanitizeInputWindows();                              // (4.5.7 review) boot-load validation for WS/WL/WM
 void switchRemapApplyCell(int jack, int window, bool gamepad, int actionNumber);

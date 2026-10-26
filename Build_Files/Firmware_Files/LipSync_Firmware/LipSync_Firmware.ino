@@ -278,7 +278,8 @@ volatile int g_bleInitStage = 0;                 // 4.5.11: init-task progress/f
 volatile int8_t g_bleSdWasEnabled = -1;          // 4.5.13: the init task's SD probe: -1 = not probed yet, 0 = the SoftDevice was down (normal), 1 = it was ALREADY enabled when the app started (bootloader leftover — see LSBLE.h)
 volatile uint8_t g_bleProbeStep = 0;             // 4.5.14: the begin()-mirror probe's first failing call (0 = not run/non-BLE, 1..10 = that call failed, 11 = all passed) — see LSBLE.h
 volatile uint32_t g_bleProbeCode = 0;            // 4.5.14: the failing call's SoftDevice error code (0 = none)
-volatile uint32_t g_bleProbeNeed = 0;            // 4.5.14: sd_ble_enable's required app RAM base (on NO_MEM, the smoking gun vs 0x20006000)
+volatile uint32_t g_bleProbeNeed = 0;           // 4.5.14: sd_ble_enable's required app RAM base (on NO_MEM, the smoking gun vs 0x20006000)
+volatile uint32_t g_bleInitRc = 0;              // 4.5.19 (expert consult): the RAW err_t from the failing DIS/HID begin — sd_ble_gatts_service_add's own code on the st=2 path (0x4=NO_MEM, 0x7=INVALID_PARAM, 0xF=FORBIDDEN, 0x10=INVALID_ADDR)
 volatile uint32_t g_bleIrqBad1 = 0;              // 4.5.15: pre-demotion mask of enabled IRQs 0-31 found at an SD-reserved priority (< 4) at BLE-init time (bit = IRQ number)
 volatile uint32_t g_bleIrqBad2 = 0;              // 4.5.15: the same mask for IRQs 32-47
 volatile uint8_t g_bleProbeDemoted = 0;          // 4.5.15: how many the sweep demoted to 4 before the enable
@@ -671,7 +672,9 @@ void loop() {
       Serial.print(F(" bad2=0x"));
       Serial.print(g_bleIrqBad2, HEX);
       Serial.print(F(" dem="));
-      Serial.println(g_bleProbeDemoted);
+      Serial.print(g_bleProbeDemoted);
+      Serial.print(F(" rc=0x"));
+      Serial.println(g_bleInitRc, HEX);
     }
     g_hostHasSpoken = true;
   }
@@ -724,7 +727,9 @@ void loop() {
     Serial.print(F(" bad2=0x"));
     Serial.print(g_bleIrqBad2, HEX);   // 4.5.15: IRQs 32-47 of the same sweep
     Serial.print(F(" dem="));
-    Serial.println(g_bleProbeDemoted);
+    Serial.print(g_bleProbeDemoted);
+    Serial.print(F(" rc=0x"));
+    Serial.println(g_bleInitRc, HEX);
   }
 
   // Feed the hardware watchdog directly from the live loop (bench
@@ -831,7 +836,9 @@ void loop() {
       Serial.print(F(" bad2=0x"));
       Serial.print(g_bleIrqBad2, HEX);
       Serial.print(F(" dem="));
-      Serial.println(g_bleProbeDemoted);
+      Serial.print(g_bleProbeDemoted);
+      Serial.print(F(" rc=0x"));
+      Serial.println(g_bleInitRc, HEX);
     } else {
       Serial.println();
     }

@@ -149,15 +149,31 @@ void initializeBluefruit(const char* s) {
   Bluefruit.setName(s);
   bledis.setManufacturer("MakersMakingChange");
   bledis.setModel("LipSync Mouse");
-  if (!bledis.begin()) {
-    g_bleInitStage = 2;
-    Serial.println("BOOT: BLE FAILED at DIS begin");
-    return;
+  // 4.5.19 (expert consult, 2026-10-26): BLEDis::begin() and
+  // BLEHidAdafruit::begin() return err_t — the RAW SoftDevice error code
+  // (sd_ble_gatts_service_add's own value on the DIS failure path, via
+  // VERIFY_STATUS). The stage checks were discarding it into a bool.
+  // The code now rides the BOOT/HB lines as rc= so the next log answers
+  // the expert's decisive question directly: 0x4 = NRF_ERROR_NO_MEM
+  // (attr-table exhaustion — check the active table size), 0x7 = INVALID_PARAM,
+  // 0xF = FORBIDDEN, 0x10 = INVALID_ADDR (pointers/corruption).
+  {
+    err_t disRc = bledis.begin();
+    if (disRc != NRF_SUCCESS) {
+      g_bleInitStage = 2;
+      g_bleInitRc = disRc;
+      Serial.println("BOOT: BLE FAILED at DIS begin");
+      return;
+    }
   }
-  if (!blehid.begin()) {
-    g_bleInitStage = 3;
-    Serial.println("BOOT: BLE FAILED at HID begin");
-    return;
+  {
+    err_t hidRc = blehid.begin();
+    if (hidRc != NRF_SUCCESS) {
+      g_bleInitStage = 3;
+      g_bleInitRc = hidRc;
+      Serial.println("BOOT: BLE FAILED at HID begin");
+      return;
+    }
   }
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
   Bluefruit.Advertising.addTxPower();
