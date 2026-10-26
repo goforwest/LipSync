@@ -54,6 +54,15 @@ class LSBLEMouse {
 // the same copy-paste-invitation class that motivated 4.5.4's LSUSBKeyboard
 // removal. (The btKeyReport struct went with it.)
 
+// 4.5.14: the probe's SoftDevice fault handler. An SD assert is unrecoverable
+// by definition (the SD resets the chip on return), so there is nothing to do
+// but let it — the core's own nrf_error_cb at CFG_DEBUG=0 is an empty body
+// that hangs in while(1) yield() at CFG_DEBUG!=0; ours must never hang the
+// init task if the impossible happens.
+static void lipsyncBleProbeFaultHandler(uint32_t id, uint32_t pc, uint32_t info) {
+  (void) id; (void) pc; (void) info;  // the SD calls NVIC_SystemReset() when we return
+}
+
 void initializeBluefruit(const char* s) {
   // 4.5.9 bench round 3: every begin()/start() is CHECKED and the failure is
   // printed. A failed SoftDevice enable previously cascaded into the
@@ -65,27 +74,112 @@ void initializeBluefruit(const char* s) {
   // bail with needsInitialization still true: every BLE call site is
   // guarded (isConnected, btFeedbackLoop), no SVC call is made, and the
   // boot trace names the failure instead of faulting.
-  // 4.5.13 bench round 6: the 2026-10-26 session finally captured the
-  // verdict — ble=3 st=1 on every BLE boot: Bluefruit.begin() itself fails,
-  // the SoftDevice enable is the dying stage. Two candidate causes, both
-  // fixed this round:
-  // (1) The hang witness (TIMER3) armed at priority 0 BEFORE this task ran
-  //     — an SD-reserved level — because needsInitialization is still true
-  //     while the init is merely DEFERRED (the witness's arm-time shortcut
-  //     was written for the pre-4.5.10 world where the enable happened
-  //     before the arm). The witness now takes the SD-legal priority 4 on
-  //     any boot with the init pending (see initHangWitness).
-  // (2) The bootloader may have left the SoftDevice ENABLED when it jumped
-  //     to the app (this board updates through that bootloader — every
-  //     flash lands here), and sd_softdevice_enable() on an already-enabled
-  //     SD fails outright. Probe first — the result rides the BOOT/HB lines
-  //     as sd= (0 = down, 1 = leftover) — and disable a leftover so begin()
-  //     starts from the clean slate it expects.
+  // 4.5.13 bench round 7: the 2026-10-26 06:45 session captured ble=3 st=1
+  // sd=0 — the SoftDevice was DOWN at boot (the bootloader-leftover theory
+  // is dead) and the witness was SD-legal, so the failure is INSIDE
+  // AdafruitBluefruit::begin(), which swallows every return code
+  // (VERIFY_STATUS(err, false)) and reports nothing but false. "st=1" has
+  // therefore been over-claiming: begin() is enable + 8 cfg_sets +
+  // sd_ble_enable (the classic APP-RAM-ceiling check) + opt/semaphore/task
+  // calls, and any of them can be the one dying.
+  // 4.5.14 bench round 8: this probe MIRRORS begin()'s SoftDevice/BLE-level
+  // sequence call-for-call — sd_softdevice_enable, the 8 sd_ble_cfg_set
+  // calls with begin()'s exact stock constants (defaults: prph=1,
+  // central=0, attr table 0x1000, MTU 23, stock queue sizes, service
+  // changed on), then sd_ble_enable — capturing each return code. Results
+  // ride the BOOT/HB lines as pstep=/pcode=/need=:
+  //   pstep 0     = probe not run (non-BLE boot)
+  //   pstep 1..10 = that call failed; pcode = its SoftDevice error code
+  //                 (1=enable, 2=VS_UUID, 3=ROLE_COUNT, 4=SERVICE_CHANGED,
+  //                  5=ATTR_TAB_SIZE, 6=CONN_CFG_GATT, 7=CONN_CFG_GAP,
+  //                  8=CONN_CFG_GATTS, 9=CONN_CFG_GATTC, 10=sd_ble_enable —
+  //                  need= then holds the SD's required APP RAM base, the
+  //                  smoking gun when pcode=NO_MEM)
+  //   pstep 11    = the whole probe PASSED — if begin() STILL fails, the
+  //                 failure is in begin()'s tail (sd_ble_opt_set /
+  //                 Periph.begin / name set / event semaphores / task
+  //                 creation) and the next round instruments those.
+  // If the probe passes, the SoftDevice is DISABLED again and begin()
+  // re-runs the identical sequence that just passed — a passing probe
+  // means begin() itself comes up (advertising, blue blink, pairable). A
+  // failing probe means begin() dies at the same call — but now named.
   uint8_t sdAlreadyEnabled = 0;
   (void) sd_softdevice_is_enabled(&sdAlreadyEnabled);
   g_bleSdWasEnabled = (sdAlreadyEnabled != 0) ? 1 : 0;
   if (sdAlreadyEnabled) {
-    (void) sd_softdevice_disable();  // MBR-serviced SVC: legal whether or not the SD is up; the enable below re-brings it with OUR clock config
+    (void) sd_softdevice_disable();  // MBR-serviced SVC: legal whether or not the SD is up
+  }
+  {
+    nrf_clock_lf_cfg_t probeClock = { NRF_CLOCK_LF_SRC_XTAL, 0, 0, NRF_CLOCK_LF_ACCURACY_20_PPM };
+    extern uint32_t __data_start__[];  // the app RAM base begin() passes to every cfg call (linker symbol, 0x20006000)
+    g_bleProbeStep = 1;
+    g_bleProbeCode = sd_softdevice_enable(&probeClock, lipsyncBleProbeFaultHandler);
+    if (g_bleProbeCode == 0) {
+      uint32_t ramStart = (uint32_t) __data_start__;
+      ble_cfg_t probeCfg;
+      memset(&probeCfg, 0, sizeof(probeCfg));
+      probeCfg.common_cfg.vs_uuid_cfg.vs_uuid_count = BLE_UUID_VS_COUNT_DEFAULT;
+      g_bleProbeStep = 2;
+      g_bleProbeCode = sd_ble_cfg_set(BLE_COMMON_CFG_VS_UUID, &probeCfg, ramStart);
+      if (g_bleProbeCode == 0) {
+        memset(&probeCfg, 0, sizeof(probeCfg));
+        probeCfg.gap_cfg.role_count_cfg.periph_role_count = 1;
+        probeCfg.gap_cfg.role_count_cfg.central_role_count = 0;
+        probeCfg.gap_cfg.role_count_cfg.central_sec_count = 0;
+        g_bleProbeStep = 3;
+        g_bleProbeCode = sd_ble_cfg_set(BLE_GAP_CFG_ROLE_COUNT, &probeCfg, ramStart);
+      }
+      if (g_bleProbeCode == 0) {
+        memset(&probeCfg, 0, sizeof(probeCfg));
+        probeCfg.gatts_cfg.service_changed.service_changed = 1;
+        g_bleProbeStep = 4;
+        g_bleProbeCode = sd_ble_cfg_set(BLE_GATTS_CFG_SERVICE_CHANGED, &probeCfg, ramStart);
+      }
+      if (g_bleProbeCode == 0) {
+        memset(&probeCfg, 0, sizeof(probeCfg));
+        probeCfg.gatts_cfg.attr_tab_size.attr_tab_size = CFG_SD_ATTR_TABLE_SIZE;
+        g_bleProbeStep = 5;
+        g_bleProbeCode = sd_ble_cfg_set(BLE_GATTS_CFG_ATTR_TAB_SIZE, &probeCfg, ramStart);
+      }
+      if (g_bleProbeCode == 0) {
+        memset(&probeCfg, 0, sizeof(probeCfg));
+        probeCfg.conn_cfg.conn_cfg_tag = CONN_CFG_PERIPHERAL;
+        probeCfg.conn_cfg.params.gatt_conn_cfg.att_mtu = BLE_GATT_ATT_MTU_DEFAULT;
+        g_bleProbeStep = 6;
+        g_bleProbeCode = sd_ble_cfg_set(BLE_CONN_CFG_GATT, &probeCfg, ramStart);
+      }
+      if (g_bleProbeCode == 0) {
+        memset(&probeCfg, 0, sizeof(probeCfg));
+        probeCfg.conn_cfg.conn_cfg_tag = CONN_CFG_PERIPHERAL;
+        probeCfg.conn_cfg.params.gap_conn_cfg.conn_count = 1;
+        probeCfg.conn_cfg.params.gap_conn_cfg.event_length = BLE_GAP_EVENT_LENGTH_DEFAULT;
+        g_bleProbeStep = 7;
+        g_bleProbeCode = sd_ble_cfg_set(BLE_CONN_CFG_GAP, &probeCfg, ramStart);
+      }
+      if (g_bleProbeCode == 0) {
+        memset(&probeCfg, 0, sizeof(probeCfg));
+        probeCfg.conn_cfg.conn_cfg_tag = CONN_CFG_PERIPHERAL;
+        probeCfg.conn_cfg.params.gatts_conn_cfg.hvn_tx_queue_size = BLE_GATTS_HVN_TX_QUEUE_SIZE_DEFAULT;
+        g_bleProbeStep = 8;
+        g_bleProbeCode = sd_ble_cfg_set(BLE_CONN_CFG_GATTS, &probeCfg, ramStart);
+      }
+      if (g_bleProbeCode == 0) {
+        memset(&probeCfg, 0, sizeof(probeCfg));
+        probeCfg.conn_cfg.conn_cfg_tag = CONN_CFG_PERIPHERAL;
+        probeCfg.conn_cfg.params.gattc_conn_cfg.write_cmd_tx_queue_size = BLE_GATTC_WRITE_CMD_TX_QUEUE_SIZE_DEFAULT;
+        g_bleProbeStep = 9;
+        g_bleProbeCode = sd_ble_cfg_set(BLE_CONN_CFG_GATTC, &probeCfg, ramStart);
+      }
+      if (g_bleProbeCode == 0) {
+        g_bleProbeStep = 10;
+        g_bleProbeCode = sd_ble_enable(&ramStart);
+        g_bleProbeNeed = ramStart;  // on NO_MEM this is the REQUIRED app RAM base — compare against 0x20006000
+      }
+      if (g_bleProbeCode == 0) {
+        g_bleProbeStep = 11;  // everything begin() does up through sd_ble_enable has PASSED
+      }
+      (void) sd_softdevice_disable();  // leave the clean slate begin() expects, whatever happened above
+    }
   }
   if (!Bluefruit.begin()) {
     g_bleInitStage = 1;

@@ -276,6 +276,9 @@ void bootTrailStamp(uint8_t step) {
 // window is a no-op window, not a fault window.
 volatile int g_bleInitStage = 0;                 // 4.5.11: init-task progress/failure stage (see LSApiDeclarations.h)
 volatile int8_t g_bleSdWasEnabled = -1;          // 4.5.13: the init task's SD probe: -1 = not probed yet, 0 = the SoftDevice was down (normal), 1 = it was ALREADY enabled when the app started (bootloader leftover — see LSBLE.h)
+volatile uint8_t g_bleProbeStep = 0;             // 4.5.14: the begin()-mirror probe's first failing call (0 = not run/non-BLE, 1..10 = that call failed, 11 = all passed) — see LSBLE.h
+volatile uint32_t g_bleProbeCode = 0;            // 4.5.14: the failing call's SoftDevice error code (0 = none)
+volatile uint32_t g_bleProbeNeed = 0;            // 4.5.14: sd_ble_enable's required app RAM base (on NO_MEM, the smoking gun vs 0x20006000)
 static volatile bool g_bleInitDone = false;       // the task finished (success or failure)
 static char g_bleDeviceName[CONF_BLE_DEVICE_NAME_SZ] = {0};  // the advertising name (static: outlives setup's frame)
 static StackType_t g_bleInitStack[CONF_BLE_INIT_TASK_STACK_BYTES / sizeof(StackType_t)];
@@ -653,7 +656,13 @@ void loop() {
       Serial.print(F(" st="));
       Serial.print(g_bleInitStage);
       Serial.print(F(" sd="));
-      Serial.println(g_bleSdWasEnabled);  // -1 = probe not run (init still in flight), 0 = SD was down, 1 = SD was ALREADY enabled (bootloader leftover)
+      Serial.print(g_bleSdWasEnabled);  // -1 = probe not run (init still in flight), 0 = SD was down, 1 = SD was ALREADY enabled (bootloader leftover)
+      Serial.print(F(" pstep="));
+      Serial.print(g_bleProbeStep);
+      Serial.print(F(" pcode=0x"));
+      Serial.print(g_bleProbeCode, HEX);
+      Serial.print(F(" need=0x"));
+      Serial.println(g_bleProbeNeed, HEX);
     }
     g_hostHasSpoken = true;
   }
@@ -701,7 +710,13 @@ void loop() {
     Serial.print(F(" st="));
     Serial.print(g_bleInitStage);  // 1=SD enable 2=DIS 3=HID 4=advertising 5=success
     Serial.print(F(" sd="));
-    Serial.println(g_bleSdWasEnabled);  // -1 = probe not run yet, 0 = SD was down, 1 = SD was already up (bootloader leftover)
+    Serial.print(g_bleSdWasEnabled);  // -1 = probe not run yet, 0 = SD was down, 1 = SD was already up (bootloader leftover)
+    Serial.print(F(" pstep="));
+    Serial.print(g_bleProbeStep);     // 4.5.14: the begin()-mirror probe's verdict (11 = all passed, 1..10 = that call failed)
+    Serial.print(F(" pcode=0x"));
+    Serial.print(g_bleProbeCode, HEX);
+    Serial.print(F(" need=0x"));
+    Serial.println(g_bleProbeNeed, HEX);
   }
 
   // Feed the hardware watchdog directly from the live loop (bench
@@ -796,7 +811,13 @@ void loop() {
       Serial.print(F(" ble=3 st="));
       Serial.print(g_bleInitStage);
       Serial.print(F(" sd="));
-      Serial.println(g_bleSdWasEnabled);
+      Serial.print(g_bleSdWasEnabled);
+      Serial.print(F(" pstep="));
+      Serial.print(g_bleProbeStep);
+      Serial.print(F(" pcode=0x"));
+      Serial.print(g_bleProbeCode, HEX);
+      Serial.print(F(" need=0x"));
+      Serial.println(g_bleProbeNeed, HEX);
     } else {
       Serial.println();
     }
