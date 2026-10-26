@@ -109,6 +109,39 @@ void initializeBluefruit(const char* s) {
   if (sdAlreadyEnabled) {
     (void) sd_softdevice_disable();  // MBR-serviced SVC: legal whether or not the SD is up
   }
+  // 4.5.15 bench round 9: pcode=0x1001 DECODED — NRF_ERROR_SDM_INCORRECT_
+  // INTERRUPT_CONFIGURATION: the SDM scans the NVIC at enable time and
+  // refuses if any ENABLED interrupt sits at an SD-reserved priority
+  // level (0-3). The bench's probe (pstep=1) proved our own mirrored
+  // sd_softdevice_enable() fails with exactly that code on every BLE boot;
+  // the vendored Wire enabled TWIM at priority 3 (inherited from upstream)
+  // and our BLE boot reaches this task only AFTER the screen/sensor
+  // polling has enabled it. The stock example (which works on this unit)
+  // never touches Wire; 4.1.0 worked only because its Bluefruit.begin()
+  // ran BEFORE any Wire.begin(). The Wire now takes priority 4 at the
+  // source (see Wire_nRF52.cpp), and this sweep is the belt-and-braces
+  // plus the on-wire proof: every enabled IRQ below the boundary is
+  // recorded (bad1=/bad2= bit masks, IRQ n = bit n — the BOOT/HB lines
+  // carry them) and demoted to 4 BEFORE the probe runs, so sd_softdevice_
+  // enable sees a legal NVIC no matter what any future boot path enables.
+  // demoted= counts the demotions; bad1/bad2 hold the PRE-demotion state
+  // so the log names the true offender even on a boot where the demotion
+  // saved it.
+  {
+    for (int irq = 0; irq < 48; irq++) {  // nRF52840: 48 external IRQs (0-47)
+      const uint32_t bit = 1UL << (irq & 31);
+      volatile uint32_t* iser = (irq < 32) ? &NVIC->ISER[0] : &NVIC->ISER[1];
+      if ((*iser & bit) && NVIC_GetPriority((IRQn_Type)irq) < 4) {
+        if (irq < 32) {
+          g_bleIrqBad1 |= bit;
+        } else {
+          g_bleIrqBad2 |= bit;
+        }
+        NVIC_SetPriority((IRQn_Type)irq, 4);
+        g_bleProbeDemoted++;
+      }
+    }
+  }
   {
     nrf_clock_lf_cfg_t probeClock = { NRF_CLOCK_LF_SRC_XTAL, 0, 0, NRF_CLOCK_LF_ACCURACY_20_PPM };
     extern uint32_t __data_start__[];  // the app RAM base begin() passes to every cfg call (linker symbol, 0x20006000)

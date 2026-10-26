@@ -52,6 +52,18 @@ in older firmware.
   recovery total and the millis() stamp of the latest one; the firmware's
   `BH` serial endpoint turns them into the "seconds since the bus last
   wedged" diagnostic (4.3.0, roadmap item 3).
+- Since 4.5.15 the TWIM/TWIS interrupt priority is 4, not upstream's 3 —
+  3 is inside the SoftDevice-reserved range (0-3), and
+  `sd_softdevice_enable()` refuses with
+  `NRF_ERROR_SDM_INCORRECT_INTERRUPT_CONFIGURATION` (0x1001) if any
+  enabled interrupt sits there at enable time. This was the entire
+  "Bluetooth mode never discovers" bench hunt: the 4.5.14 probe captured
+  the code, and 4.1.0's BLE had worked only because its
+  `Bluefruit.begin()` ran BEFORE any `Wire.begin()` enabled the IRQ
+  (order, not legality). Upstream's `libraries/Wire/Wire_nRF52.cpp`
+  carries the same 3; 4 is legal for both the SoftDevice (first
+  app-legal level) and FreeRTOS (`>= configMAX_SYSCALL_INTERRUPT_PRIORITY`
+  = 2 on this core), and the handler calls no kernel APIs.
 
 `Wire.h` differs from the core's copy only by the `busHealthy()`,
 `recoveryCount()` and `lastRecoveryMs()` declarations and their comments;

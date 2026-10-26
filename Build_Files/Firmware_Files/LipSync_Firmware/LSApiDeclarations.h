@@ -283,6 +283,12 @@ extern volatile int8_t g_bleSdWasEnabled;
 extern volatile uint8_t g_bleProbeStep;
 extern volatile uint32_t g_bleProbeCode;
 extern volatile uint32_t g_bleProbeNeed;
+// 4.5.15: the pre-enable NVIC sweep (see LSBLE.h) — the masks of enabled
+// IRQs found at SD-reserved priorities (< 4) at BLE-init time (bit = IRQ
+// number, IRQs 0-31 in bad1, 32-47 in bad2) and the demotion count.
+extern volatile uint32_t g_bleIrqBad1;
+extern volatile uint32_t g_bleIrqBad2;
+extern volatile uint8_t g_bleProbeDemoted;
 bool switchRemapAllowed(int actionNumber, bool gamepad);  // (4.5.7 review) column-aware: the gamepad cells reject the mouse hold modes
 void sanitizeInputWindows();                              // (4.5.7 review) boot-load validation for WS/WL/WM
 void switchRemapApplyCell(int jack, int window, bool gamepad, int actionNumber);

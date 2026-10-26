@@ -279,6 +279,9 @@ volatile int8_t g_bleSdWasEnabled = -1;          // 4.5.13: the init task's SD p
 volatile uint8_t g_bleProbeStep = 0;             // 4.5.14: the begin()-mirror probe's first failing call (0 = not run/non-BLE, 1..10 = that call failed, 11 = all passed) — see LSBLE.h
 volatile uint32_t g_bleProbeCode = 0;            // 4.5.14: the failing call's SoftDevice error code (0 = none)
 volatile uint32_t g_bleProbeNeed = 0;            // 4.5.14: sd_ble_enable's required app RAM base (on NO_MEM, the smoking gun vs 0x20006000)
+volatile uint32_t g_bleIrqBad1 = 0;              // 4.5.15: pre-demotion mask of enabled IRQs 0-31 found at an SD-reserved priority (< 4) at BLE-init time (bit = IRQ number)
+volatile uint32_t g_bleIrqBad2 = 0;              // 4.5.15: the same mask for IRQs 32-47
+volatile uint8_t g_bleProbeDemoted = 0;          // 4.5.15: how many the sweep demoted to 4 before the enable
 static volatile bool g_bleInitDone = false;       // the task finished (success or failure)
 static char g_bleDeviceName[CONF_BLE_DEVICE_NAME_SZ] = {0};  // the advertising name (static: outlives setup's frame)
 static StackType_t g_bleInitStack[CONF_BLE_INIT_TASK_STACK_BYTES / sizeof(StackType_t)];
@@ -662,7 +665,13 @@ void loop() {
       Serial.print(F(" pcode=0x"));
       Serial.print(g_bleProbeCode, HEX);
       Serial.print(F(" need=0x"));
-      Serial.println(g_bleProbeNeed, HEX);
+      Serial.print(g_bleProbeNeed, HEX);
+      Serial.print(F(" bad1=0x"));
+      Serial.print(g_bleIrqBad1, HEX);
+      Serial.print(F(" bad2=0x"));
+      Serial.print(g_bleIrqBad2, HEX);
+      Serial.print(F(" dem="));
+      Serial.println(g_bleProbeDemoted);
     }
     g_hostHasSpoken = true;
   }
@@ -716,7 +725,13 @@ void loop() {
     Serial.print(F(" pcode=0x"));
     Serial.print(g_bleProbeCode, HEX);
     Serial.print(F(" need=0x"));
-    Serial.println(g_bleProbeNeed, HEX);
+    Serial.print(g_bleProbeNeed, HEX);
+    Serial.print(F(" bad1=0x"));
+    Serial.print(g_bleIrqBad1, HEX);   // 4.5.15: enabled IRQs 0-31 found at an SD-reserved priority at init time (bit = IRQ)
+    Serial.print(F(" bad2=0x"));
+    Serial.print(g_bleIrqBad2, HEX);   // 4.5.15: IRQs 32-47 of the same sweep
+    Serial.print(F(" dem="));
+    Serial.println(g_bleProbeDemoted);
   }
 
   // Feed the hardware watchdog directly from the live loop (bench
@@ -817,7 +832,13 @@ void loop() {
       Serial.print(F(" pcode=0x"));
       Serial.print(g_bleProbeCode, HEX);
       Serial.print(F(" need=0x"));
-      Serial.println(g_bleProbeNeed, HEX);
+      Serial.print(g_bleProbeNeed, HEX);
+      Serial.print(F(" bad1=0x"));
+      Serial.print(g_bleIrqBad1, HEX);
+      Serial.print(F(" bad2=0x"));
+      Serial.print(g_bleIrqBad2, HEX);
+      Serial.print(F(" dem="));
+      Serial.println(g_bleProbeDemoted);
     } else {
       Serial.println();
     }
