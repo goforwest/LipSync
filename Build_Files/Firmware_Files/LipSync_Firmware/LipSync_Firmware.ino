@@ -611,7 +611,32 @@ void loop() {
   // 4.5.10: any host byte stops the repeating boot header (below) — the
   // app's connect sends SETTINGS within milliseconds of opening the port,
   // so a connected session falls silent after one extra line at most.
+  static bool finalBootLinePrinted = false;
   if (Serial.available() > 0) {
+    // 4.5.12: the FIRST host byte also prints the header one final time —
+    // the repeating ticks all fall inside TinyUSB's DTR-gated discard
+    // window (writes before the host opens the port are dropped), which
+    // is how three BLE boots' worth of st= data was lost. This line lands
+    // in every session log right after connect, carrying the BLE verdict.
+    if (!g_hostHasSpoken && !finalBootLinePrinted) {
+      finalBootLinePrinted = true;
+      int bleStateFinal = 0;
+      if (g_bleInitPending) {
+        bleStateFinal = g_bleInitDone ? (needsInitialization ? 3 : 2) : 1;
+      }
+      Serial.print(F("BOOT: "));
+      Serial.print(CONF_LIPSYNC_VERSION_STRING);
+      Serial.print(F(" rst=0x"));
+      Serial.print(g_lastRebootReason, HEX);
+      Serial.print(F(" pt="));
+      Serial.print(g_bootTrailPrev);
+      Serial.print(F(" pm="));
+      Serial.print(g_hangMarkerPrev);
+      Serial.print(F(" ble="));
+      Serial.print(bleStateFinal);
+      Serial.print(F(" st="));
+      Serial.println(g_bleInitStage);
+    }
     g_hostHasSpoken = true;
   }
 
@@ -645,7 +670,9 @@ void loop() {
         bleState = 1;  // task running
       }
     }
-    Serial.print(F("BOOT: 4.5.11 rst=0x"));
+    Serial.print(F("BOOT: "));
+    Serial.print(CONF_LIPSYNC_VERSION_STRING);
+    Serial.print(F(" rst=0x"));
     Serial.print(g_lastRebootReason, HEX);
     Serial.print(F(" pt="));
     Serial.print(g_bootTrailPrev);
@@ -690,8 +717,14 @@ void loop() {
   // the loop froze; wdt=1 feed=never = the watchdog was armed but its
   // timer never registered (the LSTimer pool has shown "No free timers").
   static unsigned long lastHeartbeatMs = 0;
+  // 4.5.12: a BLE boot whose init FAILED is degraded — the heartbeat now
+  // carries the verdict (ble=/st=) for the whole session, so a connected
+  // app sees the failure state repeatedly instead of a silent unpairable
+  // device. A successful BLE boot (needsInitialization false) is healthy.
+  const bool bleInitFailed = (g_bleInitPending && g_bleInitDone && needsInitialization);
   const bool degradedNow = g_safeModeEnabled || !g_displayConnected || !g_joystickSensorConnected
-                         || !g_mouthpiecePressureSensorConnected || !g_ambientPressureSensorConnected;
+                         || !g_mouthpiecePressureSensorConnected || !g_ambientPressureSensorConnected
+                         || bleInitFailed;
   // RELEASED BEHAVIOR (4.5.7 review): the bench's 2026-10-23 "witness
   // window" (every boot printing at 250 ms/1 s cadence for the first 90 s)
   // shipped in the V4.5.6 tag even though its own comment called it "a
@@ -739,7 +772,12 @@ void loop() {
     Serial.print(g_mouthpiecePressureSensorConnected ? 1 : 0);
     Serial.print(g_ambientPressureSensorConnected ? 1 : 0);
     Serial.print(g_displayConnected ? 1 : 0);
-    Serial.println();
+    if (bleInitFailed) {
+      Serial.print(F(" ble=3 st="));
+      Serial.println(g_bleInitStage);
+    } else {
+      Serial.println();
+    }
   }
 
   ledStateTimer.run();  // Timer for lights

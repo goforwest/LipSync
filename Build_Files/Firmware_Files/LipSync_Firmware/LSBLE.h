@@ -87,7 +87,15 @@ void initializeBluefruit(const char* s) {
   }
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
   Bluefruit.Advertising.addTxPower();
-  Bluefruit.Advertising.addAppearance(BLE_APPEARANCE_HID_KEYBOARD);
+  // 4.5.12 bench fix: ONE appearance, exactly like the core's stock
+  // blehid_mouse example. The 4.1.0-era sequence added BOTH keyboard and
+  // mouse appearances, and the arithmetic sits exactly at the 31-byte
+  // legacy advertising limit: flags(3) + txpower(3) + appearance(4)x2 +
+  // service UUID(4) + name "LS_xxxxxxxx"(13) = 31 with ZERO margin — any
+  // device whose name runs one byte longer makes addName/start fail. The
+  // advertised appearance is cosmetic; the HID service still carries the
+  // full keyboard+mouse report descriptors untouched (the wire HID
+  // contract is unchanged).
   Bluefruit.Advertising.addAppearance(BLE_APPEARANCE_HID_MOUSE);
   Bluefruit.Advertising.addService(blehid);
   Bluefruit.Advertising.addName();
