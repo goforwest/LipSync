@@ -63,6 +63,18 @@ static void lipsyncBleProbeFaultHandler(uint32_t id, uint32_t pc, uint32_t info)
   (void) id; (void) pc; (void) info;  // the SD calls NVIC_SystemReset() when we return
 }
 
+// 4.5.16: bluefruit.cpp's own USB/SD coexistence hooks (bluefruit.cpp:67/76,
+// compiled in — USE_TINYUSB is defined for this build; declared in no
+// header). The core's TinyUSB port enables the POWER_CLOCK interrupt at
+// boot (usb_hardware_init -> nrfx power/USB event registration) — the
+// SoftDevice's own shared interrupt line — and sd_softdevice_enable refuses
+// with 0x1001 while it is enabled ("having enabled SoftDevice interrupts",
+// the error's second branch, verbatim). AdafruitBluefruit::begin() releases
+// it around its enable via these hooks; the probe must run them too or it
+// is not a true mirror.
+void usb_softdevice_pre_enable(void);
+void usb_softdevice_post_enable(void);
+
 void initializeBluefruit(const char* s) {
   // 4.5.9 bench round 3: every begin()/start() is CHECKED and the failure is
   // printed. A failed SoftDevice enable previously cascaded into the
@@ -143,11 +155,27 @@ void initializeBluefruit(const char* s) {
     }
   }
   {
+    // 4.5.16 bench round 10: the 4.5.15 sweep demoted USBD (bad2=0x80,
+    // the core's TinyUSB port sets it to priority 2 by design) and the
+    // probe STILL failed 0x1001 — because the offender is the error's
+    // OTHER branch: the core's usb_hardware_init leaves the POWER_CLOCK
+    // interrupt (the SoftDevice's own shared line) ENABLED, and the SDM
+    // refuses while it is. AdafruitBluefruit::begin() avoids this via
+    // its USE_TINYUSB coexistence hooks (usb_softdevice_pre_enable
+    // uninit's the power driver; post_enable re-registers the events
+    // through the SD's power SVCs) — the probe now runs them too, making
+    // it a true call-for-call mirror of begin() including this dance.
+    // Note the core deliberately runs USBD at priority 2 (its comment
+    // calls 0/1/4 "reserved for SoftDevice") and the stock example's
+    // begin() PASSES the SDM with that — the priority model alone was
+    // never the whole story; the POWER_CLOCK release is.
+    usb_softdevice_pre_enable();
     nrf_clock_lf_cfg_t probeClock = { NRF_CLOCK_LF_SRC_XTAL, 0, 0, NRF_CLOCK_LF_ACCURACY_20_PPM };
     extern uint32_t __data_start__[];  // the app RAM base begin() passes to every cfg call (linker symbol, 0x20006000)
     g_bleProbeStep = 1;
     g_bleProbeCode = sd_softdevice_enable(&probeClock, lipsyncBleProbeFaultHandler);
     if (g_bleProbeCode == 0) {
+      usb_softdevice_post_enable();  // begin()'s exact order: the power events re-register through the SD's SVCs the moment it is up
       uint32_t ramStart = (uint32_t) __data_start__;
       ble_cfg_t probeCfg;
       memset(&probeCfg, 0, sizeof(probeCfg));
