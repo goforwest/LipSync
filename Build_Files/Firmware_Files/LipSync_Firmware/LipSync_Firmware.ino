@@ -262,6 +262,80 @@ void bootTrailStamp(uint8_t step) {
   writeTrailByte(step);
 }
 
+// 4.5.23 — THE FAULT DISCRIMINATOR (bench round 16: the BLE init now FULLY
+// SUCCEEDS — st=5, pst=5, advertising runs — and the boot dies a few seconds
+// AFTER it: ~0.3 s after the host opens the port (pt=7, serial dispatch) or
+// within ~10-15 s idle (pt=4, an LED action), always rst=0x4 with pm=0. The
+// remaining hunt splits on one question the stock core cannot answer: its
+// HardFault_Handler is a WEAK spin-loop (.S) and the SoftDevice's assert
+// path resets the chip itself — both read identically (rst=0x4, no marker).
+// This override captures the fault: the class marker (retention bits 2-4 =
+// 2, reading back as pm=2 — bit 3, the unused half of the marker nibble)
+// names "a HARDFAULT killed the previous boot" on the next boot's wire;
+// pm=1 keeps its meaning (witnessed hang); pm=0 + a dead BLE boot now means
+// "SD assert / non-HardFault reset" by elimination. The capture ALSO
+// encodes the faulting PC's 8 KB flash page into GPREGRET (0xC0|page —
+// values 0xC0-0xCF collide with none of the bootloader's DFU magics
+// 0x4e/0x57/0xa8; the SD exposes GPREGRET set only via SVC, so the write is
+// best-effort from fault context — if the SD eats it or the bootloader
+// clears it, only the location is lost, never the class). The successor
+// prints it as fp=0x<page-base>. A best-effort serial print of the frame
+// is attempted first (usually lost — interrupts are masked in the fault)
+// because a live port is exactly the death trigger the bench observed.
+volatile uint32_t g_faultFramePc = 0;
+volatile uint32_t g_faultFrameLr = 0;
+volatile uint32_t g_faultHfsr = 0;
+volatile uint32_t g_faultCfsr = 0;
+uint8_t g_faultPrevPage = 0xFF;  // the PREVIOUS boot's fault PC page (0xFF = none) — consumed from GPREGRET at setup
+
+extern "C" __attribute__((used, noinline)) void lipsyncFaultCapture(uint32_t* frame, uint32_t hfsr, uint32_t cfsr);
+extern "C" __attribute__((used, noinline)) void lipsyncFaultCapture(uint32_t* frame, uint32_t hfsr, uint32_t cfsr) {
+  g_faultFramePc = frame[6];  // the stacked PC — the faulting instruction
+  g_faultFrameLr = frame[5];  // the stacked LR — the caller
+  g_faultHfsr = hfsr;
+  g_faultCfsr = cfsr;
+  // class marker: retention bits 2-4 = value 2 (bit 3) — reads back as pm=2.
+  // The hang witness uses value 1 (bit 2); they cannot both occur in one
+  // boot (a hang needs the loop ALIVE, a fault kills it). checkResetReason
+  // treats any nonzero marker as streak-worthy — correct here too: three
+  // straight fault deaths SHOULD settle in safe mode.
+  NRF_POWER->GPREGRET2 = (NRF_POWER->GPREGRET2 & ~0x1CUL) | (2UL << 2);
+  // location: the faulting PC's 8 KB flash page into GPREGRET (best-effort —
+  // see the header note). The app's flash spans 0x26000-0x75000, so
+  // (pc >> 13) is 4 bits; 0xC0 | that can never equal a bootloader magic.
+  NRF_POWER->GPREGRET = 0xC0UL | ((g_faultFramePc >> 13) & 0x0FUL);
+  // Best-effort print (a live port is the observed death trigger — if the
+  // fault hit DURING a dispatch there is a chance the bytes are already
+  // flushed). Keep it one line so the CDC buffer need not flush.
+  Serial.print(F("FAULT pc=0x"));
+  Serial.print(g_faultFramePc, HEX);
+  Serial.print(F(" lr=0x"));
+  Serial.print(g_faultFrameLr, HEX);
+  Serial.print(F(" cfsr=0x"));
+  Serial.println(g_faultCfsr, HEX);
+  for (volatile uint32_t i = 0; i < 2000000; i++) { }  // ~100 ms dwell for any already-buffered CDC byte to drain
+  NVIC_SystemReset();  // SREQ — retention + GPREGRET survive (or the bootloader clears GPREGRET; the class marker survives regardless)
+  while (1) { }        // never returns
+}
+
+// The strong override of the core's weak (.S) spin-loop handler. Naked: the
+// exception frame is still on the stack; select MSP or PSP per EXC_RETURN
+// bit 2 and branch to the capture with the frame pointer in r0.
+extern "C" __attribute__((naked)) void HardFault_Handler(void);
+extern "C" __attribute__((naked)) void HardFault_Handler(void) {
+  __asm volatile (
+    "tst   lr, #4              \n"  // EXC_RETURN bit 2: 0 = main stack (ISR context), 1 = process stack (task context)
+    "ite   eq                  \n"
+    "mrseq r0, msp             \n"
+    "mrsne r0, psp             \n"
+    "ldr   r1, =0xE000ED2C     \n"  // SCB->HFSR
+    "ldr   r2, =0xE000ED28     \n"  // SCB->CFSR
+    "ldr   r1, [r1]            \n"
+    "ldr   r2, [r2]            \n"
+    "b     lipsyncFaultCapture \n"
+  );
+}
+
 // 4.5.10 BENCH FIX — the BLE init task. The core's loop task (which runs
 // setup() and loop()) has a hardcoded 4096-byte stack and configCHECK_FOR_
 // STACK_OVERFLOW=1 (mode 1 — misses overflow-and-return), and the BLE boot's
@@ -450,6 +524,15 @@ void setup() {
   g_bootTrailPrev = readTrailByte();
   g_hangMarkerPrev = (NRF_POWER->GPREGRET2 >> 2) & 0x07;
   NRF_POWER->GPREGRET2 &= ~0x1CUL;  // consume the marker — one hang reports once
+  // 4.5.23: consume the previous boot's HardFault PC page (written by
+  // lipsyncFaultCapture into GPREGRET; 0xC0|page — see the discriminator
+  // note above the handler). Absent/cleared → 0xFF = "no fault recorded".
+  if ((NRF_POWER->GPREGRET & 0xC0UL) == 0xC0UL) {
+    g_faultPrevPage = (uint8_t)(NRF_POWER->GPREGRET & 0x0FUL);
+    NRF_POWER->GPREGRET = 0;  // consume — one fault reports once
+  } else {
+    g_faultPrevPage = 0xFF;
+  }
   writeTrailByte(0);
 
   beginMillis = millis();  // Intialize timer
@@ -735,7 +818,13 @@ void loop() {
       Serial.print(F(" pst="));
       Serial.print(g_blePrevSt);  // 4.5.20: the PREVIOUS BLE boot's persisted verdict (-1 = none, 0 = died during begin, 1..4 = stage failure, 5 = init succeeded)
       Serial.print(F(" prc=0x"));
-      Serial.println(g_blePrevRc, HEX);
+      Serial.print(g_blePrevRc, HEX);
+      Serial.print(F(" fp=0x"));
+      if (g_faultPrevPage == 0xFF) {
+        Serial.println(F("none"));  // 4.5.23: no HardFault recorded by the previous boot
+      } else {
+        Serial.println(((uint32_t)g_faultPrevPage) << 13, HEX);  // the faulting PC's 8 KB flash page — map it against the .map file
+      }
     }
     g_hostHasSpoken = true;
   }
@@ -794,7 +883,13 @@ void loop() {
     Serial.print(F(" pst="));
     Serial.print(g_blePrevSt);  // 4.5.20: the previous BLE boot's persisted verdict
     Serial.print(F(" prc=0x"));
-    Serial.println(g_blePrevRc, HEX);
+    Serial.print(g_blePrevRc, HEX);
+    Serial.print(F(" fp=0x"));
+    if (g_faultPrevPage == 0xFF) {
+      Serial.println(F("none"));
+    } else {
+      Serial.println(((uint32_t)g_faultPrevPage) << 13, HEX);
+    }
   }
 
   // Feed the hardware watchdog directly from the live loop (bench
@@ -907,7 +1002,13 @@ void loop() {
       Serial.print(F(" pst="));
       Serial.print(g_blePrevSt);
       Serial.print(F(" prc=0x"));
-      Serial.println(g_blePrevRc, HEX);
+      Serial.print(g_blePrevRc, HEX);
+      Serial.print(F(" fp=0x"));
+      if (g_faultPrevPage == 0xFF) {
+        Serial.println(F("none"));
+      } else {
+        Serial.println(((uint32_t)g_faultPrevPage) << 13, HEX);
+      }
     } else {
       Serial.println();
     }
