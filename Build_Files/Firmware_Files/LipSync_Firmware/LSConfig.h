@@ -30,7 +30,7 @@
 
 #define CONF_LIPSYNC_VERSION_MAJOR  4
 #define CONF_LIPSYNC_VERSION_MINOR  5
-#define CONF_LIPSYNC_VERSION_REV    23
+#define CONF_LIPSYNC_VERSION_REV    24
 
 // 4.5.22 RESCUE-BUILD SWITCH (bench round 15): the device's settings
 // filesystem was left corrupted by the 4.5.20 race + the zombie phase's
