@@ -63,7 +63,14 @@ class LSBLEMouse {
 // begin() runs its OWN pre/post_enable hooks internally (USE_TINYUSB is
 // defined for the lib), so this file no longer declares or calls them.
 
+// 4.5.20: reset-proof verdict persistence (defined in LipSync_Firmware.ino
+// after the globals) — called at this task's entry and before every exit so
+// the NEXT boot can report what the dying one recorded.
+void bleVerdictPersist();
+
 void initializeBluefruit(const char* s) {
+  bleVerdictPersist();  // entry record: stage 0 = "died during begin" if this is the last write
+
   // 4.5.9 bench round 3: every begin()/start() is CHECKED and the failure is
   // printed. A failed SoftDevice enable previously cascaded into the
   // GATT/DIS/HID/advertising SVC calls on a dead stack — an SVC call with
@@ -141,6 +148,7 @@ void initializeBluefruit(const char* s) {
   if (!Bluefruit.begin()) {
     g_bleInitStage = 1;
     Serial.println("BOOT: BLE FAILED at SoftDevice enable");
+    bleVerdictPersist();
     return;
   }
   Serial.println("BOOT: BLE stack up");
@@ -163,6 +171,7 @@ void initializeBluefruit(const char* s) {
       g_bleInitStage = 2;
       g_bleInitRc = disRc;
       Serial.println("BOOT: BLE FAILED at DIS begin");
+      bleVerdictPersist();
       return;
     }
   }
@@ -172,6 +181,7 @@ void initializeBluefruit(const char* s) {
       g_bleInitStage = 3;
       g_bleInitRc = hidRc;
       Serial.println("BOOT: BLE FAILED at HID begin");
+      bleVerdictPersist();
       return;
     }
   }
@@ -195,11 +205,13 @@ void initializeBluefruit(const char* s) {
   if (!Bluefruit.Advertising.start(0)) {         // 0 = Don't stop advertising after n seconds
     g_bleInitStage = 4;
     Serial.println("BOOT: BLE FAILED at advertising start");
+    bleVerdictPersist();
     return;
   }
   Serial.println("BOOT: BLE advertising");
   g_bleInitStage = 5;
   needsInitialization = false;  // FULL SUCCESS ONLY — every guarded call site keys on this
+  bleVerdictPersist();  // st=5: if the boot STILL dies after this, the fault is past the init — advertising/runtime
 }
 
 

@@ -283,7 +283,54 @@ volatile uint32_t g_bleInitRc = 0;              // 4.5.19 (expert consult): the 
 volatile uint32_t g_bleIrqBad1 = 0;              // 4.5.15: pre-demotion mask of enabled IRQs 0-31 found at an SD-reserved priority (< 4) at BLE-init time (bit = IRQ number)
 volatile uint32_t g_bleIrqBad2 = 0;              // 4.5.15: the same mask for IRQs 32-47
 volatile uint8_t g_bleProbeDemoted = 0;          // 4.5.15: how many the sweep demoted to 4 before the enable
+volatile int8_t g_blePrevSt = -1;                 // 4.5.20: the PREVIOUS BLE boot's flash-persisted init verdict (-1 = none, 0 = died DURING begin, 1..4 = failed at that stage, 5 = init fully succeeded) — read+consumed from /bleverdict.dat at boot
+volatile uint16_t g_blePrevRc = 0;                // 4.5.20: that boot's DIS/HID raw error code
 static volatile bool g_bleInitDone = false;       // the task finished (success or failure)
+
+// 4.5.20 — BLE-VERDICT PERSISTENCE (the reset-proof capture): the BLE boots
+// of rounds 13+ die faster than the host can open the port, so st=/rc=/pstep=
+// were being lost with the boot itself — every captured BOOT line was from
+// the post-cycle SAFE boot (ble=0). The init task now writes its verdict to
+// the settings filesystem (which survives resets) at ENTRY and at every EXIT
+// path; the next boot reads it, prints it as pst=/prc= on the BOOT/HB lines,
+// and consumes the file. Whatever kills the boot, the survivor names the
+// state: pst=0 = the fault hit DURING Bluefruit.begin() itself; pst=1..4 =
+// the init failed at that stage with prc= (the DIS error code at last on the
+// wire); pst=5 = the init FULLY SUCCEEDED and the fault is AFTER it — in
+// advertising/feedback, a different hunt entirely. 8-byte record with magic
+// headers both ends: a torn write fails the magic check and reads as absent.
+static const char* const BLE_VERDICT_FILE = "/bleverdict.dat";
+void bleVerdictPersist() {
+  InternalFS.remove(BLE_VERDICT_FILE);
+  delay(1);
+  if (file.open(BLE_VERDICT_FILE, FILE_O_WRITE)) {
+    uint8_t rec[8] = { 0xB5,
+                       (uint8_t)g_bleInitStage,
+                       (uint8_t)g_bleProbeStep,
+                       (uint8_t)(g_bleSdWasEnabled & 0xFF),
+                       (uint8_t)(g_bleInitRc & 0xFF),
+                       (uint8_t)((g_bleInitRc >> 8) & 0xFF),
+                       g_bleProbeDemoted,
+                       0xA5 };
+    file.write(rec, sizeof(rec));
+    delay(1);
+    file.close();
+  }
+}
+void bleVerdictConsume() {
+  g_blePrevSt = -1;  // absent until proven present
+  g_blePrevRc = 0;
+  if (file.open(BLE_VERDICT_FILE, FILE_O_READ)) {
+    uint8_t rec[8];
+    const size_t n = file.read(rec, sizeof(rec));
+    file.close();
+    if (n == sizeof(rec) && rec[0] == 0xB5 && rec[7] == 0xA5) {
+      g_blePrevSt = (int8_t)rec[1];
+      g_blePrevRc = (uint16_t)rec[4] | ((uint16_t)rec[5] << 8);
+    }
+    InternalFS.remove(BLE_VERDICT_FILE);  // one-shot: the verdict describes the immediately-previous boot only
+  }
+}
 static char g_bleDeviceName[CONF_BLE_DEVICE_NAME_SZ] = {0};  // the advertising name (static: outlives setup's frame)
 static StackType_t g_bleInitStack[CONF_BLE_INIT_TASK_STACK_BYTES / sizeof(StackType_t)];
 static StaticTask_t g_bleInitTCB;
@@ -674,7 +721,11 @@ void loop() {
       Serial.print(F(" dem="));
       Serial.print(g_bleProbeDemoted);
       Serial.print(F(" rc=0x"));
-      Serial.println(g_bleInitRc, HEX);
+      Serial.print(g_bleInitRc, HEX);
+      Serial.print(F(" pst="));
+      Serial.print(g_blePrevSt);  // 4.5.20: the PREVIOUS BLE boot's persisted verdict (-1 = none, 0 = died during begin, 1..4 = stage failure, 5 = init succeeded)
+      Serial.print(F(" prc=0x"));
+      Serial.println(g_blePrevRc, HEX);
     }
     g_hostHasSpoken = true;
   }
@@ -729,7 +780,11 @@ void loop() {
     Serial.print(F(" dem="));
     Serial.print(g_bleProbeDemoted);
     Serial.print(F(" rc=0x"));
-    Serial.println(g_bleInitRc, HEX);
+    Serial.print(g_bleInitRc, HEX);
+    Serial.print(F(" pst="));
+    Serial.print(g_blePrevSt);  // 4.5.20: the previous BLE boot's persisted verdict
+    Serial.print(F(" prc=0x"));
+    Serial.println(g_blePrevRc, HEX);
   }
 
   // Feed the hardware watchdog directly from the live loop (bench
@@ -838,7 +893,11 @@ void loop() {
       Serial.print(F(" dem="));
       Serial.print(g_bleProbeDemoted);
       Serial.print(F(" rc=0x"));
-      Serial.println(g_bleInitRc, HEX);
+      Serial.print(g_bleInitRc, HEX);
+      Serial.print(F(" pst="));
+      Serial.print(g_blePrevSt);
+      Serial.print(F(" prc=0x"));
+      Serial.println(g_blePrevRc, HEX);
     } else {
       Serial.println();
     }
@@ -1230,6 +1289,7 @@ void enablePoll(bool isEnabled) {
 void initMemory() {
   if (USB_DEBUG) { Serial.println("USBDEBUG: initMemory()"); }
   mem.begin();  // Begin memory
+  bleVerdictConsume();  // 4.5.20: consume the previous BLE boot's flash-persisted verdict (pst=/prc= on the wire) — after the FS is up, before any header prints it
   
   // Open settings file (CONF_SETTINGS_FILE) from flash memory.
   // If not present, create file based on defaults in CONF_SETTINGS_JSON

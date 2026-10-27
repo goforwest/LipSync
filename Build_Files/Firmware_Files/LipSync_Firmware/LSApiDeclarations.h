@@ -293,6 +293,12 @@ extern volatile uint8_t g_bleProbeDemoted;
 // on the st=2 path this is sd_ble_gatts_service_add's own error code
 // (0x4=NO_MEM, 0x7=INVALID_PARAM, 0xF=FORBIDDEN, 0x10=INVALID_ADDR).
 extern volatile uint32_t g_bleInitRc;
+// 4.5.20: the previous BLE boot's flash-persisted verdict, consumed at boot
+// from /bleverdict.dat (see LipSync_Firmware.ino) — pst: -1 = none, 0 = died
+// during begin, 1..4 = failed at that stage, 5 = init fully succeeded; prc =
+// that boot's DIS/HID error code.
+extern volatile int8_t g_blePrevSt;
+extern volatile uint16_t g_blePrevRc;
 bool switchRemapAllowed(int actionNumber, bool gamepad);  // (4.5.7 review) column-aware: the gamepad cells reject the mouse hold modes
 void sanitizeInputWindows();                              // (4.5.7 review) boot-load validation for WS/WL/WM
 void switchRemapApplyCell(int jack, int window, bool gamepad, int actionNumber);
