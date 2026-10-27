@@ -353,6 +353,8 @@ volatile int8_t g_bleSdWasEnabled = -1;          // 4.5.13: the init task's SD p
 volatile uint8_t g_bleProbeStep = 0;             // 4.5.14: the begin()-mirror probe's first failing call (0 = not run/non-BLE, 1..10 = that call failed, 11 = all passed) — see LSBLE.h
 volatile uint32_t g_bleProbeCode = 0;            // 4.5.14: the failing call's SoftDevice error code (0 = none)
 volatile uint32_t g_bleProbeNeed = 0;           // 4.5.14: sd_ble_enable's required app RAM base (on NO_MEM, the smoking gun vs 0x20006000)
+TaskHandle_t g_loopTaskHandle = NULL;             // 4.5.26: the loop task's handle (captured at setup entry — the loop task runs setup) for the stack high-water print
+volatile UBaseType_t g_loopStackHwm = 0;           // 4.5.26: the loop task's minimum-ever free stack (FreeRTOS words, 4 bytes each) — printed as sw= on the wire; near-zero on BLE boots = the 4 KB loop stack is overflowing into the heap
 volatile uint32_t g_bleInitRc = 0;              // 4.5.19 (expert consult): the RAW err_t from the failing DIS/HID begin — sd_ble_gatts_service_add's own code on the st=2 path (0x4=NO_MEM, 0x7=INVALID_PARAM, 0xF=FORBIDDEN, 0x10=INVALID_ADDR)
 volatile uint32_t g_bleIrqBad1 = 0;              // 4.5.15: pre-demotion mask of enabled IRQs 0-31 found at an SD-reserved priority (< 4) at BLE-init time (bit = IRQ number)
 volatile uint32_t g_bleIrqBad2 = 0;              // 4.5.15: the same mask for IRQs 32-47
@@ -516,6 +518,7 @@ static void bleInitTaskBody(void* arg) {
 // Return     : void
 //*********************************//
 void setup() {
+  g_loopTaskHandle = xTaskGetCurrentTaskHandle();  // 4.5.26: the loop task runs setup — capture its handle for the stack high-water print
   initGlobals();  //  Intialize global variables to default values
   checkResetReason();  //  Check reason for reset and reset the reset-reason register
 
@@ -823,8 +826,10 @@ void loop() {
       if (g_faultPrevPage == 0xFF) {
         Serial.println(F("none"));  // 4.5.23: no HardFault recorded by the previous boot
       } else {
-        Serial.println(((uint32_t)g_faultPrevPage) << 13, HEX);  // the faulting PC's 8 KB flash page — map it against the .map file
+        Serial.print(((uint32_t)g_faultPrevPage) << 13, HEX);  // the faulting PC's 8 KB flash page — map it against the .map file
       }
+      Serial.print(F(" sw="));
+      Serial.println(g_loopTaskHandle ? uxTaskGetStackHighWaterMark(g_loopTaskHandle) : 0);  // 4.5.26: loop-task stack high-water (FreeRTOS words) — near-zero = the 4 KB stack overflows on the BLE path
     }
     g_hostHasSpoken = true;
   }
@@ -886,10 +891,12 @@ void loop() {
     Serial.print(g_blePrevRc, HEX);
     Serial.print(F(" fp=0x"));
     if (g_faultPrevPage == 0xFF) {
-      Serial.println(F("none"));
+      Serial.print(F("none"));
     } else {
-      Serial.println(((uint32_t)g_faultPrevPage) << 13, HEX);
+      Serial.print(((uint32_t)g_faultPrevPage) << 13, HEX);
     }
+    Serial.print(F(" sw="));
+    Serial.println(g_loopTaskHandle ? uxTaskGetStackHighWaterMark(g_loopTaskHandle) : 0);
   }
 
   // Feed the hardware watchdog directly from the live loop (bench
@@ -1005,10 +1012,12 @@ void loop() {
       Serial.print(g_blePrevRc, HEX);
       Serial.print(F(" fp=0x"));
       if (g_faultPrevPage == 0xFF) {
-        Serial.println(F("none"));
+        Serial.print(F("none"));
       } else {
-        Serial.println(((uint32_t)g_faultPrevPage) << 13, HEX);
+        Serial.print(((uint32_t)g_faultPrevPage) << 13, HEX);
       }
+      Serial.print(F(" sw="));
+      Serial.println(g_loopTaskHandle ? uxTaskGetStackHighWaterMark(g_loopTaskHandle) : 0);  // 4.5.26: stack high-water — the overflow verdict
     } else {
       Serial.println();
     }
