@@ -299,6 +299,10 @@ extern volatile uint32_t g_bleInitRc;
 // that boot's DIS/HID error code.
 extern volatile int8_t g_blePrevSt;
 extern volatile uint16_t g_blePrevRc;
+// 4.5.21: raised by the BLE init task (entry + every exit path), serviced by
+// the loop — the ONLY cross-task handoff in the verdict path (the task never
+// touches the filesystem; see LipSync_Firmware.ino's 4.5.21 regression note).
+extern volatile bool g_bleVerdictDirty;
 bool switchRemapAllowed(int actionNumber, bool gamepad);  // (4.5.7 review) column-aware: the gamepad cells reject the mouse hold modes
 void sanitizeInputWindows();                              // (4.5.7 review) boot-load validation for WS/WL/WM
 void switchRemapApplyCell(int jack, int window, bool gamepad, int actionNumber);

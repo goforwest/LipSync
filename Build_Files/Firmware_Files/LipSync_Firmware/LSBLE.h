@@ -63,13 +63,13 @@ class LSBLEMouse {
 // begin() runs its OWN pre/post_enable hooks internally (USE_TINYUSB is
 // defined for the lib), so this file no longer declares or calls them.
 
-// 4.5.20: reset-proof verdict persistence (defined in LipSync_Firmware.ino
-// after the globals) — called at this task's entry and before every exit so
-// the NEXT boot can report what the dying one recorded.
-void bleVerdictPersist();
-
+// 4.5.20/4.5.21: reset-proof verdict persistence — the task RAISES A FLAG
+// (g_bleVerdictDirty, declared in LSApiDeclarations.h); the LOOP performs the
+// filesystem write. The 4.5.20 shape wrote from this task using LSMEMORY's
+// shared global File handle and corrupted the settings file (bench round 14
+// — the re-seed signature: IN=0.00|0.00, CM reverted to default).
 void initializeBluefruit(const char* s) {
-  bleVerdictPersist();  // entry record: stage 0 = "died during begin" if this is the last write
+  g_bleVerdictDirty = true;  // entry record: stage 0 = "died during begin" if this is the last write
 
   // 4.5.9 bench round 3: every begin()/start() is CHECKED and the failure is
   // printed. A failed SoftDevice enable previously cascaded into the
@@ -148,7 +148,7 @@ void initializeBluefruit(const char* s) {
   if (!Bluefruit.begin()) {
     g_bleInitStage = 1;
     Serial.println("BOOT: BLE FAILED at SoftDevice enable");
-    bleVerdictPersist();
+    g_bleVerdictDirty = true;
     return;
   }
   Serial.println("BOOT: BLE stack up");
@@ -171,7 +171,7 @@ void initializeBluefruit(const char* s) {
       g_bleInitStage = 2;
       g_bleInitRc = disRc;
       Serial.println("BOOT: BLE FAILED at DIS begin");
-      bleVerdictPersist();
+      g_bleVerdictDirty = true;
       return;
     }
   }
@@ -181,7 +181,7 @@ void initializeBluefruit(const char* s) {
       g_bleInitStage = 3;
       g_bleInitRc = hidRc;
       Serial.println("BOOT: BLE FAILED at HID begin");
-      bleVerdictPersist();
+      g_bleVerdictDirty = true;
       return;
     }
   }
@@ -205,13 +205,13 @@ void initializeBluefruit(const char* s) {
   if (!Bluefruit.Advertising.start(0)) {         // 0 = Don't stop advertising after n seconds
     g_bleInitStage = 4;
     Serial.println("BOOT: BLE FAILED at advertising start");
-    bleVerdictPersist();
+    g_bleVerdictDirty = true;
     return;
   }
   Serial.println("BOOT: BLE advertising");
   g_bleInitStage = 5;
   needsInitialization = false;  // FULL SUCCESS ONLY — every guarded call site keys on this
-  bleVerdictPersist();  // st=5: if the boot STILL dies after this, the fault is past the init — advertising/runtime
+  g_bleVerdictDirty = true;  // st=5: if the boot STILL dies after this, the fault is past the init — advertising/runtime
 }
 
 

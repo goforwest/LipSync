@@ -287,23 +287,33 @@ volatile int8_t g_blePrevSt = -1;                 // 4.5.20: the PREVIOUS BLE bo
 volatile uint16_t g_blePrevRc = 0;                // 4.5.20: that boot's DIS/HID raw error code
 static volatile bool g_bleInitDone = false;       // the task finished (success or failure)
 
-// 4.5.20 — BLE-VERDICT PERSISTENCE (the reset-proof capture): the BLE boots
-// of rounds 13+ die faster than the host can open the port, so st=/rc=/pstep=
-// were being lost with the boot itself — every captured BOOT line was from
-// the post-cycle SAFE boot (ble=0). The init task now writes its verdict to
-// the settings filesystem (which survives resets) at ENTRY and at every EXIT
-// path; the next boot reads it, prints it as pst=/prc= on the BOOT/HB lines,
-// and consumes the file. Whatever kills the boot, the survivor names the
-// state: pst=0 = the fault hit DURING Bluefruit.begin() itself; pst=1..4 =
-// the init failed at that stage with prc= (the DIS error code at last on the
-// wire); pst=5 = the init FULLY SUCCEEDED and the fault is AFTER it — in
-// advertising/feedback, a different hunt entirely. 8-byte record with magic
-// headers both ends: a torn write fails the magic check and reads as absent.
+// 4.5.20/4.5.21 — BLE-VERDICT PERSISTENCE (the reset-proof capture): the
+// BLE boots of rounds 13+ die faster than the host can open the port, so
+// st=/rc=/pstep= were being lost with the boot itself. The verdict goes to
+// the settings filesystem (which survives resets), and the next boot prints
+// it as pst=/prc= and consumes the file.
+//
+// 4.5.21 REGRESSION FIX — THE BLE TASK NO LONGER TOUCHES THE FILESYSTEM. The
+// 4.5.20 shape called bleVerdictPersist() from the init task, which opened
+// LSMEMORY.h's ONE GLOBAL shared File handle concurrently with the loop
+// task's settings writes — two FreeRTOS tasks sharing one stateful handle
+// clobbered each other's file state and corrupted the settings file (bench
+// round 14: after a CM,1:2 cycle the survivor read IN=0.00|0.00 CA=0.00|0.00
+// CM=1 — the re-seed signature; the calibration was wiped and the mode
+// reverted to the compiled default). The task now only raises a flag; the
+// LOOP — which already owns every other FS operation, all sequential —
+// performs the persist. All filesystem access is single-threaded again, and
+// the verdict ride survives. The entry record still lands well before
+// begin() finishes (the loop services the flag within milliseconds).
+// 8-byte record with magic headers both ends: a torn write fails the magic
+// check and reads as absent.
 static const char* const BLE_VERDICT_FILE = "/bleverdict.dat";
-void bleVerdictPersist() {
+volatile bool g_bleVerdictDirty = false;  // raised by the init task, serviced by the loop — the ONLY cross-task handoff (no FS access off-loop)
+void bleVerdictPersist() {  // LOOP-CONTEXT ONLY (see the 4.5.21 note above)
+  File verdictFile(InternalFS);  // its own handle — never the shared settings object
   InternalFS.remove(BLE_VERDICT_FILE);
   delay(1);
-  if (file.open(BLE_VERDICT_FILE, FILE_O_WRITE)) {
+  if (verdictFile.open(BLE_VERDICT_FILE, FILE_O_WRITE)) {
     uint8_t rec[8] = { 0xB5,
                        (uint8_t)g_bleInitStage,
                        (uint8_t)g_bleProbeStep,
@@ -312,9 +322,9 @@ void bleVerdictPersist() {
                        (uint8_t)((g_bleInitRc >> 8) & 0xFF),
                        g_bleProbeDemoted,
                        0xA5 };
-    file.write(rec, sizeof(rec));
+    verdictFile.write(rec, sizeof(rec));
     delay(1);
-    file.close();
+    verdictFile.close();
   }
 }
 void bleVerdictConsume() {
@@ -901,6 +911,14 @@ void loop() {
     } else {
       Serial.println();
     }
+  }
+
+  // 4.5.21: the verdict-persist service point — the BLE init task raises the
+  // flag, the loop (sole owner of all filesystem access) performs the write.
+  // Runs within milliseconds of the flag, well before begin() completes.
+  if (g_bleVerdictDirty) {
+    g_bleVerdictDirty = false;
+    bleVerdictPersist();
   }
 
   ledStateTimer.run();  // Timer for lights
