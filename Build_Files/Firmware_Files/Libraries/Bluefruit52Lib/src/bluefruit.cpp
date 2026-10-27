@@ -168,8 +168,21 @@ static void nrf_error_cb(uint32_t id, uint32_t pc, uint32_t info)
     Serial.println();
   }
 
-  // ~100 ms dwell for the CDC bytes to drain toward the open host port.
-  for (volatile uint32_t i = 0; i < 2000000; i++) { }
+  // 4.5.25 (bench round 18): the prints above only ever LANDED when the port
+  // was already open AND the CDC buffer happened to be flushed by the core's
+  // Serial maintenance — which never runs before our reset. tud_cdc_write_
+  // flush() starts the IN transaction by writing the USBD peripheral
+  // directly, so the transfer goes out on the wire even from this fault
+  // context (the peripheral completes it in hardware; the completion IRQ
+  // staying masked is irrelevant). Flush hard, dwell, flush again for the
+  // endpoint-busy case, then reset.
+  Serial.flush();
+  // ~50 ms dwell for the hardware transaction to complete.
+  for (volatile uint32_t i = 0; i < 1000000; i++) { }
+  Serial.flush();
+  // ~50 ms more, then the reset — the retention copy (fp=) already survives
+  // regardless of whether these bytes make it out.
+  for (volatile uint32_t i = 0; i < 1000000; i++) { }
 
   NVIC_SystemReset();  // the same SREQ the stock empty-return path produced — the cycle shape is unchanged, but now every successor names the killer
 }
