@@ -30,9 +30,22 @@
 
 #define CONF_LIPSYNC_VERSION_MAJOR  4
 #define CONF_LIPSYNC_VERSION_MINOR  5
-#define CONF_LIPSYNC_VERSION_REV    21
+#define CONF_LIPSYNC_VERSION_REV    22
 
-const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + "." + String(CONF_LIPSYNC_VERSION_MINOR) + "." + String(CONF_LIPSYNC_VERSION_REV);
+// 4.5.22 RESCUE-BUILD SWITCH (bench round 15): the device's settings
+// filesystem was left corrupted by the 4.5.20 race + the zombie phase's
+// witness-kills-mid-write, and boots now die/hang at the first FS operation
+// — before any tone, screen, or serial protocol (USB still enumerates: the
+// core's TinyUSB init precedes setup). The RECOVER artifact is built with
+// this set to 1: it FORMATS InternalFS before mounting — a fresh filesystem
+// heals the boot; the settings re-seed to compiled defaults (they were
+// already wiped by the corruption, so the format costs nothing). The
+// version string reports "4.5.22R" on that build so the wire can tell the
+// two binaries apart. THE RECOVER BUILD FORMATS ON EVERY BOOT — flash the
+// regular build over it via the app as soon as the device is alive again.
+#define CONF_FS_FORMAT_ON_BOOT 0
+
+const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + "." + String(CONF_LIPSYNC_VERSION_MINOR) + "." + String(CONF_LIPSYNC_VERSION_REV) + (CONF_FS_FORMAT_ON_BOOT ? "R" : "");
 
 // I2C Devices
 #define I2CADDR_DISPLAY 0x3D  // Display address (61)

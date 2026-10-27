@@ -1306,6 +1306,15 @@ void enablePoll(bool isEnabled) {
 //****************************************//
 void initMemory() {
   if (USB_DEBUG) { Serial.println("USBDEBUG: initMemory()"); }
+#if CONF_FS_FORMAT_ON_BOOT
+  // 4.5.22 RESCUE PATH (see LSConfig.h): a fresh format before the mount
+  // heals a filesystem torn by the 4.5.20 race + mid-write witness kills —
+  // the class of corruption that hangs/crash-loops the boot at the FIRST FS
+  // operation, before any tone, screen, or serial protocol. Runs on the
+  // RECOVER build only; mem.begin() below mounts the fresh filesystem.
+  InternalFS.format();
+  delay(2);
+#endif
   mem.begin();  // Begin memory
   bleVerdictConsume();  // 4.5.20: consume the previous BLE boot's flash-persisted verdict (pst=/prc= on the wire) — after the FS is up, before any header prints it
   
