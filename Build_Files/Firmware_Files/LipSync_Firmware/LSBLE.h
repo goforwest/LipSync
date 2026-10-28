@@ -151,7 +151,7 @@ void initializeBluefruit(const char* s) {
     g_bleVerdictDirty = true;
     return;
   }
-  Serial.println("BOOT: BLE stack up");
+  if (USB_DEBUG) { Serial.println("BOOT: BLE stack up"); }
   // 4.5.27: THE SoftDevice is UP from this instant until the next reset —
   // every POWER-register access from here on MUST go through the SD SVCs
   // (see lipsyncRetentionUpdate in LSApiDeclarations.h; the Fable 5.1
@@ -213,7 +213,7 @@ void initializeBluefruit(const char* s) {
     g_bleVerdictDirty = true;
     return;
   }
-  Serial.println("BOOT: BLE advertising");
+  if (USB_DEBUG) { Serial.println("BOOT: BLE advertising"); }
   g_bleInitStage = 5;
   needsInitialization = false;  // FULL SUCCESS ONLY — every guarded call site keys on this
   g_bleVerdictDirty = true;  // st=5: if the boot STILL dies after this, the fault is past the init — advertising/runtime

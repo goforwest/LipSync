@@ -364,7 +364,8 @@ volatile uint8_t g_bleProbeStep = 0;             // 4.5.14: the begin()-mirror p
 volatile uint32_t g_bleProbeCode = 0;            // 4.5.14: the failing call's SoftDevice error code (0 = none)
 volatile uint32_t g_bleProbeNeed = 0;           // 4.5.14: sd_ble_enable's required app RAM base (on NO_MEM, the smoking gun vs 0x20006000)
 TaskHandle_t g_loopTaskHandle = NULL;             // 4.5.26: the loop task's handle (captured at setup entry — the loop task runs setup) for the stack high-water print
-volatile UBaseType_t g_loopStackHwm = 0;           // 4.5.26: the loop task's minimum-ever free stack (FreeRTOS words, 4 bytes each) — printed as sw= on the wire; near-zero on BLE boots = the 4 KB loop stack is overflowing into the heap
+volatile UBaseType_t g_loopStackHwm = 0;
+bool g_bootReportWorthy = false;                  // 4.5.29: computed at setup — true only when the PREVIOUS boot ended abnormally (witness marker, captured fault page, failed BLE init, or lockup). The first-host-byte BOOT report prints only when this is set; healthy boots are SILENT (the released wire contract, restored)           // 4.5.26: the loop task's minimum-ever free stack (FreeRTOS words, 4 bytes each) — printed as sw= on the wire; near-zero on BLE boots = the 4 KB loop stack is overflowing into the heap
 volatile uint32_t g_bleInitRc = 0;              // 4.5.19 (expert consult): the RAW err_t from the failing DIS/HID begin — sd_ble_gatts_service_add's own code on the st=2 path (0x4=NO_MEM, 0x7=INVALID_PARAM, 0xF=FORBIDDEN, 0x10=INVALID_ADDR)
 volatile uint32_t g_bleIrqBad1 = 0;              // 4.5.15: pre-demotion mask of enabled IRQs 0-31 found at an SD-reserved priority (< 4) at BLE-init time (bit = IRQ number)
 volatile uint32_t g_bleIrqBad2 = 0;              // 4.5.15: the same mask for IRQs 32-47
@@ -513,7 +514,7 @@ static void bleInitTaskBody(void* arg) {
   if (needsInitialization) {          // ...then the verdict (true = a stage failed)
     Serial.println(F("BOOT: BLE task FAILED (see stage line above)"));
   } else {
-    Serial.println(F("BOOT: BLE task up"));
+    if (USB_DEBUG) { Serial.println(F("BOOT: BLE task up")); }
   }
   vTaskSuspend(NULL);  // a FreeRTOS task must never return
 }
@@ -549,6 +550,28 @@ void setup() {
   }
   writeTrailByte(0);
 
+  // 4.5.29 — THE CONDITIONAL BOOT REPORT (release hygiene, restoring the
+  // "healthy boots print nothing" wire contract the 4.5.9-4.5.12 bench
+  // instruments deliberately broke "until the BLE boot is bench-cleared" —
+  // it now is). The first-host-byte BOOT line prints ONLY when the previous
+  // boot ended abnormally; every normal flow (power-on, reset pin, the
+  // deliberate software resets of CM/OM/SR/menu/UM) is silent. The
+  // abnormal classes, each covered by a surviving signal:
+  //   - a witnessed loop hang or a captured HardFault → the retention
+  //     marker (pm) is nonzero;
+  //   - an SD assert or our fault capture → the fault page (fp) is present;
+  //   - a failed BLE init → the persisted verdict (pst) is 0..4;
+  //   - a LOCKUP reset → the RESETREAS lockup bit (no capture exists for
+  //     this class — the bit itself is the report);
+  //   - a watchdog reset → already boots safe mode → the HB line reports it.
+  // If a future death class leaves none of these, it stays silent by design
+  // — silence IS the contract, and the degradation that matters (a dead or
+  // broken boot) always has the HB line or this report.
+  g_bootReportWorthy = (g_hangMarkerPrev != 0)
+                     || (g_faultPrevPage != 0xFF)
+                     || (g_blePrevSt >= 0 && g_blePrevSt < 5)
+                     || ((g_lastRebootReason & NRF_POWER_RESETREAS_LOCKUP_MASK) == NRF_POWER_RESETREAS_LOCKUP_MASK);
+
   beginMillis = millis();  // Intialize timer
 
   // Keep the bus dark until the composite descriptor is complete. The core
@@ -565,19 +588,23 @@ void setup() {
 
   Serial.begin(115200);
 
-  // BOOT TRACE (4.5.9 bench round 3): a handful of short lines naming each
-  // boot milestone. The bench's BLE boot looped with zero wire visibility
-  // (the app could not even open the port), so every boot now announces its
-  // reset reason up front and the milestones below name the death site even
-  // inside a fast fault loop — the last line printed IS the fault's
-  // address. Unprefixed lines are proven app-tolerated (three sessions of
-  // HB/ERROR lines dropped as undecodable, no waiter false-match possible).
-  Serial.print(F("BOOT: 4.5.9 rst=0x"));
-  Serial.print(g_lastRebootReason, HEX);
-  Serial.print(F(" pt="));
-  Serial.print(g_bootTrailPrev);
-  Serial.print(F(" pm="));
-  Serial.println(g_hangMarkerPrev);
+  // BOOT TRACE (4.5.9 bench round 3) — 4.5.29 RELEASE HYGIENE: the
+  // unconditional announcement is retired with the bench hunt it carried
+  // ("until the BLE boot is bench-cleared" — cleared at 4.5.27). The line
+  // now prints only when the previous boot ended abnormally (see
+  // g_bootReportWorthy above); the milestone prints below are gated behind
+  // USB_DEBUG. Unprefixed lines remain app-tolerated (proven across many
+  // sessions; dropped as undecodable, no waiter false-match possible).
+  if (USB_DEBUG || g_bootReportWorthy) {
+    Serial.print(F("BOOT: "));
+    Serial.print(CONF_LIPSYNC_VERSION_STRING);
+    Serial.print(F(" rst=0x"));
+    Serial.print(g_lastRebootReason, HEX);
+    Serial.print(F(" pt="));
+    Serial.print(g_bootTrailPrev);
+    Serial.print(F(" pm="));
+    Serial.println(g_hangMarkerPrev);
+  }
 
   initMemory();  // Initialize Memory
 
@@ -760,7 +787,7 @@ void setup() {
   // contend for stack and the loop's guarded BLE calls stay inert until the
   // stack is up (needsInitialization is the gate).
   if (g_bleInitPending) {
-    Serial.println(F("BOOT: BLE task create"));
+    if (USB_DEBUG) { Serial.println(F("BOOT: BLE task create")); }
     xTaskCreateStatic(bleInitTaskBody, "bleInit",
                       CONF_BLE_INIT_TASK_STACK_BYTES / sizeof(StackType_t),
                       NULL, CONF_BLE_INIT_TASK_PRIORITY,
@@ -770,7 +797,7 @@ void setup() {
   if (USB_DEBUG) { Serial.print("USBDEBUG: lastRebootReason: "); Serial.println(g_lastRebootReason); }
   if (USB_DEBUG) { Serial.println("USBDEBUG: Setup complete."); }
 
-  Serial.println(F("BOOT: setup done"));
+  if (USB_DEBUG) { Serial.println(F("BOOT: setup done")); }
 
 }  // end setup
 
@@ -797,6 +824,15 @@ void loop() {
     // in every session log right after connect, carrying the BLE verdict.
     if (!g_hostHasSpoken && !finalBootLinePrinted) {
       finalBootLinePrinted = true;
+      // 4.5.29: the report prints ONLY when the previous boot ended
+      // abnormally (g_bootReportWorthy — see setup). Healthy boots stay
+      // SILENT on the wire: the released contract ("healthy boots print
+      // nothing") is restored now that the BLE boot is bench-cleared. The
+      // 4.5.12 "bulletproof capture" served its hunt; the abnormal-boot
+      // classes keep it — each one leaves a marker, a fault page, a failed
+      // verdict, or a lockup bit, and this line still carries the full
+      // forensics for exactly those boots.
+      if (g_bootReportWorthy) {
       int bleStateFinal = 0;
       if (g_bleInitPending) {
         bleStateFinal = g_bleInitDone ? (needsInitialization ? 3 : 2) : 1;
@@ -841,74 +877,16 @@ void loop() {
       }
       Serial.print(F(" sw="));
       Serial.println(g_loopTaskHandle ? uxTaskGetStackHighWaterMark(g_loopTaskHandle) : 0);  // 4.5.26: loop-task stack high-water (FreeRTOS words) — near-zero = the 4 KB stack overflows on the BLE path
+      }
     }
     g_hostHasSpoken = true;
   }
 
-  // REPEATING BOOT HEADER (4.5.10 bench fix): the one-shot boot trace was
-  // proven insufficient — the app opens the port AFTER the boot, and CDC
-  // output before an open port is discarded, so three sessions of BLE-boot
-  // deaths left the wire silent. The header now repeats every second for
-  // the first 30 s of the boot (or until the host speaks), carrying the
-  // reset reason and the LIVE BLE task state — any serial monitor opened
-  // mid-fault-loop captures the state within one second, and the last line
-  // before a death names the fault's neighborhood.
-  // 4.5.11's deferred BLE-boot attach (wait for the task verdict, or a
-  // 10 s fallback) is RETIRED as of 4.5.18 — beginComOpMode attaches at
-  // the stock point, before the SoftDevice comes up (see its comment).
-
-  static unsigned long lastBootHeaderMs = 0;
-  if (!g_hostHasSpoken && millis() < 30000UL && (millis() - lastBootHeaderMs >= 1000UL)) {
-    lastBootHeaderMs = millis();
-    int bleState = 0;  // 0 = not a BLE boot
-    if (g_bleInitPending) {
-      if (g_bleInitDone) {
-        bleState = needsInitialization ? 3 : 2;  // 3 = failed, 2 = up
-      } else {
-        bleState = 1;  // task running
-      }
-    }
-    Serial.print(F("BOOT: "));
-    Serial.print(CONF_LIPSYNC_VERSION_STRING);
-    Serial.print(F(" rst=0x"));
-    Serial.print(g_lastRebootReason, HEX);
-    Serial.print(F(" pt="));
-    Serial.print(g_bootTrailPrev);
-    Serial.print(F(" pm="));
-    Serial.print(g_hangMarkerPrev);
-    Serial.print(F(" ble="));
-    Serial.print(bleState);
-    Serial.print(F(" st="));
-    Serial.print(g_bleInitStage);  // 1=SD enable 2=DIS 3=HID 4=advertising 5=success
-    Serial.print(F(" sd="));
-    Serial.print(g_bleSdWasEnabled);  // -1 = probe not run yet, 0 = SD was down, 1 = SD was already up (bootloader leftover)
-    Serial.print(F(" pstep="));
-    Serial.print(g_bleProbeStep);     // build shape: 11 = probe-mirror build (passed), 12 = direct-begin build (4.5.18+), 0/1..10 = historical
-    Serial.print(F(" pcode=0x"));
-    Serial.print(g_bleProbeCode, HEX);
-    Serial.print(F(" need=0x"));
-    Serial.print(g_bleProbeNeed, HEX);
-    Serial.print(F(" bad1=0x"));
-    Serial.print(g_bleIrqBad1, HEX);   // 4.5.15: enabled IRQs 0-31 found at an SD-reserved priority at init time (bit = IRQ)
-    Serial.print(F(" bad2=0x"));
-    Serial.print(g_bleIrqBad2, HEX);   // 4.5.15: IRQs 32-47 of the same sweep
-    Serial.print(F(" dem="));
-    Serial.print(g_bleProbeDemoted);
-    Serial.print(F(" rc=0x"));
-    Serial.print(g_bleInitRc, HEX);
-    Serial.print(F(" pst="));
-    Serial.print(g_blePrevSt);  // 4.5.20: the previous BLE boot's persisted verdict
-    Serial.print(F(" prc=0x"));
-    Serial.print(g_blePrevRc, HEX);
-    Serial.print(F(" fp=0x"));
-    if (g_faultPrevPage == 0xFF) {
-      Serial.print(F("none"));
-    } else {
-      Serial.print(((uint32_t)g_faultPrevPage) << 13, HEX);
-    }
-    Serial.print(F(" sw="));
-    Serial.println(g_loopTaskHandle ? uxTaskGetStackHighWaterMark(g_loopTaskHandle) : 0);
-  }
+  // REPEATING BOOT HEADER — RETIRED (4.5.29): the 1 s × 30 s repeat lived
+  // for the TinyUSB CDC discard window (pre-open-port writes are dropped),
+  // so a dying boot could still be caught on a serial monitor mid-loop.
+  // The hunt it served is closed and the conditional first-host-byte report
+  // above carries every abnormal class — healthy boots are silent again.
 
   // Feed the hardware watchdog directly from the live loop (bench
   // 2026-10-18, the unbreakable safe-mode reset cycle): the heartbeat
@@ -2005,10 +1983,12 @@ void beginComOpMode() {
   initCommunicationMode();  // Retrieve communication mode from memory (None, USB, Bluetooth)
   initOperatingMode();      // Retrieve operating mode from memory (USB Mouse, Bluetooth Mouse, Gamepad)
 
-  Serial.print(F("BOOT: com-op om="));
-  Serial.print(g_operatingMode);
-  Serial.print(F(" cm="));
-  Serial.println(g_comMode);
+  if (USB_DEBUG) {
+    Serial.print(F("BOOT: com-op om="));
+    Serial.print(g_operatingMode);
+    Serial.print(F(" cm="));
+    Serial.println(g_comMode);
+  }
 
   // Cross-validate the loaded pair (4.5.7 review): the setters reject
   // gamepad+BLE, but the boot loaders clamp each value to its own range
@@ -2059,7 +2039,7 @@ void beginComOpMode() {
             USBDevice.attach();
             snprintf(g_bleDeviceName, sizeof(g_bleDeviceName), "LS_%s", g_deviceUID.c_str());
             g_bleInitPending = true;
-            Serial.println(F("BOOT: BLE deferred to 16KB task"));
+            if (USB_DEBUG) { Serial.println(F("BOOT: BLE deferred to 16KB task")); }
           }
           break;
       }
@@ -2070,7 +2050,7 @@ void beginComOpMode() {
       break;
       // default: (SAFE is handled by the early return above)
   }
-  Serial.println(F("BOOT: interfaces up"));
+  if (USB_DEBUG) { Serial.println(F("BOOT: interfaces up")); }
 
 
   if (USB_DEBUG) {

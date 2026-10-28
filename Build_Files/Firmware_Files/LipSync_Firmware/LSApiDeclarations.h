@@ -293,6 +293,11 @@ extern volatile uint8_t g_bleProbeDemoted;
 // on the st=2 path this is sd_ble_gatts_service_add's own error code
 // (0x4=NO_MEM, 0x7=INVALID_PARAM, 0xF=FORBIDDEN, 0x10=INVALID_ADDR).
 extern volatile uint32_t g_bleInitRc;
+// 4.5.29: computed at setup — the previous boot ended abnormally (witness
+// marker, captured fault page, failed BLE verdict, or lockup reset); the
+// first-host-byte BOOT report and the setup-time announcement print only
+// when this is set. Healthy boots are SILENT (the released wire contract).
+extern bool g_bootReportWorthy;
 // 4.5.27 (Fable 5.1 consult, bench round 20 — THE ROOT CAUSE, FINALLY): the
 // boot-trail/marker writes go to NRF_POWER->GPREGRET2 — and POWER is a
 // SOFTDEVICE-RESTRICTED peripheral. With the SD up, every raw write is caught
