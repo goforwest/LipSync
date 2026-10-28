@@ -4147,7 +4147,21 @@ void btFeedbackLoop() {
   }  // Set the default LED effect if bluetooth connection state is changed
   else if (g_comMode == CONF_COM_MODE_BLE && tempIsConnected != g_btIsConnected) {
     g_btIsConnected = tempIsConnected;
-    setLedDefault();
+    if (tempIsConnected) {
+      // 4.5.28 bench report fix: on the CONNECTED transition, paint the solid
+      // blue DIRECTLY from this poll's own result. setLedDefault() makes a
+      // SECOND live isConnected() query, and during the pairing handshake
+      // (the host connects, drops, and re-bonds around the exchange) that
+      // second query can transiently disagree with this one — clearLedAll()
+      // had already run, the blue branch didn't match, and the LED was left
+      // dark with nothing repainting it in the steady state (the observed
+      // bug: dark from pairing until an unrelated setLedDefault — a menu
+      // exit — repainted it). The disconnected transition keeps the default
+      // path; the scan blink re-arms within one poll.
+      led.setLedColor(CONF_BT_LED_NUMBER, LED_CLR_BLUE, led.getLedBrightness());
+    } else {
+      setLedDefault();
+    }
   }
 
   //if (USB_DEBUG) { Serial.println("USBDEBUG: end of btFeedbackLoop"); }
