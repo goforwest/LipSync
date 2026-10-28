@@ -4138,8 +4138,20 @@ void btFeedbackLoop() {
       // bug: dark from pairing until an unrelated setLedDefault — a menu
       // exit — repainted it). The disconnected transition keeps the default
       // path; the scan blink re-arms within one poll.
+      // 4.6.0 fix: the scan-blink timer armed during the (possibly long)
+      // disconnected advertising window is still pending and its final run
+      // lands on LED_CLR_NONE (off) — it clobbered the blue paint within
+      // ~1.5 s and left the LED dark. Delete it before painting.
+      if (ledTimerId[CONF_TIMER_LED_BT] >= 0) {
+        ledStateTimer.deleteTimer(ledTimerId[CONF_TIMER_LED_BT]);
+        ledTimerId[CONF_TIMER_LED_BT] = -1;
+      }
       led.setLedColor(CONF_BT_LED_NUMBER, LED_CLR_BLUE, led.getLedBrightness());
     } else {
+      if (ledTimerId[CONF_TIMER_LED_BT] >= 0) {
+        ledStateTimer.deleteTimer(ledTimerId[CONF_TIMER_LED_BT]);
+        ledTimerId[CONF_TIMER_LED_BT] = -1;
+      }
       setLedDefault();
     }
   }
