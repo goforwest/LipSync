@@ -117,6 +117,9 @@ private:
 // Return     : void
 //*********************************//
 LSOutput::LSOutput() {
+  _ledBrightness = 0;
+  _ledBrightnessLevel = CONF_LED_BRIGHTNESS_LEVEL_MIN;
+  _lightModeLevel = 0;
 }
 
 //*********************************//
@@ -312,6 +315,8 @@ void LSOutput::setLedColor(int ledNumber, int ledColorNumber, int ledBrightness)
   int b = colorProperty[ledColorNumber].colorCode.b;
 
   bool someLight = (r > 0 || g > 0 || b > 0);
+  if (ledColorNumber < 0) ledColorNumber = LED_CLR_NONE;
+  if (ledColorNumber >= (int)(sizeof(colorProperty)/sizeof(colorProperty[0]))) ledColorNumber = LED_CLR_NONE;
 
   switch (ledNumber) {
     case CONF_LED_LEFT:

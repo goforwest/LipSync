@@ -1593,7 +1593,11 @@ void LSScreen::displayCursor() {
   flushDisplay();
 
   _selectedLine = _cursorStart + _currentSelection;
-  _selectedText = _currentMenuText[_selectedLine];
+  if (_currentMenuText == nullptr || _selectedLine < 0 || _selectedLine >= _currentMenuLength) {
+    _selectedText = "";
+  } else {
+    _selectedText = _currentMenuText[_selectedLine];
+  }
 
   if (_selectedText.length() > (_maxCharPerLine - 1)) {
     //Serial.println("Long text");

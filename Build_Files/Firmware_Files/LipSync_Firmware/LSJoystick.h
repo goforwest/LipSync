@@ -694,9 +694,12 @@ pointFloatType LSJoystick::getInputMax(int quad) {
   // A failed read is NOT a corner sample: {0,0} would replace a real held
   // deflection with the origin on this step (hold the last good point by
   // returning the stored corner below unchanged).
+  if (quad < 0 || quad >= JOY_CALIBR_ARRAY_SIZE) {
+    return pointFloatType{0.0f, 0.0f};
+  }
   double xReading = 0.0, yReading = 0.0, zReading = 0.0;
   if (!readMagneticField(&xReading, &yReading, &zReading)) {
-    return (quad >= 0 && quad < JOY_CALIBR_ARRAY_SIZE) ? _magnetInputCalibration[quad] : pointFloatType{0.0f, 0.0f};
+    return _magnetInputCalibration[quad];
   }
   // Get new x and y reading
   pointFloatType tempCalibrationPoint = {(float)yReading, (float)xReading};
@@ -709,9 +712,7 @@ pointFloatType LSJoystick::getInputMax(int quad) {
   // Make sure it's a valid quadrant and if new point has larger magnitude from center ( calibration timer loop )
 
 
-  if( (quad >= 0) && 
-  (quad < JOY_CALIBR_ARRAY_SIZE) && 
-  magnitudePoint(tempCalibrationPoint, _magnetInputCalibration[0]) > magnitudePoint(_magnetInputCalibration[quad], _magnetInputCalibration[0])){           // The point with larger magnitude is sent as output 
+  if( magnitudePoint(tempCalibrationPoint, _magnetInputCalibration[0]) > magnitudePoint(_magnetInputCalibration[quad], _magnetInputCalibration[0])){           // The point with larger magnitude is sent as output 
     _magnetInputCalibration[quad] = tempCalibrationPoint;
   }
   

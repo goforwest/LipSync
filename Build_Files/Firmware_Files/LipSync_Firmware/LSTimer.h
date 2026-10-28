@@ -603,6 +603,10 @@ unsigned long LSTimer<T>::elapsedTime(int timerId) {
         invalidOperations++;
         return 0;
     }
+    if (timer[timerId].callback == NULL && !stopwatch[timerId]) {
+        invalidOperations++;
+        return 0;
+    }
 
     ls_millis_t current_millis, diff_millis;
 
@@ -670,6 +674,10 @@ void LSTimer<T>::restartTimer(int timerId) {
     // timer[-1].previousTime and timer[-1].numRuns are 40 bytes before the
     // array, i.e. straight into an adjacent global.
     if (timerId < 0 || timerId >= MAX_TIMERS) {
+        invalidOperations++;
+        return;
+    }
+    if (timer[timerId].callback == NULL && !stopwatch[timerId]) {
         invalidOperations++;
         return;
     }

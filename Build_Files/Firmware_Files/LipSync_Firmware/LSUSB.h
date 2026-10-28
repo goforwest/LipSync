@@ -493,7 +493,11 @@ void LSUSBGamepad::write(void *report)
     if (USBDevice.mounted()) timedOut = true;
     return;
   }
-  memcpy(&_report, report, sizeof(_report));
+  if (report) {
+    memcpy(&_report, report, sizeof(_report));
+  } else {
+    memset(&_report, 0, sizeof(_report));
+  }
   if (GamepadReport(&_report, sizeof(_report))) {
     reportSuccesses++;
     countReportMovement();

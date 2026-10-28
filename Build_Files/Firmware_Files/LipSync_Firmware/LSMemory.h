@@ -133,7 +133,8 @@ void LSMemory::initialize(String fileString, String jsonString) {
     // parses cleanly yet carries no settings, so doc.isNull() must also be
     // false. Otherwise a stray "null" would be treated as healthy and never
     // re-seeded.
-    fileHealthy = (readlen > 0) && !deserializeJson(doc, String(buffer)) && !doc.isNull();
+    DeserializationError err = deserializeJson(doc, String(buffer));
+    fileHealthy = (readlen > 0) && !err && !doc.isNull() && doc.is<JsonObject>();
   }
   if (fileHealthy) {
     return;  // Nothing to do — the stored settings parse
@@ -361,7 +362,7 @@ JsonObject LSMemory::readObject(String fileString){
   // timer-print cleanup eliminated. The failed state is still observable
   // through isLastReadOk(), and initialize()'s re-seed heals the file at
   // the next boot.
-  _lastReadOk = !deserializationError;
+  _lastReadOk = !deserializationError && !doc.isNull() && doc.is<JsonObject>();
   if (deserializationError) {
     static bool reportedDeserializeFailure = false;
     if (!reportedDeserializeFailure) {
@@ -369,6 +370,13 @@ JsonObject LSMemory::readObject(String fileString){
       Serial.print("ERROR: deserializeJson() failed (reported once per boot): ");
       Serial.println(deserializationError.f_str());
     }
+  } else if (doc.isNull() || !doc.is<JsonObject>()) {
+    static bool reportedInvalidType = false;
+    if (!reportedInvalidType) {
+      reportedInvalidType = true;
+      Serial.println(F("ERROR: settings file is not a JSON object (reported once per boot)"));
+    }
+    _lastReadOk = false;
   }
 
   JsonObject obj = doc.as<JsonObject>();

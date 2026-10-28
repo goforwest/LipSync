@@ -289,11 +289,19 @@ bool serialSettings(bool enabled) {
 //*********************************//
 void performCommand(String inputString) {
   int inputIndex = inputString.indexOf(':');
+  if (inputIndex < 0) {
+    printResponseInt(true, true, false, 1, inputString, false, 0);
+    return;
+  }
 
   // Extract command string from input string
   String inputCommandString = inputString.substring(0, inputIndex);
 
   int inputCommandIndex = inputCommandString.indexOf(',');
+  if (inputCommandIndex < 0) {
+    printResponseInt(true, true, false, 1, inputString, false, 0);
+    return;
+  }
 
   String inputEndpointString = inputCommandString.substring(0, inputCommandIndex);
 
@@ -566,13 +574,18 @@ void getDeviceID(bool responseEnabled, bool apiEnabled) {
   if (tempDeviceID != deviceID) {  // If string doesn't match, store to memory
     mem.writeString(CONF_SETTINGS_FILE, commandKey, deviceID);
   }
-  g_deviceUID = deviceID; // Update global variable
+  if (deviceID.length() > 0) {
+    g_deviceUID = deviceID; // Update global variable
+  }
   
   // Answer the ID now in force (the chip's real UID): on a fresh settings
   // file the stored value is the compiled placeholder, and answering it made
   // the FIRST read after a factory reset (or any board swap) report a value
   // the device had already replaced in memory — the truth only arrived on
   // the second read.
+  if (deviceID.length() == 0) {
+    deviceID = tempDeviceID;
+  }
   printResponseString(responseEnabled, apiEnabled, true, 0, "ID,0", true, deviceID);
 
 }

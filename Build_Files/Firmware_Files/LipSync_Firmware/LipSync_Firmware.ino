@@ -324,7 +324,7 @@ extern "C" __attribute__((used, noinline)) void lipsyncFaultCapture(uint32_t* fr
   Serial.println(g_faultCfsr, HEX);
   for (volatile uint32_t i = 0; i < 2000000; i++) { }  // ~100 ms dwell for any already-buffered CDC byte to drain
   NVIC_SystemReset();  // SREQ — retention + GPREGRET survive (or the bootloader clears GPREGRET; the class marker survives regardless)
-  while (1) { }        // never returns
+  while (1) { delay(10); }        // never returns
 }
 
 // The strong override of the core's weak (.S) spin-loop handler. Naked: the
@@ -2232,6 +2232,7 @@ void switchRemapApplyCell(int jack, int window, bool gamepad, int actionNumber) 
 
 int switchRemapDefaultCell(int jack, int window, bool gamepad) {
   int row = CONF_SWITCH_REMAP_FIRST_ROW + jack * CONF_SWITCH_REMAP_ROWS_PER_JACK + window;
+  if (row < 0 || row >= (int)(sizeof(switchActionProperty) / sizeof(inputActionStruct))) return 0;
   if (gamepad) return (int)switchActionProperty[row].gamepadOutputActionNumber;
   return (int)switchActionProperty[row].mouseOutputActionNumber;
 }

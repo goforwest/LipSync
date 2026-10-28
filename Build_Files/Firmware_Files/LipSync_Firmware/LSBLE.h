@@ -254,6 +254,7 @@ void LSBLEMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t 
   // the buttons state still mutates, so the first post-init movement
   // report carries it.
   if (needsInitialization) return;
+  if (blehid.isConnected() == false && !Bluefruit.connected()) return;
   blehid.mouseReport(b, x, y, wheel, pan);
 }
 

@@ -178,6 +178,7 @@ void LSPressure::begin()
   {
     if (USB_DEBUG) {Serial.println("USBDEBUG: LSPressure::begin LPS35HW Found."); }
     _lps35hw.setDataRate(LPS35HW_RATE_25_HZ);  // Options: 1 Hz, 10Hz, 25Hz, 50Hz, 75Hz
+    g_mouthpiecePressureSensorConnected = true;
   }
 
   // LPS22 Pressure sensor setup
@@ -189,7 +190,8 @@ void LSPressure::begin()
   else
   {
     if (USB_DEBUG) {Serial.println("USBDEBUG: LSPressure::begin LPS22 Found.");}
-    _lps22.setDataRate(LPS22_RATE_25_HZ);         // Options: 1-shot, 
+    _lps22.setDataRate(LPS22_RATE_25_HZ);         // Options: 1-shot,
+    g_ambientPressureSensorConnected = true;
   }
 
   //setFilterMode(PRESS_FILTER_NONE);         // Set the default filter mode to none  //  TODO 2025-Feb-22 Currently unused

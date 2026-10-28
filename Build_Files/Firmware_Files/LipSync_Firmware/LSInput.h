@@ -55,7 +55,7 @@ class LSInput {
 LSInput::LSInput(int* inputPinArray, int inputNumber)
 {
   inputBuffer.begin(INPUT_BUFF_SIZE);
-  _inputPinArray = new int[inputNumber];
+  _inputPinArray = new int[inputNumber]();
 
   _inputNumber = inputNumber;
   
@@ -69,7 +69,10 @@ LSInput::LSInput(int* inputPinArray, int inputNumber)
 
 LSInput::~LSInput()
 {
-
+  if (_inputPinArray) {
+    delete[] _inputPinArray;
+    _inputPinArray = nullptr;
+  }
 }
 
 void LSInput::begin() {
@@ -91,9 +94,8 @@ void LSInput::update() {
 
   inputAllState = 0;
 
-
   // for each input pin, do a digital read and create a single number to represent the collective states
-  for (int i = 0; i < _inputNumber; i++){
+  for (int i = 0; i < _inputNumber && i < 3; i++){
     inputState[i] = !digitalRead(_inputPinArray[i]);
     inputAllState += (1 << i) * inputState[i];  // create single integer to represent combination of button presses (integer shift, not pow())
   }

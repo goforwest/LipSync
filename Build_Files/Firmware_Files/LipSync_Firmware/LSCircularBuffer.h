@@ -119,6 +119,16 @@ void LSCircularBuffer<T>::begin(uint16_t inputSize)
 template<typename T>
 T LSCircularBuffer<T>::getElement( uint16_t elementNum )
 {
+  if (cBufferData == nullptr || cBufferSize == 0) {
+    T empty = {0};
+    return empty;
+  }
+  if (elementNum >= cBufferElementsUsed && cBufferElementsUsed > 0) {
+    elementNum = cBufferElementsUsed - 1;
+  } else if (cBufferElementsUsed == 0) {
+    T empty = {0};
+    return empty;
+  }
   // Translate elementNum into terms of cBufferLastPtr.
   int16_t virtualElementNum;
   virtualElementNum = cBufferLastPtr - elementNum;
@@ -187,6 +197,10 @@ void LSCircularBuffer<T>::updateLastElement(const T elementVal){
 template<typename T>
 T LSCircularBuffer<T>::getLastElement( void )
 {
+  if (cBufferData == nullptr || cBufferSize == 0 || cBufferElementsUsed == 0) {
+    T empty = {0};
+    return empty;
+  }
   // Output the value of last element
   return cBufferData[cBufferLastPtr];
 }
