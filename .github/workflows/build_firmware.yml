@@ -252,7 +252,22 @@ jobs:
               exit 0
             fi
           fi
-          git switch --orphan firmware-binaries
+          # (4.6.1 release fix) The bench rounds commit the dist artifacts
+          # into the branch tree, so the tag checkout carries them as
+          # TRACKED files — the fresh staging build above then reads as
+          # local modifications and git refuses the orphan switch
+          # ("your local changes would be overwritten by checkout"; the
+          # V4.5.6 release passed only because its tag tree predated the
+          # committed-dist convention). The classic orphan pattern
+          # instead: checkout --orphan keeps index and worktree, then the
+          # index is emptied with --cached -f — every file stays on disk,
+          # the freshly built dist content included, and the commit below
+          # stages exactly the four release files. (Verified against the
+          # exact sequence in a scratch repo: switch --orphan alone
+          # refuses BOTH the modified-tracked and the untracked-leftover
+          # shapes.)
+          git checkout --orphan firmware-binaries
+          git rm -r -q --cached -f .
           mv dist/* .
           git add firmware-manifest.json "LipSync_Firmware_${VERSION}_dfu.zip" "LipSync_Firmware_${VERSION}.uf2" "LipSync_Firmware_${VERSION}.hex"
           git commit -m "Firmware ${VERSION} flash artifacts"
