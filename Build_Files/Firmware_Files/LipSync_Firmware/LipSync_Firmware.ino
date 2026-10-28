@@ -174,8 +174,14 @@ volatile bool g_shutdownInProgress = false;  // witness v9: softwareReset's deli
 // is atomic on the ARM, so the worst case of the race is one tick of lag.
 // >3 consecutive un-fed seconds (counter reaches 4) is a loop hang.
 volatile uint32_t g_witnessSecondsUnfed = 0;
-uint8_t readTrailByte()            { return (NRF_POWER->GPREGRET2 >> 5) & 0x07; }
-void writeTrailByte(uint8_t step)  { NRF_POWER->GPREGRET2 = (NRF_POWER->GPREGRET2 & ~0xE0UL) | ((step & 0x07) << 5); }
+// 4.5.27 (Fable 5.1 consult): these were RAW POWER-peripheral writes — the
+// SoftDevice's watch unit flags every one with the SD up (APP_MEMACC, the
+// root cause of the entire 4.5.6-4.5.26 BLE death saga: the stamps were the
+// killer, the "death sites" the stamps named were the stamp's own callers).
+// Both now route through the SD-aware helper: the SVC path with the stack
+// up, the raw write when it is down.
+uint8_t readTrailByte()            { return (lipsyncRetentionGet(1) >> 5) & 0x07; }
+void writeTrailByte(uint8_t step)  { lipsyncRetentionUpdate(1, 0xE0, (uint8_t)((step & 0x07) << 5)); }
 
 // WITNESS v8 — THE HANG WITNESS (bench 2026-10-23): this round proved the
 // freeze ends in a WATCHDOG reset that WIPES GPREGRET2 (every freeze
@@ -237,7 +243,7 @@ extern "C" void TIMER3_IRQHandler(void) {
   // watchdogLoop()'s reset. 4 consecutive un-fed seconds = the loop stalled
   // past 3 s with interrupts alive.
   if (!g_shutdownInProgress && g_watchdogArmed && ++g_witnessSecondsUnfed >= 4) {
-    NRF_POWER->GPREGRET2 = (NRF_POWER->GPREGRET2 & ~0x1CUL) | (1UL << 2);  // marker 1: loop hang witnessed (trail bits preserved)
+    lipsyncRetentionUpdate(1, 0x1C, 0x04);  // 4.5.27: the SD-aware marker write (the raw POWER write was an APP_MEMACC kill with the SD up) — marker 1: loop hang witnessed (trail bits preserved)
     NVIC_SystemReset();  // SREQ — retention survives; the next boot reports pt=/pm=
   }
 }
@@ -299,6 +305,9 @@ extern "C" __attribute__((used, noinline)) void lipsyncFaultCapture(uint32_t* fr
   // boot (a hang needs the loop ALIVE, a fault kills it). checkResetReason
   // treats any nonzero marker as streak-worthy — correct here too: three
   // straight fault deaths SHOULD settle in safe mode.
+  // RAW, deliberately (4.5.27): SVCs are impossible at fault priority, and
+  // the SD's watch unit is a WATCH — the write itself completes, the
+  // violation is only reported afterwards, and we reset 100 ms later anyway.
   NRF_POWER->GPREGRET2 = (NRF_POWER->GPREGRET2 & ~0x1CUL) | (2UL << 2);
   // location: the faulting PC's 8 KB flash page into GPREGRET (best-effort —
   // see the header note). The app's flash spans 0x26000-0x75000, so
@@ -350,6 +359,7 @@ extern "C" __attribute__((naked)) void HardFault_Handler(void) {
 // window is a no-op window, not a fault window.
 volatile int g_bleInitStage = 0;                 // 4.5.11: init-task progress/failure stage (see LSApiDeclarations.h)
 volatile int8_t g_bleSdWasEnabled = -1;          // 4.5.13: the init task's SD probe: -1 = not probed yet, 0 = the SoftDevice was down (normal), 1 = it was ALREADY enabled when the app started (bootloader leftover — see LSBLE.h)
+volatile bool g_softDeviceEnabled = false;      // 4.5.27: THE SoftDevice is up (set right after Bluefruit.begin() succeeds) — every retention-register access routes through the SD SVCs while this is true; see LSApiDeclarations.h          // 4.5.13: the init task's SD probe: -1 = not probed yet, 0 = the SoftDevice was down (normal), 1 = it was ALREADY enabled when the app started (bootloader leftover — see LSBLE.h)
 volatile uint8_t g_bleProbeStep = 0;             // 4.5.14: the begin()-mirror probe's first failing call (0 = not run/non-BLE, 1..10 = that call failed, 11 = all passed) — see LSBLE.h
 volatile uint32_t g_bleProbeCode = 0;            // 4.5.14: the failing call's SoftDevice error code (0 = none)
 volatile uint32_t g_bleProbeNeed = 0;           // 4.5.14: sd_ble_enable's required app RAM base (on NO_MEM, the smoking gun vs 0x20006000)
@@ -525,14 +535,15 @@ void setup() {
   // Witness v7: capture what the DEAD boot last stamped (survives the reset
   // in the retention register), then start this boot's trail.
   g_bootTrailPrev = readTrailByte();
-  g_hangMarkerPrev = (NRF_POWER->GPREGRET2 >> 2) & 0x07;
-  NRF_POWER->GPREGRET2 &= ~0x1CUL;  // consume the marker — one hang reports once
+  g_hangMarkerPrev = (lipsyncRetentionGet(1) >> 2) & 0x07;
+  lipsyncRetentionUpdate(1, 0x1C, 0);  // consume the marker — one hang reports once (4.5.27: SD-aware)
   // 4.5.23: consume the previous boot's HardFault PC page (written by
   // lipsyncFaultCapture into GPREGRET; 0xC0|page — see the discriminator
   // note above the handler). Absent/cleared → 0xFF = "no fault recorded".
-  if ((NRF_POWER->GPREGRET & 0xC0UL) == 0xC0UL) {
-    g_faultPrevPage = (uint8_t)(NRF_POWER->GPREGRET & 0x0FUL);
-    NRF_POWER->GPREGRET = 0;  // consume — one fault reports once
+  const uint32_t faultReg = lipsyncRetentionGet(0);
+  if ((faultReg & 0xC0UL) == 0xC0UL) {
+    g_faultPrevPage = (uint8_t)(faultReg & 0x0FUL);
+    lipsyncRetentionUpdate(0, 0xFF, 0);  // consume — one fault reports once (4.5.27: SD-aware)
   } else {
     g_faultPrevPage = 0xFF;
   }

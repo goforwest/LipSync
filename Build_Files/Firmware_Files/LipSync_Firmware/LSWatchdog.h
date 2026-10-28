@@ -85,14 +85,14 @@ void checkResetReason() {
   // for CONF_WATCHDOG_BOOT_CLEAR_MS clears the streak (watchdogLoop), so
   // isolated hangs never exhaust the budget. All writes touch only their
   // own bits; the trail lives in bits 5-7.
-  uint8_t prevHangMarker = (uint8_t)((NRF_POWER->GPREGRET2 >> 2) & 0x07UL);
+  uint8_t prevHangMarker = (uint8_t)((lipsyncRetentionGet(1) >> 2) & 0x07UL);  // 4.5.27: SD-aware
   if (!g_watchdogReset && prevHangMarker != 0) {
-    uint8_t hangStreak = (uint8_t)(NRF_POWER->GPREGRET2 & 0x03UL) + 1;
+    uint8_t hangStreak = (uint8_t)(lipsyncRetentionGet(1) & 0x03UL) + 1;
     if (hangStreak > 3) hangStreak = 3;
-    NRF_POWER->GPREGRET2 = (NRF_POWER->GPREGRET2 & ~0x03UL) | hangStreak;
+    lipsyncRetentionUpdate(1, 0x03, hangStreak);  // 4.5.27: SD-aware — a raw POWER write is an APP_MEMACC kill with the SD up
     g_hangBootStreak = hangStreak;
   } else {
-    NRF_POWER->GPREGRET2 &= ~0x03UL;  // clear the streak — the previous boot did not die in a witnessed hang
+    lipsyncRetentionUpdate(1, 0x03, 0);  // clear the streak — the previous boot did not die in a witnessed hang (4.5.27: SD-aware)
     g_hangBootStreak = 0;
   }
   // The watchdog-reset counter itself: a DOG reset wipes the register, so
@@ -100,7 +100,7 @@ void checkResetReason() {
   // the streak above is the functional settling path). The hang streak
   // feeds this value so setup()'s retry-limit gate covers both classes.
   if (g_watchdogReset) {
-    g_watchdogBootCount = (uint8_t)(NRF_POWER->GPREGRET2 & 0x03UL);
+    g_watchdogBootCount = (uint8_t)(lipsyncRetentionGet(1) & 0x03UL);  // 4.5.27: SD-aware
     if (g_watchdogBootCount > 3) g_watchdogBootCount = 3;
     if (g_watchdogBootCount == 0) g_watchdogBootCount = 1;
   } else {
@@ -149,7 +149,11 @@ void watchdogLoop(void) {
   // count, for the DOG class).
   static bool watchdogBootCountCleared = false;
   if (!watchdogBootCountCleared && millis() > CONF_WATCHDOG_BOOT_CLEAR_MS) {
-    NRF_POWER->GPREGRET2 &= ~0x03UL;  // clear only the counter bits (the trail bits 5-7 stay)
+    // 4.5.27 (Fable 5.1 consult): THIS was the next scheduled death — the
+    // 120 s streak-clear is a raw POWER write that runs on LIVE boots with
+    // the SoftDevice up (the stamp fixes would only have moved the kill to
+    // t=120 s). SD-aware now.
+    lipsyncRetentionUpdate(1, 0x03, 0);  // clear only the counter bits (the trail bits 5-7 stay)
     watchdogBootCountCleared = true;
   }
 }

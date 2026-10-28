@@ -3526,7 +3526,20 @@ void enterUpdateMode(bool responseEnabled, bool apiEnabled) {
 
   delay(CONF_UPDATE_MODE_DWELL_MS);
 
-  enterSerialDfu();
+  // 4.5.27 (Fable 5.1 consult, hazard 1): the core's enterSerialDfu() writes
+  // the DFU magic to NRF_POWER->GPREGRET RAW (wiring.c:85) — a POWER write
+  // the SoftDevice's watch unit flags when the stack is up, and the fault
+  // handler's own GPREGRET overwrite would clobber the magic, rebooting into
+  // the app instead of the bootloader. With the SD up, set the magic through
+  // the sanctioned SVCs and reset ourselves; with it down (the normal
+  // USB-mode update flow), the core's path is exactly right.
+  if (g_softDeviceEnabled) {
+    (void) sd_power_gpregret_clr(0, 0xFF);
+    (void) sd_power_gpregret_set(0, 0x4E);  // DFU_MAGIC_SERIAL_ONLY_RESET (wiring.c:26 — not exported in any core header)
+    NVIC_SystemReset();
+  } else {
+    enterSerialDfu();
+  }
 }
 
 //***ENTER UPDATE MODE API FUNCTION***//

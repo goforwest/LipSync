@@ -152,6 +152,11 @@ void initializeBluefruit(const char* s) {
     return;
   }
   Serial.println("BOOT: BLE stack up");
+  // 4.5.27: THE SoftDevice is UP from this instant until the next reset —
+  // every POWER-register access from here on MUST go through the SD SVCs
+  // (see lipsyncRetentionUpdate in LSApiDeclarations.h; the Fable 5.1
+  // consult pinned the entire BLE death saga on raw GPREGRET2 writes).
+  g_softDeviceEnabled = true;
   Bluefruit.Periph.setConnInterval(9, 16);  // min = 9*1.25=11.25 ms, max = 16*1.25=20ms
   Bluefruit.setTxPower(4);                  // Check bluefruit.h for supported values
   Bluefruit.setName(s);

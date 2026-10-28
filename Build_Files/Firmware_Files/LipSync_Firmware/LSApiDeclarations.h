@@ -293,6 +293,45 @@ extern volatile uint8_t g_bleProbeDemoted;
 // on the st=2 path this is sd_ble_gatts_service_add's own error code
 // (0x4=NO_MEM, 0x7=INVALID_PARAM, 0xF=FORBIDDEN, 0x10=INVALID_ADDR).
 extern volatile uint32_t g_bleInitRc;
+// 4.5.27 (Fable 5.1 consult, bench round 20 — THE ROOT CAUSE, FINALLY): the
+// boot-trail/marker writes go to NRF_POWER->GPREGRET2 — and POWER is a
+// SOFTDEVICE-RESTRICTED peripheral. With the SD up, every raw write is caught
+// by the SD's memory-watch unit: id=NRF_FAULT_ID_APP_MEMACC (0x1001), the
+// reported pc lands up to 2 instructions AFTER the offending store (the
+// callee's entry — nrf_sdm.h:283), which is why the bench read String
+// ctors, blinkLed and NVIC_SystemReset as the "killers" when they were
+// bystanders: the stamps in their CALLERS (processSerialMessage pt=7,
+// performLedAction pt=4, the witness ISR marker) were the deaths. The trail
+// machinery — added in 4.5.6 as the freeze forensics — has been the killer
+// of every SD-up boot since; 4.1.0's Bluetooth worked because it predates
+// the machinery entirely. All retention access now routes through the
+// sanctioned SVCs when the SoftDevice is up.
+extern volatile bool g_softDeviceEnabled;  // set true right after Bluefruit.begin() succeeds (the SD is up from that instant until reset); read by the ISR paths — do NOT probe sd_softdevice_is_enabled() from an ISR, that is itself an SVC
+#include <nrf_soc.h>  // sd_power_gpregret_get/set/clr — the sanctioned POWER-register access with the SD up
+static inline uint32_t lipsyncRetentionGet(uint32_t id) {
+  if (g_softDeviceEnabled) {
+    uint32_t v = 0;
+    (void) sd_power_gpregret_get(id, &v);
+    return v;
+  }
+  if (id) return NRF_POWER->GPREGRET2;
+  return NRF_POWER->GPREGRET;
+}
+// clear the `clr` bits, then set the `set` bits — mask-based, so the loop's
+// trail bits and the witness ISR's marker bits can no longer clobber each
+// other's read-modify-write either (a bonus: the old full-register RMWs from
+// two contexts were also a race). SVC from the witness ISR at priority 7 is
+// legal (the SVC handler runs at a more urgent priority; USB-boot ISRs take
+// the raw path because the SD is down there).
+static inline void lipsyncRetentionUpdate(uint32_t id, uint8_t clr, uint8_t set) {
+  if (g_softDeviceEnabled) {
+    if (clr) (void) sd_power_gpregret_clr(id, clr);
+    if (set) (void) sd_power_gpregret_set(id, set);
+  } else {
+    volatile uint32_t* r = (id != 0) ? &NRF_POWER->GPREGRET2 : &NRF_POWER->GPREGRET;
+    *r = (*r & ~(uint32_t)clr) | (uint32_t)set;
+  }
+}
 // 4.5.20: the previous BLE boot's flash-persisted verdict, consumed at boot
 // from /bleverdict.dat (see LipSync_Firmware.ino) — pst: -1 = none, 0 = died
 // during begin, 1..4 = failed at that stage, 5 = init fully succeeded; prc =
