@@ -731,7 +731,8 @@ pointFloatType LSJoystick::getInputMax(int quad) {
 // Return     : void
 //*********************************//
 void LSJoystick::setInputMax(int quad, pointFloatType inputPoint) {
- // Update the calibration point 
+  if (quad < 0 || quad >= JOY_CALIBR_ARRAY_SIZE) return;
+  // Update the calibration point
   _magnetInputCalibration[quad] = inputPoint;
 }
 
@@ -745,7 +746,8 @@ void LSJoystick::setInputMax(int quad, pointFloatType inputPoint) {
 // Return     : void
 //*********************************//
 void LSJoystick::zeroInputMax(int quad) {
- // Reset or zero the calibration point 
+  if (quad < 0 || quad >= JOY_CALIBR_ARRAY_SIZE) return;
+  // Reset or zero the calibration point
   _magnetInputCalibration[quad] = {0, 0};
 }
 

@@ -496,7 +496,11 @@ void LSUSBGamepad::write(void *report)
   if (report) {
     memcpy(&_report, report, sizeof(_report));
   } else {
-    memset(&_report, 0, sizeof(_report));
+    // A null report means "release and center", not axes at their minimum.
+    // Zeroing the packed report put both unsigned axes at 0 (full deflection).
+    _report.buttons = 0;
+    _report.xAxis = 128;
+    _report.yAxis = 128;
   }
   if (GamepadReport(&_report, sizeof(_report))) {
     reportSuccesses++;

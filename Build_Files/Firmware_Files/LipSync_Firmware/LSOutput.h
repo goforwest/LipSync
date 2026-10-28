@@ -309,14 +309,21 @@ int LSOutput::getLightModeLevel(void)
 //*********************************//
 void LSOutput::setLedColor(int ledNumber, int ledColorNumber, int ledBrightness) {
 
+  // Validate externally supplied settings before indexing the color table.
+  // The previous guard ran after these reads, so an invalid API/settings
+  // value had already accessed outside colorProperty before being corrected.
+  const int colorCount = sizeof(colorProperty) / sizeof(colorProperty[0]);
+  if (ledColorNumber < 0 || ledColorNumber >= colorCount) {
+    ledColorNumber = LED_CLR_NONE;
+  }
+  ledBrightness = constrain(ledBrightness, 0, CONF_LED_BRIGHTNESS_MAX);
+
   // Extract color components from color
   int r = colorProperty[ledColorNumber].colorCode.r;
   int g = colorProperty[ledColorNumber].colorCode.g;
   int b = colorProperty[ledColorNumber].colorCode.b;
 
   bool someLight = (r > 0 || g > 0 || b > 0);
-  if (ledColorNumber < 0) ledColorNumber = LED_CLR_NONE;
-  if (ledColorNumber >= (int)(sizeof(colorProperty)/sizeof(colorProperty[0]))) ledColorNumber = LED_CLR_NONE;
 
   switch (ledNumber) {
     case CONF_LED_LEFT:
