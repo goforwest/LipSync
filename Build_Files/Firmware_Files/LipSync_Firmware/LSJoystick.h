@@ -173,6 +173,7 @@ class LSJoystick {
     unsigned long _busRetryIntervalMs = 20;                               // shared bus drags transfers until they crawl — see update())
     uint32_t _processCount = 0;                                           // Times the !skipInputChange block has run since boot (the frozen-pipeline smoking gun if 0)
     uint8_t _consecReadFails = 0;                                         // Consecutive failed sensor reads (re-init at JOY_READ_FAIL_REINIT_LIMIT — see update())
+    bool _begun = false;                                                  // begin() ran and the XENSIV handle is initialized. The joystick's twin of LSPressure::_begun (the 2026-10-28 PV-crash class): initJoystick() is gated on g_joystickSensorConnected, so on a joystick-absent boot the sensor was never begun and a DEBUG,1:1-driven js.update() must not reach the driver. readMagneticField() is the one choke point every read funnels through — the gate there covers them all.
 
     // One bounded XENSIV read. Returns false (and leaves the caller's
     // doubles untouched, i.e. 0.0) when the transfer failed — the caller
@@ -183,6 +184,8 @@ class LSJoystick {
     // signal. The retired TLV493D fork held last-good values on bus errors;
     // that failure semantic is restored here.
     bool readMagneticField(double* xReading, double* yReading, double* zReading) {
+      if (!_begun) return false;  // Never begun = no driver I/O; every caller's failed-read
+                                  // semantics are already hold-last-value (see the comment above)
       if (_Tlv493dSensor.getMagneticField(xReading, yReading, zReading)) {
         _consecReadFails = 0;
         return true;
@@ -264,6 +267,7 @@ void LSJoystick::begin() {
   setOuterDeadzone(JOY_OUTPUT_DEADZONE_STATUS, 1.0 - JOY_OUTPUT_DEADZONE_FACTOR);   // Set default deadzone status and deadzone factor.
   setOutputRange(JOY_OUTPUT_RANGE_LEVEL);                               // Set default output range level or speed level.
   clear();                                                              // Clear calibration array and _joystickOutputBuffer.
+  _begun = true;                                                        // Sensor handle initialized — opens the readMagneticField() gate
 }
 
 //*********************************//

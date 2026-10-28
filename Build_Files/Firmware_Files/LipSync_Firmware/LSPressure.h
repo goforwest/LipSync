@@ -113,7 +113,8 @@ class LSPressure {
       float _sipThreshold;                                 // Sip Threshold 
       float _puffThreshold;                                // Puff Threshold 
       int _sapMainState;                                   // The value which represents the current main state (example: PRESS_SAP_MAIN_STATE_PUFF) 
-      bool _sensorsHealthy;                               // Both sensors return valid readings
+      bool _sensorsHealthy;                               // Both sensors return valid readings (false until begin() correlates it with the sensor-detection globals — see the constructor)
+      bool _begun;                                        // begin() ran, so the Adafruit driver objects are safe to call. A never-begun LPSressure holds NULL i2c_dev pointers and ANY driver call faults (bench 2026-10-28: PV,0:0 on a missing-sensor boot HardFaulted inside Adafruit_I2CDevice::write_then_read — pm=2 pt=7 fp=0xE000, twice). Every driver I/O this class makes is behind this gate.
       unsigned long _lastProbeMs;                         // Timestamp of the last unhealthy-mode re-probe
       uint8_t _badReadCount;                              // Consecutive invalid readings while healthy
       uint8_t _goodProbeCount;                            // Consecutive valid re-probes while unhealthy
@@ -138,7 +139,15 @@ LSPressure::LSPressure()
 {
   _pressureBuffer.begin(PRESS_BUFF_SIZE);        // Initialize Pressure Buffer
   _sapBuffer.begin(PRESS_SAP_BUFF_SIZE);         // Initialize Sip and Puff Action Buffer 
-  _sensorsHealthy = true;
+  // 4.6.1: both start false. The old `_sensorsHealthy = true` default was
+  // half of the PV crash: begin() is the only code that correlates this
+  // flag with the sensor-detection globals, and on a missing-sensor boot
+  // initSipAndPuff() never runs — so the object stayed "healthy" forever
+  // with drivers that were never begin_I2C()'d, and the first ps.update()
+  // (PV,0:0, or DEBUG,1:2) took the healthy read path straight into the
+  // NULL i2c_dev chain. An object that has not begun cannot be healthy.
+  _sensorsHealthy = false;
+  _begun = false;
   _lastProbeMs = 0;
   _badReadCount = 0;
   _goodProbeCount = 0;
@@ -203,6 +212,8 @@ void LSPressure::begin()
                         // read was a blocking 5-reading loop that could freeze startup for up to
                         // 15 s when a sensor misbehaved; until it completes, the offset is 0 and
                         // sip and puff stay inert.
+  _begun = true;         // Drivers are now safe (i2c_dev allocated even on a failed begin_I2C) —
+                        // sets the gate update() checks before any driver I/O
 }
 
 //*********************************//
@@ -403,6 +414,11 @@ void LSPressure::setPuffThreshold(float p)
 //*********************************//
 void LSPressure::update()
 {
+  // Never begun = no driver I/O of any kind (the _begun gate). The getters
+  // still answer their member values (zeros), so a PV,0:0 on a degraded
+  // boot reports honestly instead of faulting; updateState() is skipped
+  // too — there is no live reading to run a state machine on.
+  if (!_begun) return;
   updatePressure();
   updateState();
 }
