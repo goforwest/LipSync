@@ -120,9 +120,11 @@ void LSMemory::initialize(String fileString, String jsonString) {
   bool fileHealthy = false;
   if (file.open(fileName, FILE_O_READ))
   {
-    uint32_t readlen;
+    const uint32_t fileSize = file.size();
+    uint32_t readlen = 0;
     char buffer[BUFFER_SIZE] = { 0 };
-    readlen = file.read(buffer, sizeof(buffer));
+    int readResult = file.read(buffer, sizeof(buffer));
+    if (readResult > 0) readlen = (uint32_t)readResult;
     if (readlen >= sizeof(buffer)) readlen = sizeof(buffer) - 1;  // 4.5.7 review: the one-byte overflow at exactly 512 bytes
     buffer[readlen] = 0;
     file.close();
@@ -133,8 +135,13 @@ void LSMemory::initialize(String fileString, String jsonString) {
     // parses cleanly yet carries no settings, so doc.isNull() must also be
     // false. Otherwise a stray "null" would be treated as healthy and never
     // re-seeded.
+    doc.clear();
     DeserializationError err = deserializeJson(doc, String(buffer));
-    fileHealthy = (readlen > 0) && !err && !doc.isNull() && doc.is<JsonObject>();
+    fileHealthy = (fileSize > 0) &&
+                  (fileSize <= CONF_SETTINGS_FILE_BUDGET) &&
+                  (fileSize < sizeof(buffer)) &&
+                  (readlen == fileSize) &&
+                  !err && !doc.isNull() && doc.is<JsonObject>();
   }
   if (fileHealthy) {
     return;  // Nothing to do — the stored settings parse
@@ -167,10 +174,14 @@ void LSMemory::initialize(String fileString, String jsonString) {
   if( file.open(fileName, FILE_O_WRITE) )
   {
     const char* jsonChar = jsonString.c_str();
-    file.write(jsonChar, strlen(jsonChar));
+    const size_t jsonLength = strlen(jsonChar);
+    const size_t written = file.write(jsonChar, jsonLength);
     delay(1);
     file.close();
     delay(1);
+    if (written != jsonLength) {
+      InternalFS.remove(fileName);
+    }
   }
 }
 
@@ -186,8 +197,8 @@ void LSMemory::initialize(String fileString, String jsonString) {
 //*********************************//
 void LSMemory::clear(String fileString) {
   const char* fileName = fileString.c_str();
-  InternalFS.remove(fileName);
   file.close();
+  InternalFS.remove(fileName);
   delay(1);  
 }
 
@@ -202,6 +213,7 @@ void LSMemory::clear(String fileString) {
 // Return     : void
 //*********************************//
 void LSMemory::format(){
+  file.close();
   InternalFS.format();
   delay(1);
 }
@@ -252,15 +264,22 @@ String LSMemory::readAll(String fileString){
   if (!file.open(fileName, FILE_O_READ)) {
     return "";
   }
-  uint32_t readlen;
+  const uint32_t fileSize = file.size();
+  if (fileSize == 0 || fileSize > CONF_SETTINGS_FILE_BUDGET || fileSize >= BUFFER_SIZE) {
+    file.close();
+    return "";
+  }
+  uint32_t readlen = 0;
   char buffer[BUFFER_SIZE] = { 0 };
-  readlen = file.read(buffer, sizeof(buffer));
+  int readResult = file.read(buffer, sizeof(buffer));
+  if (readResult > 0) readlen = (uint32_t)readResult;
   if (readlen >= sizeof(buffer)) readlen = sizeof(buffer) - 1;  // 4.5.7 review: the one-byte overflow at exactly 512 bytes
 
   delay(1);
   buffer[readlen] = 0;
   file.close();
   delay(1);
+  if (readlen != fileSize) return "";
   return buffer;
 }
 
@@ -285,7 +304,9 @@ bool LSMemory::writeAll(String fileString, String jsonString){
     const char* fileName = fileString.c_str();
     const char* jsonChar = jsonString.c_str();
 
-    if (strlen(jsonChar) > CONF_SETTINGS_FILE_BUDGET) {
+    const size_t jsonLength = strlen(jsonChar);
+    if (jsonLength == 0) return false;
+    if (jsonLength > CONF_SETTINGS_FILE_BUDGET) {
       // Name the reason on serial: a refused settings write must never read
       // as a flash failure — it is a deliberate downgrade guard, and the
       // line tells the maker/support tech which knob moved.
@@ -297,6 +318,12 @@ bool LSMemory::writeAll(String fileString, String jsonString){
       return false;
     }
 
+    JsonDocument candidate;
+    DeserializationError candidateError = deserializeJson(candidate, jsonString);
+    if (candidateError || candidate.isNull() || !candidate.is<JsonObject>()) {
+      return false;
+    }
+
     // Crash-safe replace (4.5.7 review): write the new content to a temp
     // file, close, then rename over the target — LittleFS's rename is an
     // atomic metadata commit, so a reset at ANY instant leaves either the
@@ -304,6 +331,7 @@ bool LSMemory::writeAll(String fileString, String jsonString){
     // lost the entire settings file (calibration, caregiver restrictions)
     // to a power cut inside the window — and doFactoryReset's ~22
     // sequential writes multiplied that window 22-fold.
+    file.close();
     InternalFS.remove(CONF_SETTINGS_TMP_FILE);
     delay(1);
 
@@ -312,9 +340,14 @@ bool LSMemory::writeAll(String fileString, String jsonString){
     }
     delay(1);
 
-    file.write(jsonChar, strlen(jsonChar));
+    const size_t written = file.write(jsonChar, jsonLength);
     delay(1);
     file.close();
+
+    if (written != jsonLength) {
+      InternalFS.remove(CONF_SETTINGS_TMP_FILE);
+      return false;
+    }
 
     if (!InternalFS.rename(CONF_SETTINGS_TMP_FILE, fileName)) {
       InternalFS.remove(CONF_SETTINGS_TMP_FILE);  // Leave no stale temp behind
@@ -335,7 +368,7 @@ bool LSMemory::writeAll(String fileString, String jsonString){
 //*********************************//
 JsonObject LSMemory::readObject(String fileString){
 
-  uint32_t readLength;
+  uint32_t readLength = 0;
   const char* fileName = fileString.c_str();
   char jsonBuffer[BUFFER_SIZE] = { 0 };
   // Check the open — see readAll() (4.5.7 review): an unopened read is a
@@ -343,16 +376,35 @@ JsonObject LSMemory::readObject(String fileString){
   // marks the read failed so writes refuse (writeObject's isNull guard)
   // and the next boot's re-seed heals.
   if (!file.open(fileName, FILE_O_READ)) {
+    // Never expose the previous successful read through the shared document.
+    // A stale object here let a failed read mutate and rewrite old settings.
+    doc.clear();
     _lastReadOk = false;
     return doc.as<JsonObject>();
   }
   delay(1);
-  readLength = file.read(jsonBuffer, sizeof(jsonBuffer));
+  const uint32_t fileSize = file.size();
+  if (fileSize == 0 || fileSize > CONF_SETTINGS_FILE_BUDGET || fileSize >= sizeof(jsonBuffer)) {
+    file.close();
+    doc.clear();
+    _lastReadOk = false;
+    return doc.as<JsonObject>();
+  }
+  int readResult = file.read(jsonBuffer, sizeof(jsonBuffer));
+  if (readResult > 0) readLength = (uint32_t)readResult;
   if (readLength >= sizeof(jsonBuffer)) readLength = sizeof(jsonBuffer) - 1;  // 4.5.7 review: the one-byte overflow at exactly 512 bytes
   delay(1);
   jsonBuffer[readLength] = 0;
+  file.close();
+
+  if (readLength != fileSize) {
+    doc.clear();
+    _lastReadOk = false;
+    return doc.as<JsonObject>();
+  }
 
   // Deserialize he JSON documetn
+  doc.clear();
   DeserializationError deserializationError = deserializeJson(doc, String(jsonBuffer));
 
   // Test is parsing suceeds. The error prints ONCE PER BOOT (4.5.7
@@ -494,6 +546,7 @@ bool LSMemory::writeObject(String fileString, String key, JsonObject obj){
     }
 
     // Crash-safe replace — see writeAll() (4.5.7 review).
+    file.close();
     InternalFS.remove(CONF_SETTINGS_TMP_FILE);
     delay(1);
 
@@ -502,9 +555,15 @@ bool LSMemory::writeObject(String fileString, String key, JsonObject obj){
     }
     delay(1);
 
-    file.write(jsonChar, strlen(jsonChar));
+    const size_t jsonLength = strlen(jsonChar);
+    const size_t written = file.write(jsonChar, jsonLength);
     delay(1);
     file.close();
+
+    if (written != jsonLength) {
+      InternalFS.remove(CONF_SETTINGS_TMP_FILE);
+      return false;
+    }
 
     if (!InternalFS.rename(CONF_SETTINGS_TMP_FILE, fileName)) {
       InternalFS.remove(CONF_SETTINGS_TMP_FILE);  // Leave no stale temp behind

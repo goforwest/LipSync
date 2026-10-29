@@ -277,7 +277,7 @@ void LSOutput::setLedBrightnessLevel(int ledBrightnessLevel) {
 //*********************************//
 void LSOutput::setLightModeLevel(int lightModeLevel)
 {
-  _lightModeLevel = lightModeLevel;
+  _lightModeLevel = constrain(lightModeLevel, CONF_LIGHT_MODE_MIN, CONF_LIGHT_MODE_MAX);
 }
 
 //*********************************//
@@ -358,6 +358,12 @@ void LSOutput::setLedColor(int ledNumber, int ledColorNumber, int ledBrightness)
       }
     case CONF_LED_MICRO:
       {
+        // The onboard RGB LED is active-low. Light mode OFF must gate it just
+        // like the three face LEDs; previously LM=0 still painted the USB/
+        // gamepad status color indefinitely.
+        if (_lightModeLevel <= CONF_LIGHT_MODE_OFF) {
+          r = g = b = 0;
+        }
         analogWrite(LED_RED,   (255 - r*ledBrightness/255) );
         analogWrite(LED_GREEN, (255 - g*ledBrightness/255) );
         analogWrite(LED_BLUE,  (255 - b*ledBrightness/255) );
@@ -402,6 +408,7 @@ void LSOutput::setLedColor(int ledNumber, int ledColorNumber, int ledBrightness)
 // Return     : void
 //*********************************//
 void LSOutput::setInputStateLeds(int windowCount, int colorNumber, int ledBrightness) {
+  windowCount = constrain(windowCount, 0, 3);
   setLedColor(CONF_LED_LEFT,   windowCount >= 1 ? colorNumber : LED_CLR_NONE, ledBrightness);
   setLedColor(CONF_LED_MIDDLE, windowCount >= 2 ? colorNumber : LED_CLR_NONE, ledBrightness);
   setLedColor(CONF_LED_RIGHT,  windowCount >= 3 ? colorNumber : LED_CLR_NONE, ledBrightness);

@@ -703,6 +703,10 @@ boolean LSTimer<T>::isEnabled(int timerId) {
         invalidOperations++;
         return false;
     }
+    if (timer[timerId].callback == NULL && !stopwatch[timerId]) {
+        invalidOperations++;
+        return false;
+    }
 
     return timer[timerId].enabled;
 }
@@ -721,6 +725,10 @@ template<typename T>
 void LSTimer<T>::enable(int timerId) {
     // Lower-bound guard, silent + counted (see deleteTimer).
     if (timerId < 0 || timerId >= MAX_TIMERS) {
+        invalidOperations++;
+        return;
+    }
+    if (timer[timerId].callback == NULL && !stopwatch[timerId]) {
         invalidOperations++;
         return;
     }
@@ -745,6 +753,10 @@ void LSTimer<T>::disable(int timerId) {
         invalidOperations++;
         return;
     }
+    if (timer[timerId].callback == NULL && !stopwatch[timerId]) {
+        invalidOperations++;
+        return;
+    }
 
     timer[timerId].enabled = false;
 }
@@ -763,6 +775,10 @@ template<typename T>
 void LSTimer<T>::toggle(int timerId) {
     // Lower-bound guard, silent + counted (see deleteTimer).
     if (timerId < 0 || timerId >= MAX_TIMERS) {
+        invalidOperations++;
+        return;
+    }
+    if (timer[timerId].callback == NULL && !stopwatch[timerId]) {
         invalidOperations++;
         return;
     }
@@ -803,8 +819,12 @@ int LSTimer<T>::getNumRuns(int timerId) {
         invalidOperations++;
         return 0;
     }
+    if (timer[timerId].callback == NULL && !stopwatch[timerId]) {
+        invalidOperations++;
+        return 0;
+    }
 
     return timer[timerId].numRuns;
 }
 
-#endif 
+#endif

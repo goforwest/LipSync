@@ -55,7 +55,11 @@ uint8_t const mouse_desc_hid_report[] =
 
 class LSUSBMouse {
   private:
-    void mouseReport(signed char b, signed char x, signed char y, signed char wheel = 0,signed char pan = 0); 
+    bool mouseReport(signed char b, signed char x, signed char y, signed char wheel = 0,signed char pan = 0);
+    bool _buttonStatePending = false;
+    bool _clickPending = false;
+    bool _clickPressedSent = false;
+    uint8_t _clickButton = 0;
   public:
     inline LSUSBMouse(void);
     inline void begin(void);
@@ -65,6 +69,7 @@ class LSUSBMouse {
     inline void moveAll(signed char x, signed char y, signed char wheel = 0,signed char pan = 0); 
     inline void scroll(signed char wheel = 0);
     inline void pan(signed char pan = 0); 
+    inline void service(void);                    // Flush queued button/click state without relying on joystick movement
     inline void click(uint8_t b = MOUSE_LEFT);
     inline void press(uint8_t b = MOUSE_LEFT);     // press LEFT by default
     inline void release(uint8_t b = MOUSE_LEFT);   // release LEFT by default
@@ -260,7 +265,7 @@ void LSUSBMouse::wakeup(void)
     }
 }
 
-void LSUSBMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t pan) 
+bool LSUSBMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t pan)
 {
 	// Never block on HID readiness. The old while(!isReady()) delay(1) spin
   // sat on the joystick-poll path and the connect-retry path, so any window
@@ -287,7 +292,8 @@ void LSUSBMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t 
     // Latch only on persistence: a busy endpoint frees within a tick or two,
     // a real outage never does. Skipped busy ticks still cost nothing — the
     // pending report already carries the movement.
-    if (++consecutiveSkips < CONF_MOUSE_EP_BUSY_SKIP_LIMIT) return;
+    if (consecutiveSkips < 255) consecutiveSkips++;
+    if (consecutiveSkips < CONF_MOUSE_EP_BUSY_SKIP_LIMIT) return false;
     if (!timedOut) {
       // Episode start: latch the timeout state (consumed by errorCheck and
       // usbCheckConnection) and hand recovery to the connect machinery once —
@@ -296,7 +302,7 @@ void LSUSBMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t 
       timedOut = true;
       usbCheckConnection();
     }
-    return;
+    return false;
   }
   consecutiveSkips = 0;
   if (usb_hid.mouseReport(RID_MOUSE,b,x,y,wheel,pan)) {
@@ -309,7 +315,10 @@ void LSUSBMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t 
       if (absY > maxAbsReport) maxAbsReport = absY;
     }
     timedOut = false;  // Only an ACCEPTED report clears the episode (4.5.7 review): a ready-but-refused tick is still an outage symptom
+    _buttonStatePending = false;
+    return true;
   }
+  return false;
 }
 
 void LSUSBMouse::move(int8_t x, int8_t y) 
@@ -331,12 +340,42 @@ void LSUSBMouse::pan(int8_t pan)
     mouseReport(_buttons, 0, 0, 0, pan);
 }
 
+void LSUSBMouse::service(void)
+{
+  // A click is two reports separated by a host poll. The old immediate
+  // press+release sent the release while the endpoint was still busy; when
+  // normal joystick polling was disabled (e.g. joystick debug mode), no later
+  // movement report arrived to release the host button and it could remain
+  // stuck indefinitely. Advance one phase whenever the endpoint is ready.
+  if (_clickPending && isReady()) {
+    if (!_clickPressedSent) {
+      _buttons |= _clickButton;
+      if (mouseReport(_buttons, 0, 0, 0, 0)) _clickPressedSent = true;
+    } else {
+      _buttons &= (uint8_t)~_clickButton;
+      if (mouseReport(_buttons, 0, 0, 0, 0)) {
+        _clickPending = false;
+        _clickPressedSent = false;
+        _clickButton = 0;
+      }
+    }
+    return;
+  }
+
+  if (_buttonStatePending && isReady()) {
+    mouseReport(_buttons, 0, 0, 0, 0);
+  }
+}
+
 void LSUSBMouse::click(uint8_t b)
 {
-  _buttons = b;
-  mouseReport(_buttons, 0, 0, 0, 0);
-  _buttons = 0;
-  mouseReport(_buttons, 0, 0, 0, 0);
+  if (_clickPending) return;  // One complete click is safer than interleaving two half-clicks
+  b &= MOUSE_ALL;
+  if (b == 0) return;
+  _clickPending = true;
+  _clickPressedSent = false;
+  _clickButton = b;
+  service();
 }
 
 void LSUSBMouse::buttons(uint8_t b)
@@ -344,7 +383,7 @@ void LSUSBMouse::buttons(uint8_t b)
 	if (b != _buttons)
 	{
 	  _buttons = b;
-	  mouseReport(_buttons, 0, 0, 0, 0);
+	  if (!mouseReport(_buttons, 0, 0, 0, 0)) _buttonStatePending = true;
 	}
 }
 

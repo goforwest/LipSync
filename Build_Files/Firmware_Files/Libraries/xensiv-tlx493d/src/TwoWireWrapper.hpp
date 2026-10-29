@@ -91,11 +91,12 @@ namespace ifx {
                     if( (rxLen > 0)  && (rxBuffer != NULL) ) {
                         uint8_t bytesRead = iic->requestFrom(iicAddress, rxLen);
 
-                        for(uint16_t i = 0; (i < rxLen) && (iic->available() > 0); ++i) {
-                            rxBuffer[i] = (uint8_t) iic->read();
+                        uint8_t actualRead = 0;
+                        while((actualRead < rxLen) && (iic->available() > 0)) {
+                            rxBuffer[actualRead++] = (uint8_t) iic->read();
                         }
 
-                        if( bytesRead != rxLen ) {
+                        if( bytesRead != rxLen || actualRead != rxLen ) {
                             return false;
                         }
                     }

@@ -100,19 +100,19 @@ class LSPressure {
       sensors_event_t _lps22Temperature;                  // Ambient pressure event object                           
       LSCircularBuffer <pressureStruct> _pressureBuffer;  // Create a buffer of type pressureStruct to push pressure readings
       LSCircularBuffer <inputStateStruct> _sapBuffer;     // Create a buffer of type inputStateStruct to push sap states
-      int _pressureMode;                                  // Pressure Mode: DIFF or ABS pressure
-      float _sapPressureAbs;                              // Main Pressure reading (Sip and Puff Absolute) [hPa]
-      float _ambientPressure;                             // Reference Pressure reading (Ambient Absolute) [hPa]
-      float _offsetPressure;                              // Offset Pressure [hPa] (Difference between two sensors)
-      float _sapPressure;                                 // Calculated Pressure Difference sapPressure = (sapPressureAbs- ambientPressure- offsetPressure)
-      float _refTolVal;                                   // The tolerance value in hPa used to check and update reference pressure 
+      int _pressureMode = PRESS_MODE_DIFF;                // Pressure Mode: DIFF or ABS pressure
+      float _sapPressureAbs = 0.0f;                       // Main Pressure reading (Sip and Puff Absolute) [hPa]
+      float _ambientPressure = 0.0f;                      // Reference Pressure reading (Ambient Absolute) [hPa]
+      float _offsetPressure = 0.0f;                       // Offset Pressure [hPa] (Difference between two sensors)
+      float _sapPressure = 0.0f;                          // Calculated Pressure Difference sapPressure = (sapPressureAbs- ambientPressure- offsetPressure)
+      float _refTolVal = PRESS_REF_TOLERANCE;             // The tolerance value in hPa used to check and update reference pressure
       LSTimer <void> _sapStateTimer;                      // Timer used to measure time for each sip and puff action. 
-      int _sapStateTimerId;                                // The id for the sap state timer
-      inputStateStruct _sapCurrState;                      // The current state of sip and puff
-      inputStateStruct _sapPrevState;                      // The previous state of sip and puff
-      float _sipThreshold;                                 // Sip Threshold 
-      float _puffThreshold;                                // Puff Threshold 
-      int _sapMainState;                                   // The value which represents the current main state (example: PRESS_SAP_MAIN_STATE_PUFF) 
+      int _sapStateTimerId = -1;                           // The id for the sap state timer
+      inputStateStruct _sapCurrState = {PRESS_SAP_MAIN_STATE_NONE, PRESS_SAP_SEC_STATE_WAITING, 0};
+      inputStateStruct _sapPrevState = {PRESS_SAP_MAIN_STATE_NONE, PRESS_SAP_SEC_STATE_WAITING, 0};
+      float _sipThreshold = PRESS_SAP_DEFAULT_THRESHOLD;   // Sip Threshold
+      float _puffThreshold = PRESS_SAP_DEFAULT_THRESHOLD;  // Puff Threshold
+      int _sapMainState = PRESS_SAP_MAIN_STATE_NONE;       // The value which represents the current main state (example: PRESS_SAP_MAIN_STATE_PUFF)
       bool _sensorsHealthy;                               // Both sensors return valid readings (false until begin() correlates it with the sensor-detection globals — see the constructor)
       bool _begun;                                        // begin() ran, so the Adafruit driver objects are safe to call. A never-begun LPSressure holds NULL i2c_dev pointers and ANY driver call faults (bench 2026-10-28: PV,0:0 on a missing-sensor boot HardFaulted inside Adafruit_I2CDevice::write_then_read — pm=2 pt=7 fp=0xE000, twice). Every driver I/O this class makes is behind this gate.
       unsigned long _lastProbeMs;                         // Timestamp of the last unhealthy-mode re-probe
@@ -229,17 +229,20 @@ void LSPressure::begin()
 //*********************************//
 void LSPressure::clear()
 {
+  _pressureBuffer.clear();
   while(_pressureBuffer.getLength() < PRESS_BUFF_SIZE)
   {    
     _pressureBuffer.pushElement({0.0, 0.0, 0.0});  // Clear Pressure Buffer by pushing zero readings to buffers 
   }
 
   // Push initial state to state Queue
+  _sapBuffer.clear();
   _sapCurrState = _sapPrevState = {PRESS_SAP_MAIN_STATE_NONE, PRESS_SAP_SEC_STATE_WAITING, 0};
   _sapBuffer.pushElement(_sapCurrState);
 
   // Reset and start the timer   
-  _sapStateTimerId =  _sapStateTimer.startTimer();
+  if (_sapStateTimerId >= 0) _sapStateTimer.deleteTimer(_sapStateTimerId);
+  _sapStateTimerId = _sapStateTimer.startTimer();
 
 }
 
@@ -468,18 +471,20 @@ void LSPressure::updatePressure()
 
   // If pressure mode is differential
   float tempAmbientPressure = 0.00;
+  bool ambientReadingValid = (_pressureMode != PRESS_MODE_DIFF);
   if(_pressureMode == PRESS_MODE_DIFF) {
     _lps22.getEvent(&_lps22Pressure, &_lps22Temperature);
     tempAmbientPressure = _lps22Pressure.pressure;  // Set a temporary reference value to new reference pressure reading
 
     if(tempAmbientPressure > CONF_PRESS_ABS_PLAUSIBLE_MIN && tempAmbientPressure < CONF_PRESS_ABS_PLAUSIBLE_MAX) { // If ambient pressure is plausible, update the ambient pressure value
       _ambientPressure = tempAmbientPressure;
+      ambientReadingValid = true;
     }
   }
 
   // Make sure pressure readings are valid (plausibility range — see the re-probe above)
   bool validReading = (_sapPressureAbs > CONF_PRESS_ABS_PLAUSIBLE_MIN && _sapPressureAbs < CONF_PRESS_ABS_PLAUSIBLE_MAX
-                       && (_pressureMode != PRESS_MODE_DIFF || (_ambientPressure > CONF_PRESS_ABS_PLAUSIBLE_MIN && _ambientPressure < CONF_PRESS_ABS_PLAUSIBLE_MAX)));
+                       && ambientReadingValid);
 
   // Stepped offset measurement: this tick's reading IS the sample, so the old
   // 5-read blocking re-measure (up to 15 s of frozen main loop on a bad

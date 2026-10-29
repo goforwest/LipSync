@@ -6,11 +6,18 @@ on:
       - '**' # Runs on ALL branches (the v4.1 double-fire caller was removed — 4.5.7 review)
     paths:
       - "Build_Files/Firmware_Files/LipSync_Firmware/**"
+      - "Build_Files/Firmware_Files/Libraries/**"
+      - ".github/workflows/compress_firmware.yml"
   workflow_dispatch: # Allows manual triggering of the workflow
 
 jobs:
   compress_and_commit:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: firmware-source-zip-${{ github.ref }}
+      cancel-in-progress: false
 
     steps:
       - name: Checkout Repository
@@ -22,13 +29,22 @@ jobs:
           # adds/updates entries, so a file deleted or renamed from the tree
           # lived on in the committed zip forever.
           rm -f Build_Files/Firmware_Files/LipSync_Firmware.zip
-          cd Build_Files/Firmware_Files/LipSync_Firmware
-          zip -r ../LipSync_Firmware.zip ./
+          cd Build_Files/Firmware_Files
+          # Include every source needed by the pinned build. Packaging only
+          # the sketch silently dropped the bounded Wire fork, the Bluefruit
+          # fault capture, and XENSIV—the resulting download did not reproduce
+          # CI or the release binary.
+          zip -r -X LipSync_Firmware.zip LipSync_Firmware Libraries \
+            -x '*/.DS_Store'
 
       - name: Commit and Push ZIP
         run: |
           git config --global user.name "github-actions"
           git config --global user.email "github-actions@github.com"
           git add Build_Files/Firmware_Files/LipSync_Firmware.zip
+          if git diff --cached --quiet; then
+            echo "Firmware source archive is already current."
+            exit 0
+          fi
           git commit -m "Automated update: Compress firmware files"
           git push

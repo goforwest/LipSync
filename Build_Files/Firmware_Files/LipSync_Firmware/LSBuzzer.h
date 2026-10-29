@@ -189,7 +189,11 @@ void LSBuzzer::update(){
   // Fire queued notes whose time has come (called from the main loop)
   for (uint8_t i = 0; i < _noteQueueLen; ) {
     if ((long)(millis() - _noteQueue[i].fireAtMs) >= 0) {
-      tone(CONF_BUZZER_PIN, _noteQueue[i].frequency, _noteQueue[i].duration);
+      if (_noteQueue[i].frequency == 0) {
+        noTone(CONF_BUZZER_PIN);
+      } else {
+        tone(CONF_BUZZER_PIN, _noteQueue[i].frequency, _noteQueue[i].duration);
+      }
       for (uint8_t j = i; j < _noteQueueLen - 1; j++) {
         _noteQueue[j] = _noteQueue[j + 1];
       }
@@ -227,7 +231,8 @@ void LSBuzzer::queueNote(unsigned long delayMs, unsigned int frequency, unsigned
 // Return     : void
 //*********************************//
 void LSBuzzer::clear(){
-  // No current implementation  
+  _noteQueueLen = 0;
+  noTone(CONF_BUZZER_PIN);
 }
 
 //*********************************//
@@ -267,6 +272,7 @@ void LSBuzzer::disable(){
 //*********************************//
 void LSBuzzer::setSoundModeLevel(int inputSoundMode){
   _soundModeLevel = inputSoundMode;
+  if (_soundModeLevel == CONF_SOUND_MODE_OFF) clear();
 }
 
 //*********************************//
@@ -294,21 +300,17 @@ void LSBuzzer::playStartupSound(){
 // Return :  void
 //*********************************//
 void LSBuzzer::playReadySound(){
-  // Fully blocking, both notes (4.5.7 review): this still queued its second
-  // note, and buzzer.update() fired that tone() from loop context ~500 ms
-  // after the ready page — contradicting the queue's own "nothing queues
-  // today" documentation (the 4.5.6 hunt's invariant) and landing inside
-  // the all-LEDs-on window ledWaitFeedback() left live. Called once per
-  // boot (the boot-center completion / first healthy USB tick), so the
-  // bounded 750 ms block buys the same guarantee playErrorSound has: the
-  // loop context NEVER fires a queued tone, and the PWM peripheral is
-  // released via noTone() before any later LED analogWrite().
+  // Non-blocking two-note ready cue. The 4.6.2 bench log caught the former
+  // 500+250 ms delays landing over the first post-flash SETTINGS handshake
+  // (a healthy response was delayed ~780 ms) and freezing cursor/sensor work
+  // for the same interval. Tone owns PWM2 while the LEDs use PWM0/1, and the
+  // core's timed tone releases cleanly; queue the second note and explicit
+  // release while the main loop remains live.
   if (_buzzerOn && (_soundModeLevel != CONF_SOUND_MODE_OFF)){
+    clear();
     tone(CONF_BUZZER_PIN, NOTE_F5, 500);
-    delay(500);
-    tone(CONF_BUZZER_PIN, NOTE_C6, 250);
-    delay(250);
-    noTone(CONF_BUZZER_PIN);
+    queueNote(500, NOTE_C6, 250);
+    queueNote(750, 0, 0);  // explicit PWM release after the second timed note
   }
 }
 
@@ -336,8 +338,8 @@ void LSBuzzer::playErrorSound(){
   // tone() callers are single fire-and-forget notes with a duration the
   // core auto-releases (modeEngageTone, the calibration tones) plus this
   // blocking pair. The QUEUED-note machinery no longer fires from the
-  // loop at all: nothing queues today (playReadySound was the last queuer
-  // and now blocks like this function), so buzzer.update() is a no-op.
+  // loop only for the ready cue's two bounded follow-up steps; playErrorSound
+  // itself stays synchronous so error audio completes before error LEDs start.
   if (!_buzzerOn || (_soundModeLevel == CONF_SOUND_MODE_OFF)) return;
     tone(CONF_BUZZER_PIN, NOTE_G4, 500);
     delay(500);

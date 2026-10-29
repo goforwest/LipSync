@@ -70,8 +70,10 @@ bool g_joystickSensorConnected = false;            // Joystick sensor connection
 bool g_mouthpiecePressureSensorConnected = false;  // Mouthpiece pressure sensor connection state
 bool g_ambientPressureSensorConnected = false;     // Ambient pressure sensor connection state
 
-// LED module variables
-ledStateStruct* ledCurrentState = new ledStateStruct;  // pointer to LED current state structure
+// LED module variables. Static storage avoids a boot-time heap allocation for
+// an object that lives for the entire firmware lifetime.
+ledStateStruct ledCurrentStateStorage = {0, 0, 0, 0, 0, 0};
+ledStateStruct* const ledCurrentState = &ledCurrentStateStorage;
 bool ledActionEnabled = false;
 
 // Input module variables
@@ -91,19 +93,19 @@ int sapActionSize;
 unsigned long sapActionMaxTime = 0;
 
 // Timer related variables
-int actionTimerId[1];  // 1 action timer
+int actionTimerId[1] = {-1};  // 1 action timer
 LSTimer<int> actionTimer;
 
-int calibrationTimerId[2];  // 2 calibration timers: 0 - , 1-
+int calibrationTimerId[2] = {-1, -1};  // 2 calibration timers: 0 - , 1-
 LSTimer<int> calibrationTimer;
 
-int pollTimerId[10];  // 9 poll timers — the CAPTURED ids (4.5.7 review): every enable/disable path must use these, not the CONF_TIMER_* constants; the two are equal only while every boot registration lands sequentially into an empty pool, and one refused registration or reorder away from the constants is disabling the WRONG feature's loop
+int pollTimerId[10] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1};  // 9 poll timers — the CAPTURED ids (4.5.7 review): every enable/disable path must use these, not the CONF_TIMER_* constants; the two are equal only while every boot registration lands sequentially into an empty pool, and one refused registration or reorder away from the constants is disabling the WRONG feature's loop
 LSTimer<void> pollTimer;
 
 int ledTimerId[5] = {-1, -1, -1, -1, -1};  // LED timers 0 - startup feedback, 1 - IBM, 2- normal blinks, 3 - Bluetooth Status, 4 - error — -1 = none registered (4.5.7 review: zero-init made blinkLed's delete-before-rearm guard delete pool slot 0 on its first call)
 LSTimer<ledStateStruct> ledStateTimer;
 
-int usbConnectTimerId[1];
+int usbConnectTimerId[1] = {-1};
 LSTimer<int> usbConnectTimer;
 
 unsigned int g_usbAttempt = 0;
@@ -313,18 +315,24 @@ extern "C" __attribute__((used, noinline)) void lipsyncFaultCapture(uint32_t* fr
   // see the header note). The app's flash spans 0x26000-0x75000, so
   // (pc >> 13) is 4 bits; 0xC0 | that can never equal a bootloader magic.
   NRF_POWER->GPREGRET = 0xC0UL | ((g_faultFramePc >> 13) & 0x0FUL);
-  // Best-effort print (a live port is the observed death trigger — if the
-  // fault hit DURING a dispatch there is a chance the bytes are already
-  // flushed). Keep it one line so the CDC buffer need not flush.
-  Serial.print(F("FAULT pc=0x"));
-  Serial.print(g_faultFramePc, HEX);
-  Serial.print(F(" lr=0x"));
-  Serial.print(g_faultFrameLr, HEX);
-  Serial.print(F(" cfsr=0x"));
-  Serial.println(g_faultCfsr, HEX);
+  // Best-effort, strictly non-blocking print. Adafruit_USBD_CDC::write()
+  // otherwise yields forever when DTR is up but the host is not draining;
+  // fault context must always reach the reset. The retention markers above
+  // remain authoritative when the whole line does not fit immediately.
+  char faultLine[80];
+  int faultLen = snprintf(faultLine, sizeof(faultLine),
+                          "FAULT pc=%lx lr=%lx cfsr=%lx\n",
+                          (unsigned long)g_faultFramePc,
+                          (unsigned long)g_faultFrameLr,
+                          (unsigned long)g_faultCfsr);
+  if (faultLen > 0 && faultLen < (int)sizeof(faultLine) &&
+      Serial.availableForWrite() >= faultLen) {
+    Serial.write((const uint8_t*)faultLine, (size_t)faultLen);
+    Serial.flush();
+  }
   for (volatile uint32_t i = 0; i < 2000000; i++) { }  // ~100 ms dwell for any already-buffered CDC byte to drain
   NVIC_SystemReset();  // SREQ — retention + GPREGRET survive (or the bootloader clears GPREGRET; the class marker survives regardless)
-  while (1) { delay(10); }        // never returns
+  while (1) { __WFE(); }          // never returns; do not call RTOS delay() from fault context
 }
 
 // The strong override of the core's weak (.S) spin-loop handler. Naked: the
@@ -395,12 +403,13 @@ static volatile bool g_bleInitDone = false;       // the task finished (success 
 // 8-byte record with magic headers both ends: a torn write fails the magic
 // check and reads as absent.
 static const char* const BLE_VERDICT_FILE = "/bleverdict.dat";
+static const char* const BLE_VERDICT_TMP_FILE = "/bleverdict.tmp";
 volatile bool g_bleVerdictDirty = false;  // raised by the init task, serviced by the loop — the ONLY cross-task handoff (no FS access off-loop)
 void bleVerdictPersist() {  // LOOP-CONTEXT ONLY (see the 4.5.21 note above)
   File verdictFile(InternalFS);  // its own handle — never the shared settings object
-  InternalFS.remove(BLE_VERDICT_FILE);
+  InternalFS.remove(BLE_VERDICT_TMP_FILE);
   delay(1);
-  if (verdictFile.open(BLE_VERDICT_FILE, FILE_O_WRITE)) {
+  if (verdictFile.open(BLE_VERDICT_TMP_FILE, FILE_O_WRITE)) {
     uint8_t rec[8] = { 0xB5,
                        (uint8_t)g_bleInitStage,
                        (uint8_t)g_bleProbeStep,
@@ -409,9 +418,16 @@ void bleVerdictPersist() {  // LOOP-CONTEXT ONLY (see the 4.5.21 note above)
                        (uint8_t)((g_bleInitRc >> 8) & 0xFF),
                        g_bleProbeDemoted,
                        0xA5 };
-    verdictFile.write(rec, sizeof(rec));
+    const size_t written = verdictFile.write(rec, sizeof(rec));
     delay(1);
     verdictFile.close();
+    if (written == sizeof(rec)) {
+      if (!InternalFS.rename(BLE_VERDICT_TMP_FILE, BLE_VERDICT_FILE)) {
+        InternalFS.remove(BLE_VERDICT_TMP_FILE);
+      }
+    } else {
+      InternalFS.remove(BLE_VERDICT_TMP_FILE);
+    }
   }
 }
 void bleVerdictConsume() {
@@ -436,7 +452,7 @@ static volatile bool g_hostHasSpoken = false;     // 4.5.10: the repeating boot 
 // Joystick module variables and structures
 int acceleration = 0;
 int g_scrollLevel = 0;
-int g_scrollNumRuns = 0;
+uint32_t g_scrollNumRuns = 0;  // unsigned wrap is defined for long-lived scroll sessions
 
 int outputAction;
 bool canOutputAction = true;
@@ -449,6 +465,7 @@ bool canOutputAction = true;
 unsigned long g_menuInputHoldMs = 0;
 bool g_startupCenterReset = true;
 bool g_resetCenterComplete = false;  // global variable for center reset status
+bool g_centerRunning = false;        // center sample buffer/timer ids are shared; serialize center and full-calibration flows
 bool g_calibrationError = false;     // Global variable for error in full calibration
 bool g_calibrationRunning = false;   // 4.5.7 review: a full-calibration chain is in flight — CA,0/EX reads must not overwrite the accumulating corner slots (see getJoystickCalibration)
 bool g_calibrationCenterStep = false;  // 4.5.7 review: the calibration chain's OWN internal step-5 center is starting (synchronous bypass for the center-flow in-flight gate — both chains share the calibrationTimerId[] variables, so a concurrent center would clobber the corner reading-timer id and silently drop the corner's persistence + ack)
@@ -608,6 +625,14 @@ void setup() {
 
   initMemory();  // Initialize Memory
 
+  // bleVerdictConsume() runs inside initMemory(), so only now can a failed
+  // previous BLE initialization contribute to the abnormal-boot report.
+  // The pre-filesystem calculation above still covers fault/retention data
+  // for the early setup print.
+  if (g_blePrevSt >= 0 && g_blePrevSt < 5) {
+    g_bootReportWorthy = true;
+  }
+
   //initUID(); // Intilize unique identifier
   getDeviceID(false, false);       // Retrieve Device ID from memory
   getVersionNumber(false, false);  // Retrieve version number from memory
@@ -677,8 +702,6 @@ void setup() {
 
   initAcceleration();  // Load the stored cursor acceleration level (roadmap item 9)
 
-  initDebug();  // Initialize Debug Mode operation
-
   startupFeedback();  // Startup LED Feedback
 
   if (USB_DEBUG) { Serial.println("USBDEBUG: Initialize timers."); }
@@ -744,6 +767,11 @@ void setup() {
     pollTimer.disable(pollTimerId[CONF_TIMER_SCROLL]);
   }
 
+  // Timer IDs are valid only after registration. Running initDebug before
+  // this point made every enable/disable target slot 0 from zero-initialized
+  // storage, while the real debug timer subsequently started enabled.
+  initDebug();
+
   // If any devices are not connected, handle error
   if (!g_displayConnected || !g_mouthpiecePressureSensorConnected || !g_ambientPressureSensorConnected || !g_joystickSensorConnected) {
     hardwareErrorCheck();
@@ -788,10 +816,16 @@ void setup() {
   // stack is up (needsInitialization is the gate).
   if (g_bleInitPending) {
     if (USB_DEBUG) { Serial.println(F("BOOT: BLE task create")); }
-    xTaskCreateStatic(bleInitTaskBody, "bleInit",
-                      CONF_BLE_INIT_TASK_STACK_BYTES / sizeof(StackType_t),
-                      NULL, CONF_BLE_INIT_TASK_PRIORITY,
-                      g_bleInitStack, &g_bleInitTCB);
+    TaskHandle_t bleTask = xTaskCreateStatic(bleInitTaskBody, "bleInit",
+                                             CONF_BLE_INIT_TASK_STACK_BYTES / sizeof(StackType_t),
+                                             NULL, CONF_BLE_INIT_TASK_PRIORITY,
+                                             g_bleInitStack, &g_bleInitTCB);
+    if (bleTask == NULL) {
+      g_bleInitStage = 1;
+      g_bleInitDone = true;
+      g_bleVerdictDirty = true;
+      Serial.println(F("BOOT: BLE FAILED to create init task"));
+    }
   }
 
   if (USB_DEBUG) { Serial.print("USBDEBUG: lastRebootReason: "); Serial.println(g_lastRebootReason); }
@@ -812,6 +846,7 @@ void setup() {
 // Return     : void
 //*********************************//
 void loop() {
+  serialTxService();
   // 4.5.10: any host byte stops the repeating boot header (below) — the
   // app's connect sends SETTINGS within milliseconds of opening the port,
   // so a connected session falls silent after one extra line at most.
@@ -903,6 +938,12 @@ void loop() {
   if (g_watchdogArmed) {
     watchdogLoop();
   }
+
+  // Button/click transitions must not depend on a later joystick movement
+  // report to reach the host (joystick debug mode deliberately disables that
+  // poll). This service is non-blocking and sends only when HID is ready.
+  usbmouse.service();
+  btmouse.service();
 
   // Degraded-state heartbeat (bench 2026-10-18, boot-with-unseated-cable
   // forensics): a 4.5.0 boot with the interface cable unseated reset at an
@@ -1039,6 +1080,7 @@ void loop() {
   buzzer.update();  // Fire queued buzzer notes (non-blocking sound sequencing)
 
   settingsEnabled = serialSettings(settingsEnabled);  // Process Serial API commands
+  serialTxService();
   //yield();
 }
 
@@ -1083,6 +1125,10 @@ void initGlobals() {
   g_inputWindowShortMs = 0;
   g_inputWindowLongMs = 0;
   g_inputWindowMaxMs = 0;
+
+  g_centerRunning = false;
+  g_calibrationRunning = false;
+  g_calibrationCenterStep = false;
 
 }
 
@@ -1432,10 +1478,14 @@ void initMemory() {
 //
 // Return     : void
 //****************************************//
-void resetMemory() {
+bool resetMemory() {
   if (USB_DEBUG) { Serial.println("USBDEBUG: resetMemory()"); }
-  mem.format();                                            // Format and remove existing text files in flash memory
-  mem.initialize(CONF_SETTINGS_FILE, CONF_SETTINGS_JSON);  // Initialize flash memory to store settings
+  mem.format();  // Format and remove existing text files in flash memory
+  // Write the complete default document once. The old factory-reset path
+  // followed initialization with ~22 read/modify/write cycles, multiplying
+  // flash wear and exposing many intermediate states for no benefit—the next
+  // boot reloads this document anyway.
+  return mem.writeAll(CONF_SETTINGS_FILE, CONF_SETTINGS_JSON);
 }
 
 //***Read UID FUNCTION***//
@@ -1457,7 +1507,9 @@ const char* readUID() {
   deviceID = NRF_FICR->DEVICEID[0];  // First part of Device ID for NRF52840 boards
   //#endif
 
-  itoa(deviceID, deviceIDString, 16);  // Convert uint32_t to hex string
+  // The wire and BLE-name contract is exactly eight hexadecimal characters.
+  // itoa() dropped leading zeroes, producing variable-length identifiers.
+  snprintf(deviceIDString, sizeof(deviceIDString), "%08lx", (unsigned long)deviceID);
 
   return deviceIDString;
 }
@@ -1751,8 +1803,10 @@ void usbCheckConnection(void) {
                     || ((g_operatingMode == CONF_OPERATING_MODE_GAMEPAD) && gamepad.isReady());
     if (hidReadyNow) {
       if (g_usbReenumCount > 0) {
-        Serial.print("USB recovered after forced re-enumeration #");
-        Serial.println(g_usbReenumCount);
+        if (USB_DEBUG) {
+          Serial.print("USB recovered after forced re-enumeration #");
+          Serial.println(g_usbReenumCount);
+        }
       }
       g_usbNotReadySinceMs = 0;  // Episode over
       g_usbReenumCount = 0;
@@ -1764,10 +1818,12 @@ void usbCheckConnection(void) {
         g_usbNotReadySinceMs = millis();  // Episode begins
       } else if ((millis() - g_usbNotReadySinceMs >= CONF_USB_REENUM_AFTER_MS) && (g_usbReenumCount < CONF_USB_REENUM_MAX)) {
         g_usbReenumCount++;
-        Serial.print("USB forced re-enumeration #");
-        Serial.print(g_usbReenumCount);
-        Serial.print(" at ");
-        Serial.println(millis());
+        if (USB_DEBUG) {
+          Serial.print("USB forced re-enumeration #");
+          Serial.print(g_usbReenumCount);
+          Serial.print(" at ");
+          Serial.println(millis());
+        }
         USBDevice.detach();
         delay(CONF_USB_REENUM_DWELL_MS);  // Dark long enough for the host to tear the old configuration down
         USBDevice.attach();
@@ -1790,8 +1846,10 @@ void usbCheckConnection(void) {
         // a post-mortem unable to tell a deliberate user/menu reset from
         // this USB-recovery restart. The stamp(6) at this function's entry
         // already names the true death context.)
-        Serial.print("USB restarting device to recover the HID interface at ");
-        Serial.println(millis());
+        if (USB_DEBUG) {
+          Serial.print("USB restarting device to recover the HID interface at ");
+          Serial.println(millis());
+        }
         screen.restartPage();
         delay(500);  // Bounded: drain the serial line and let the framebuffer push complete (bounded by Wire)
         NVIC_SystemReset();
@@ -1806,13 +1864,17 @@ void usbCheckConnection(void) {
   if (usbmouse.usbRetrying || gamepad.usbRetrying) {
 
     if (usbmouse.usbRetrying) {
-      Serial.print("Reattempting USB Mouse ");
-      Serial.println(millis());
+      if (USB_DEBUG) {
+        Serial.print("Reattempting USB Mouse ");
+        Serial.println(millis());
+      }
 
       usbmouse.begin();
     } else if (gamepad.usbRetrying) {
-      Serial.print("Reattempting USB Gamepad ");
-      Serial.println(millis());
+      if (USB_DEBUG) {
+        Serial.print("Reattempting USB Gamepad ");
+        Serial.println(millis());
+      }
 
       gamepad.begin();
     }
@@ -1828,8 +1890,9 @@ void usbCheckConnection(void) {
     // first ticks land before the host finishes configuring the composite
     // device, and by the time it is ready the next tick can be ~40 s out —
     // the No-USB page lingers on a device that is already working.
-    if (g_usbConnectDelay < 10000) {
-      g_usbConnectDelay = g_usbConnectDelay * 1.2;  // Increase time after each unsuccessfull attempt
+  if (g_usbConnectDelay < 10000) {
+      unsigned int nextDelay = (unsigned int)(g_usbConnectDelay * 1.2f);
+      g_usbConnectDelay = (nextDelay > 10000U) ? 10000U : nextDelay;
     }
 
     usbConnectTimerId[0] = usbConnectTimer.setTimeout(g_usbConnectDelay, usbCheckConnection);  // Keep retrying connection until USB connection is made
@@ -1892,11 +1955,13 @@ void usbCheckConnection(void) {
 // Return     : void
 //****************************************//
 extern "C" void tud_mount_cb(void) {
+  if (!USB_DEBUG) return;
   Serial.print("USB-EVT: configured at ");
   Serial.println(millis());
 }
 
 extern "C" void tud_umount_cb(void) {
+  if (!USB_DEBUG) return;
   Serial.print("USB-EVT: unconfigured at ");
   Serial.println(millis());
 }
@@ -1932,6 +1997,7 @@ void initOperatingMode() {
   // tick. Out of range falls back to the default mouse mode.
   if ((g_operatingMode < CONF_OPERATING_MODE_MIN) || (g_operatingMode > CONF_OPERATING_MODE_SETTABLE_MAX)) {
     g_operatingMode = CONF_OPERATING_MODE_DEFAULT;  // also catches a stored SAFE(3) — not a valid boot mode (4.5.7 review)
+    mem.writeInt(CONF_SETTINGS_FILE, "OM", g_operatingMode);
   }
 
 }
@@ -2131,8 +2197,8 @@ void initRestrictions() {
 //              load inverted windows (a quick puff firing the MAX row) or
 //              out-of-range values. An offending stored value falls back to
 //              the compiled default (0) IN MEMORY ONLY — the stored value
-//              is untouched, and every boot re-sanitizes consistently (the
-//              4.5.5 switch-action precedent).
+//              is healed to 0 (the compiled default) so a later API getter
+//              cannot reload the bad value and undo the boot sanitizer.
 //
 // Parameters : void
 //
@@ -2144,6 +2210,7 @@ void sanitizeInputWindows() {
       && (g_inputWindowShortMs < CONF_INPUT_WINDOW_SHORT_MIN_MS || g_inputWindowShortMs > CONF_INPUT_WINDOW_SHORT_MAX_MS
           || shortEff >= ((g_inputWindowLongMs > 0) ? g_inputWindowLongMs : CONF_INPUT_WINDOW_LONG_DEFAULT_MS))) {
     g_inputWindowShortMs = 0;
+    mem.writeInt(CONF_SETTINGS_FILE, "WS", 0);
   }
   unsigned long longEff = (g_inputWindowLongMs > 0) ? g_inputWindowLongMs : CONF_INPUT_WINDOW_LONG_DEFAULT_MS;
   shortEff = (g_inputWindowShortMs > 0) ? g_inputWindowShortMs : CONF_INPUT_WINDOW_SHORT_DEFAULT_MS;
@@ -2151,6 +2218,7 @@ void sanitizeInputWindows() {
       && (g_inputWindowLongMs < CONF_INPUT_WINDOW_LONG_MIN_MS || g_inputWindowLongMs > CONF_INPUT_WINDOW_LONG_MAX_MS
           || longEff <= shortEff || longEff >= ((g_inputWindowMaxMs > 0) ? g_inputWindowMaxMs : CONF_INPUT_WINDOW_MAX_DEFAULT_MS))) {
     g_inputWindowLongMs = 0;
+    mem.writeInt(CONF_SETTINGS_FILE, "WL", 0);
   }
   unsigned long maxEff = (g_inputWindowMaxMs > 0) ? g_inputWindowMaxMs : CONF_INPUT_WINDOW_MAX_DEFAULT_MS;
   longEff = (g_inputWindowLongMs > 0) ? g_inputWindowLongMs : CONF_INPUT_WINDOW_LONG_DEFAULT_MS;
@@ -2158,6 +2226,7 @@ void sanitizeInputWindows() {
       && (g_inputWindowMaxMs < CONF_INPUT_WINDOW_MAX_MIN_MS || g_inputWindowMaxMs > CONF_INPUT_WINDOW_MAX_MAX_MS
           || maxEff <= longEff)) {
     g_inputWindowMaxMs = 0;
+    mem.writeInt(CONF_SETTINGS_FILE, "WM", 0);
   }
 }
 
@@ -2720,6 +2789,7 @@ void evaluateOutputAction(inputStateStruct actionState, unsigned long actionMaxE
 // Return     : void
 //****************************************//
 void performOutputAction(int action) {
+  if (action < CONF_ACTION_NOTHING || action > CONF_ACTION_FACTORY_RESET) return;
   switch (action) {
     case CONF_ACTION_NOTHING:
       {
@@ -2861,6 +2931,12 @@ void performOutputAction(int action) {
   if (g_operatingMode == CONF_OPERATING_MODE_GAMEPAD) {
     //actionTimerId[0] = actionTimer.setTimeout(CONF_BUTTON_PRESS_DELAY, gamepadButtonRelease, (int *)action);
     actionTimerId[0] = actionTimer.setTimeout(CONF_BUTTON_PRESS_DELAY, gamepadButtonReleaseAll);  // TODO: Change this to just release one
+    if (actionTimerId[0] < 0) {
+      // Any B1-B8 path above may have asserted a report bit. If the shared
+      // release timer cannot register, clear it immediately rather than
+      // leaving a host button held until reboot.
+      gamepadButtonReleaseAll();
+    }
     outputAction = CONF_ACTION_NOTHING;
   }
 
@@ -3000,6 +3076,12 @@ void gamepadButtonClick(int buttonNumber) {
     gamepad.press(buttonNumber - 1);
     gamepad.send();
     actionTimerId[0] = actionTimer.setTimeout(CONF_BUTTON_PRESS_DELAY, gamepadButtonRelease, (int*)buttonNumber);
+    if (actionTimerId[0] < 0) {
+      // A refused release timer must fail safe. Leaving the report bit set
+      // would hold a gamepad button indefinitely until another release-all.
+      gamepad.release(buttonNumber - 1);
+      gamepad.send();
+    }
   }
 }
 
@@ -3116,23 +3198,53 @@ void performJoystickCenter(int* args) {
     // out honestly instead — restore the output-enabled state and keep the
     // previous center (4.5.7 review; unreachable with 16 slots, but the
     // guard is one check).
+    // Each center attempt owns a fresh sample window. Reusing the circular
+    // buffer's old length let a failed attempt with only 1-4 new readings
+    // appear complete and average stale samples from the previous center.
+    js.resetInputCenterBuffer();
     calibrationTimerId[1] = calibrationTimer.setTimer(CONF_JOY_INIT_READING_DELAY, currentReadingStart, CONF_JOY_INIT_READING_NUMBER, performJoystickCenterStep, (int*)args);
     if (calibrationTimerId[1] < 0) {
       Serial.println("ERROR: center-reset reading timer refused -- keeping previous center");
       setLedDefault();
       canOutputAction = true;
       g_resetCenterComplete = true;
+      g_centerRunning = false;
+      if (screen.showCenterResetComplete) screen.centerResetFailedPage();
+      printResponseInt(true, centerInitFromApi, false, 3, "IN,1", true, 1);
+      if (g_calibrationRunning) abortJoystickCalibration(false, "center reading timer refused");
+      if (g_startupCenterReset) {
+        g_startupCenterReset = false;
+        readyToUse();
+      }
       return;
     }
     // Carry the initiator into the completion step
     int payload = (stepNumber + 1) | (centerInitFromApi ? CONF_CENTER_INIT_API_FLAG : 0);
     // Start exit step
     calibrationTimerId[0] = calibrationTimer.setTimeout(nextStepStart, performJoystickCenter, (int*)payload);
+    if (calibrationTimerId[0] < 0) {
+      calibrationTimer.deleteTimer(calibrationTimerId[1]);
+      Serial.println("ERROR: center-reset completion timer refused -- keeping previous center");
+      setLedDefault();
+      canOutputAction = true;
+      g_resetCenterComplete = true;
+      g_centerRunning = false;
+      if (screen.showCenterResetComplete) screen.centerResetFailedPage();
+      printResponseInt(true, centerInitFromApi, false, 3, "IN,1", true, 1);
+      if (g_calibrationRunning) abortJoystickCalibration(false, "center completion timer refused");
+      if (g_startupCenterReset) {
+        g_startupCenterReset = false;
+        readyToUse();
+      }
+    }
   } else {
-    js.evaluateInputCenter();           // Evaluate the center point using values in the buffer
-    js.setMinimumRadius();              // Update minimum radius of operation
+    bool centerUpdated = js.evaluateInputCenter();  // Requires five valid samples from THIS attempt
+    if (centerUpdated) {
+      js.setMinimumRadius();            // Update minimum radius of operation
+      js.reprocessLastReading();        // Apply the new center even while the raw field is stationary
+    }
     centerPoint = js.getInputCenter();  // Get the new center for API output
-    printResponseFloatPoint(true, centerInitFromApi, true, 0, "IN,1", true, centerPoint);
+    printResponseFloatPoint(true, centerInitFromApi, centerUpdated, centerUpdated ? 0 : 3, "IN,1", true, centerPoint);
     // No deleteTimer here (4.5.4): the fired RUN_ONCE timeout already
     // deleted itself, and the old blind deleteTimer(0) could kill a LIVE
     // timer — slot 0 is the lowest free slot handed to the next
@@ -3144,12 +3256,19 @@ void performJoystickCenter(int* args) {
     setLedDefault();                  // Set default led feedback
     canOutputAction = true;
     g_resetCenterComplete = true;
+    g_centerRunning = false;
+
+    if (!centerUpdated && g_calibrationRunning) {
+      abortJoystickCalibration(false, "center did not collect five valid samples");
+      return;
+    }
 
     if (g_startupCenterReset) {  // Checks variable to only play sound and show splash screen on startup
       readyToUse();              // TODO JDMc 2025-Jan-24 Probably want sound to play after every calibration to indicate joystick is ready to be used again.
     }
-    if (screen.showCenterResetComplete) {  // Checks variable so center reset complete page only shows if accessed from menu, not on startup or during full calibration
-      screen.centerResetCompletePage();
+    if (screen.showCenterResetComplete) {  // Checks variable so center reset result only shows if accessed from menu, not on startup or during full calibration
+      if (centerUpdated) screen.centerResetCompletePage();
+      else screen.centerResetFailedPage();
     }
     g_startupCenterReset = false;
   }
@@ -3181,6 +3300,36 @@ void performJoystickCenterStep(int* args) {
   }
 }
 
+// Restore a usable device if any full-calibration timer registration is
+// refused. The calibration pool is deliberately roomy, but exhaustion must
+// degrade to the last persisted calibration rather than leaving polling and
+// all output disabled for the rest of the boot.
+void abortJoystickCalibration(bool calibFromApi, const char* reason) {
+  Serial.print(F("ERROR: calibration aborted: "));
+  Serial.println(reason);
+  g_calibrationRunning = false;
+  g_calibrationCenterStep = false;
+
+  // A corner may have been zeroed before the refusal. Reload all persisted
+  // corners now that the in-flight read gate is down.
+  getJoystickCalibration(false, false);
+
+  pollTimer.enable(pollTimerId[CONF_TIMER_INPUT]);
+  if (!g_safeModeEnabled) {
+    screen.enableTimeout();
+    pollTimer.enable(pollTimerId[CONF_TIMER_JOYSTICK]);
+    pollTimer.enable(pollTimerId[CONF_TIMER_SCROLL]);
+    pollTimer.enable(pollTimerId[CONF_TIMER_PRESSURE]);
+  }
+  screen.calibrationAbortedPage();
+  setLedDefault();
+  if (!g_centerRunning) {
+    canOutputAction = true;
+    g_resetCenterComplete = true;
+  }
+  printResponseInt(true, calibFromApi, false, 3, "CA,1", true, 1);
+}
+
 //***PERFORM JOYSTICK CALIBRATION FUNCTION***//
 // Function   : performJoystickCalibration
 //
@@ -3191,6 +3340,11 @@ void performJoystickCenterStep(int* args) {
 // Return     : void
 //****************************************//
 void performJoystickCalibration(int* args) {
+  // A failed timer/center step may leave already-scheduled callbacks in the
+  // pool. abortJoystickCalibration drops the run gate; stale continuations
+  // must become no-ops rather than reviving a failed flow and announcing
+  // success later.
+  if (!g_calibrationRunning) return;
   g_resetCenterComplete = false;
   g_calibrationError = false;
   // The initiator rides the chain's payload (CONF_CALIB_API_FLAG, 4.5.4
@@ -3235,6 +3389,10 @@ void performJoystickCalibration(int* args) {
     performLedAction(ledCurrentState);
     ++stepNumber;
     calibrationTimerId[0] = calibrationTimer.setTimeout(currentReadingStart, performJoystickCalibration, (int*)(stepNumber | (calibFromApi ? CONF_CALIB_API_FLAG : 0)));  // Start next step
+    if (calibrationTimerId[0] < 0) {
+      abortJoystickCalibration(calibFromApi, "first-corner timer refused");
+      return;
+    }
   } else if (stepNumber < 5) {                                                                                               // STEP 1-4: Joystick Calibration Corner Points
     screen.fullCalibrationPrompt(stepNumber);
     buzzer.calibCornerTone();
@@ -3243,18 +3401,35 @@ void performJoystickCalibration(int* args) {
     js.zeroInputMax(stepNumber);        // Clear the existing calibration value
 
     calibrationTimerId[1] = calibrationTimer.setTimer(CONF_JOY_CALIB_READING_DELAY, currentReadingStart, CONF_JOY_CALIB_READING_NUMBER, performJoystickCalibrationStep, (int*)(stepNumber | (calibFromApi ? CONF_CALIB_API_FLAG : 0)));
+    if (calibrationTimerId[1] < 0) {
+      abortJoystickCalibration(calibFromApi, "corner-reading timer refused");
+      return;
+    }
     ++stepNumber;
     // Set LED's feedback to show step is already started and get the max reading for the quadrant/step
 
     calibrationTimerId[0] = calibrationTimer.setTimeout(nextStepStart, performJoystickCalibration, (int*)(stepNumber | (calibFromApi ? CONF_CALIB_API_FLAG : 0)));  // Start next step
+    if (calibrationTimerId[0] < 0) {
+      calibrationTimer.deleteTimer(calibrationTimerId[1]);
+      abortJoystickCalibration(calibFromApi, "next-corner timer refused");
+      return;
+    }
   } else if (stepNumber == 5) {                                                                                        // STEP 5 : Joystick center point initialization
     screen.fullCalibrationPrompt(stepNumber);
     buzzer.calibCenterTone();
     g_calibrationCenterStep = true;   // The chain's own internal center — bypass the in-flight gate (synchronous: no timer fires between set and clear)
     setJoystickInitialization(false, false);
     g_calibrationCenterStep = false;
+    if (!g_centerRunning) {
+      abortJoystickCalibration(calibFromApi, "center step refused");
+      return;
+    }
     ++stepNumber;
     calibrationTimerId[0] = calibrationTimer.setTimeout(nextStepStart, performJoystickCalibration, (int*)(stepNumber | (calibFromApi ? CONF_CALIB_API_FLAG : 0)));  // Start next step
+    if (calibrationTimerId[0] < 0) {
+      abortJoystickCalibration(calibFromApi, "completion timer refused");
+      return;
+    }
   }
 
   else  // STEP 6: Calibration ended
@@ -3263,6 +3438,7 @@ void performJoystickCalibration(int* args) {
     setLedState(LED_ACTION_BLINK, CONF_JOY_CALIB_START_LED_COLOR, CONF_JOY_CALIB_LED_NUMBER, CONF_JOY_CALIB_STEP_BLINK, CONF_JOY_CALIB_STEP_BLINK_DELAY, led.getLedBrightness());  // Turn off Led's
     performLedAction(ledCurrentState);
     js.setMinimumRadius();  // Update the minimum cursor operating radius
+    js.reprocessLastReading();  // Apply the new radius even while the stick is stationary
     setLedDefault();
     canOutputAction = true;
     g_resetCenterComplete = true;
@@ -3636,22 +3812,31 @@ void setDebugState(int inputDebugMode) {
   }
 
   if (inputDebugMode == CONF_DEBUG_MODE_NONE) {
-    pollTimer.disable(pollTimerId[CONF_TIMER_DEBUG]);    // Disable debug data polling
-    // 4.5.7 review: the sensor-poll re-enables are safe-mode-gated — the
-    // serial API is deliberately not filtered by safe mode, and a DM,1:0 on
-    // a sensorful safe boot used to restore the 20 ms/30 ms joystick/scroll
-    // I2C polls toggleSafeMode shut down, for the rest of the boot.
-    if (!g_safeModeEnabled) {
-      pollTimer.enable(pollTimerId[CONF_TIMER_JOYSTICK]);  // Enable joystick data polling
-      pollTimer.enable(pollTimerId[CONF_TIMER_SCROLL]);    // Enable scroll data polling
-    }
+    pollTimer.disable(pollTimerId[CONF_TIMER_DEBUG]);
+  } else {
+    pollTimer.enable(pollTimerId[CONF_TIMER_DEBUG]);
+  }
 
-  } else if (inputDebugMode == CONF_DEBUG_MODE_JOYSTICK) {
+  if (inputDebugMode == CONF_DEBUG_MODE_JOYSTICK) {
     pollTimer.disable(pollTimerId[CONF_TIMER_JOYSTICK]);  // Disable joystick data polling
     pollTimer.disable(pollTimerId[CONF_TIMER_SCROLL]);    // Disable scroll data polling
-    pollTimer.enable(pollTimerId[CONF_TIMER_DEBUG]);      // Enable debug data polling
   } else {
-    pollTimer.enable(pollTimerId[CONF_TIMER_DEBUG]);  // Enable debug data polling
+    // Leaving joystick-debug mode must restore exactly one normal joystick
+    // loop. The old code restored neither when switching DM=1 -> DM=2..5,
+    // freezing cursor/gamepad movement; DM=0 enabled BOTH loops and doubled
+    // reports until the next input-state tick happened to correct it.
+    if (!g_safeModeEnabled && g_joystickSensorConnected) {
+      if (outputAction == CONF_ACTION_SCROLL) {
+        pollTimer.disable(pollTimerId[CONF_TIMER_JOYSTICK]);
+        pollTimer.enable(pollTimerId[CONF_TIMER_SCROLL]);
+      } else {
+        pollTimer.enable(pollTimerId[CONF_TIMER_JOYSTICK]);
+        pollTimer.disable(pollTimerId[CONF_TIMER_SCROLL]);
+      }
+    } else {
+      pollTimer.disable(pollTimerId[CONF_TIMER_JOYSTICK]);
+      pollTimer.disable(pollTimerId[CONF_TIMER_SCROLL]);
+    }
   }
 }
 
@@ -3794,9 +3979,9 @@ void ledReadyFeedback() {
 //****************************************//
 void startupFeedback() {
   if (USB_DEBUG) { Serial.println("USBDEBUG: startupFeedback"); }
-  ledTimerId[CONF_TIMER_LED_STARTUP] = ledStateTimer.setTimeout(ledCurrentState->ledBlinkTime, ledStartupEffect, ledCurrentState);
-
-  //ledTimerId[CONF_TIMER_LED_ERROR] = ledStateTimer.setTimer(CONF_ERROR_LED_BLINK_DELAY, blinkStartDelay, ((errorBlinks * 2) + 1), ledErrorEffect);
+  // The historical startup callback body is empty. Do not consume a timer
+  // slot for a zero-delay no-op; setup enables LED actions explicitly.
+  ledTimerId[CONF_TIMER_LED_STARTUP] = -1;
 }
 
 //***SET LED STATE FUNCTION***//
@@ -3814,7 +3999,9 @@ void startupFeedback() {
 // Return     : void
 //****************************************//
 void setLedState(int ledAction, int ledColorNumber, int ledNumber, int ledBlinkNumber, unsigned long ledBlinkTime, int ledBrightness) {
-  if (ledNumber <= OUTPUT_LED_NUM + 1) {  // Valid ledNumber
+  if (ledNumber >= CONF_LED_NONE && ledNumber <= OUTPUT_LED_NUM + 1 &&
+      ledAction >= LED_ACTION_NONE && ledAction <= LED_ACTION_BLINK &&
+      ledBlinkNumber >= 0) {
     ledCurrentState->ledAction = ledAction;
     ledCurrentState->ledColorNumber = ledColorNumber;
     ledCurrentState->ledNumber = ledNumber;
@@ -3912,11 +4099,15 @@ void ledBlinkEffect(ledStateStruct* args) {
 // Return     : void
 //****************************************//
 void ledBtScanEffect() {
-  if (ledStateTimer.getNumRuns(ledTimerId[CONF_TIMER_LED_BT]) % 2) {
+  const int runs = ledStateTimer.getNumRuns(ledTimerId[CONF_TIMER_LED_BT]);
+  if (runs % 2) {
     led.setLedColor(CONF_BT_LED_NUMBER, LED_CLR_NONE, CONF_BT_LED_BRIGHTNESS);
 
   } else {
     led.setLedColor(CONF_BT_LED_NUMBER, CONF_BT_LED_COLOR, CONF_BT_LED_BRIGHTNESS);
+  }
+  if (runs == ((CONF_BT_SCAN_BLINK_NUMBER * 2) + 1)) {
+    ledTimerId[CONF_TIMER_LED_BT] = -1;
   }
 }
 
@@ -3934,11 +4125,15 @@ void ledBtScanEffect() {
 // Return     : void
 //****************************************//
 void ledBtFailedEffect() {
-  if (ledStateTimer.getNumRuns(ledTimerId[CONF_TIMER_LED_BT]) % 2) {
+  const int runs = ledStateTimer.getNumRuns(ledTimerId[CONF_TIMER_LED_BT]);
+  if (runs % 2) {
     led.setLedColor(CONF_BT_LED_NUMBER, LED_CLR_NONE, CONF_BT_LED_BRIGHTNESS);
 
   } else {
     led.setLedColor(CONF_BT_LED_NUMBER, LED_CLR_RED, CONF_BT_LED_BRIGHTNESS);
+  }
+  if (runs == ((CONF_BT_SCAN_BLINK_NUMBER * 2) + 1)) {
+    ledTimerId[CONF_TIMER_LED_BT] = -1;
   }
 }
 
@@ -3949,12 +4144,18 @@ void ledBtFailedEffect() {
 //
 // Return     : void
 //****************************************//
+static int ledErrorRunTarget = 0;
+
 void ledErrorEffect() {
-  if (ledStateTimer.getNumRuns(ledTimerId[CONF_TIMER_LED_ERROR]) % 2) {
+  const int runs = ledStateTimer.getNumRuns(ledTimerId[CONF_TIMER_LED_ERROR]);
+  if (runs % 2) {
     led.setLedColor(CONF_ERROR_LED_NUMBER, LED_CLR_NONE, CONF_ERROR_LED_BRIGHTNESS);
 
   } else {
     led.setLedColor(CONF_ERROR_LED_NUMBER, CONF_ERROR_LED_COLOR, CONF_ERROR_LED_BRIGHTNESS);
+  }
+  if (runs == ledErrorRunTarget) {
+    ledTimerId[CONF_TIMER_LED_ERROR] = -1;
   }
 }
 
@@ -3967,7 +4168,13 @@ void ledErrorEffect() {
 //****************************************//
 void ledError(int errorBlinks) {
   const int blinkStartDelay = 0;
-  ledTimerId[CONF_TIMER_LED_ERROR] = ledStateTimer.setTimer(CONF_ERROR_LED_BLINK_DELAY, blinkStartDelay, ((errorBlinks * 2) + 1), ledErrorEffect);
+  if (ledTimerId[CONF_TIMER_LED_ERROR] >= 0) {
+    ledStateTimer.deleteTimer(ledTimerId[CONF_TIMER_LED_ERROR]);
+    ledTimerId[CONF_TIMER_LED_ERROR] = -1;
+  }
+  if (errorBlinks <= 0) return;
+  ledErrorRunTarget = (errorBlinks * 2) + 1;
+  ledTimerId[CONF_TIMER_LED_ERROR] = ledStateTimer.setTimer(CONF_ERROR_LED_BLINK_DELAY, blinkStartDelay, ledErrorRunTarget, ledErrorEffect);
 }
 
 //***TURN ALL LEDS OFF FUNCTION***//
@@ -4044,6 +4251,7 @@ void blinkLed(ledStateStruct* args) {
   // delete-before-rearm above supersedes).
   blinkStateSnapshot = *args;
   ledTimerId[CONF_TIMER_LED_BLINK] = ledStateTimer.setTimer(blinkStateSnapshot.ledBlinkTime, blinkOffset, ((blinkStateSnapshot.ledBlinkNumber) * 2) + 1, ledBlinkEffect, &blinkStateSnapshot);
+  if (ledTimerId[CONF_TIMER_LED_BLINK] < 0) setLedDefault();
 }
 
 //***SET DEFAULT LED EFFECT FUNCTION***//
@@ -4110,7 +4318,9 @@ void btFeedbackLoop() {
   // transient — stay dark and return.
   if (needsInitialization) {
     if (g_bleInitPending && g_bleInitDone) {
-      ledTimerId[CONF_TIMER_LED_BT] = ledStateTimer.setTimer(CONF_BT_SCAN_BLINK_DELAY, 0, ((CONF_BT_SCAN_BLINK_NUMBER * 2) + 1), ledBtFailedEffect);
+      if (ledTimerId[CONF_TIMER_LED_BT] < 0) {
+        ledTimerId[CONF_TIMER_LED_BT] = ledStateTimer.setTimer(CONF_BT_SCAN_BLINK_DELAY, 0, ((CONF_BT_SCAN_BLINK_NUMBER * 2) + 1), ledBtFailedEffect);
+      }
     }
     return;
   }
@@ -4123,7 +4333,9 @@ void btFeedbackLoop() {
   if (g_comMode == CONF_COM_MODE_BLE && tempIsConnected == false && tempIsConnected == g_btIsConnected) {
     g_btIsConnected = false;
     const int blinkStartDelay = 0;
-    ledTimerId[CONF_TIMER_LED_BT] = ledStateTimer.setTimer(CONF_BT_SCAN_BLINK_DELAY, blinkStartDelay, ((CONF_BT_SCAN_BLINK_NUMBER * 2) + 1), ledBtScanEffect);
+    if (ledTimerId[CONF_TIMER_LED_BT] < 0) {
+      ledTimerId[CONF_TIMER_LED_BT] = ledStateTimer.setTimer(CONF_BT_SCAN_BLINK_DELAY, blinkStartDelay, ((CONF_BT_SCAN_BLINK_NUMBER * 2) + 1), ledBtScanEffect);
+    }
 
   }  // Set the default LED effect if bluetooth connection state is changed
   else if (g_comMode == CONF_COM_MODE_BLE && tempIsConnected != g_btIsConnected) {
@@ -4231,4 +4443,3 @@ void softwareReset() {
   NVIC_SystemReset();
   
 }
-

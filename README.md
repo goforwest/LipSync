@@ -2,7 +2,7 @@
 
 The LipSync is a mouth-operated sip-and-puff joystick that can emulate a mouse, wireless Bluetooth mouse, or gamepad. It enables people with disabilities that limit their mobility to control a computer, gaming console, smart phone, or tablet.
 
-This most recent version, the LipSync 4.1, is made up of the LipSync Joystick and LipSync Hub. The Joystick is the primary user interface, and contains a low-force Hall-Effect joystick and sip and puff sensors. The Hub has a display that provides a graphical interface for independently adjusting settings, as well as it provides the connection to the host device and up to three external assistive switches with 3.5 mm jacks.
+The most recent hardware design, LipSync 4.1, is made up of the LipSync Joystick and LipSync Hub. The Joystick is the primary user interface, and contains a low-force Hall-Effect joystick and sip and puff sensors. The Hub has a display that provides a graphical interface for independently adjusting settings, as well as it provides the connection to the host device and up to three external assistive switches with 3.5 mm jacks. The current firmware release is 4.6.4.
 
 The device is comprised of off-the-shelf electronics and hardware, a custom PCB and 3D printed parts. The overall cost of materials (including materials required in bulk) for a single build is about $325 (plus shipping). In larger quantities, the cost of materials is closer to $175.
 
@@ -14,7 +14,7 @@ Older versions of the LipSync are now obsolete. Documentation and design files a
 
 The existing LipSync Interface Cable options in the BOM are not in stock. We are working on sourcing suitable alternatives.
 
-Last updated: 2025-Jul-22
+Last updated: 2026-Oct-29
 
 <img src="Photos/LipSync-4.jpg" width="500" alt="A green 3D-printed LipSync joystick with a pink sip-and-puff tube is mounted on an adjustable black arm. In front of it sits the LipSync Hub, a black and green control box with a small display screen, labeled buttons ('NEXT' and 'SEL'), indicator lights, and a USB cable connected at the bottom. Both devices are placed on a light wooden surface against a plain light gray wall.">
 
@@ -79,7 +79,7 @@ As open source assistive technology, you are welcomed and encouraged to improve 
 ### Build Files
  - [3D Printing Files](/Build_Files/3D_Printing_Files/)
  - [PCB Files](/Build_Files/PCB_Build_Files/)
- - [Firmware Files](/Build_Files/Firmware_Files)
+ - [Firmware Files](/Build_Files/Firmware_Files) — firmware 4.6.4 source, pinned vendored libraries, host tests, and the complete source ZIP
 
 
 ## License
@@ -146,6 +146,7 @@ The LipSync has been certified as open source hardware by the Open Source Hardwa
 ---
 
 
+<!-- ABOUT MMC START -->
 ## About Makers Making Change
 [<img src="https://raw.githubusercontent.com/makersmakingchange/makersmakingchange/main/img/mmc_logo.svg" width="500" alt="Makers Making Change Logo">](https://www.makersmakingchange.com/)
 
@@ -155,7 +156,7 @@ Makers Making Change leverages the capacity of community based Makers, Disabilit
 
  - Website: [www.MakersMakingChange.com](https://www.makersmakingchange.com/)
  - GitHub: [makersmakingchange](https://github.com/makersmakingchange)
- - Twitter: [@makermakechange](https://twitter.com/makermakechange)
+ - Bluesky: [@makersmakingchange.bsky.social](https://bsky.app/profile/makersmakingchange.bsky.social)
  - Instagram: [@makersmakingchange](https://www.instagram.com/makersmakingchange)
  - Facebook: [makersmakechange](https://www.facebook.com/makersmakechange)
  - LinkedIn: [Neil Squire Society](https://www.linkedin.com/company/neil-squire-society/)
@@ -164,3 +165,4 @@ Makers Making Change leverages the capacity of community based Makers, Disabilit
 
 ### Contact Us
 For technical questions, to get involved, or to share your experience we encourage you to [visit our website](https://www.makersmakingchange.com/) or [contact us](https://www.makersmakingchange.com/s/contact).
+<!-- ABOUT MMC END -->

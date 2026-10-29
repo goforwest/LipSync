@@ -146,7 +146,8 @@ void testLED() {
   ledError(blinks);
 
   // imitate operation loop
-  while (ledStateTimer.isEnabled(ledTimerId[CONF_TIMER_LED_ERROR]) == true) { 
+  while (ledTimerId[CONF_TIMER_LED_ERROR] >= 0 &&
+         ledStateTimer.isEnabled(ledTimerId[CONF_TIMER_LED_ERROR]) == true) {
     ledStateTimer.run();  // Timer for lights
     delay(10);
   }

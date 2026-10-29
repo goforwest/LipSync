@@ -105,6 +105,8 @@ extern bool g_mouthpiecePressureSensorConnected;  // Mouthpiece pressure sensor 
 extern bool g_ambientPressureSensorConnected;     // Ambient pressure sensor connection state
 extern int g_safeModeReason;                      // Reason safe mode is triggered.
 extern bool g_modeLocked;                         // Operating-mode lock (roadmap item 11, LK setting)
+extern bool g_calibrationRunning;                  // Full calibration accepted and in flight
+extern bool g_centerRunning;                       // Center sample/timer flow in flight
 extern String g_deviceUID;                        // Unique Device ID
 
 class LSScreen {
@@ -189,7 +191,9 @@ public:
 
   void centerResetPage();
   void centerResetCompletePage();
+  void centerResetFailedPage();
   void fullCalibrationPrompt(int stepNum);
+  void calibrationAbortedPage();
   void infoMenu();
   void testPage(unsigned int usbConnectDelay);
   void noUsbPage();
@@ -218,6 +222,7 @@ private:
                                          // can be set on a headless unit where nothing was painted)
   bool _calibrationClosesMenu = false;   // The running calibration was started over the serial API — its end pages close the menu (#36)
   bool _displayHealthy = true;               // Display answers on the I2C bus (mirrors the pressure-sensor health gate)
+  bool _begun = false;                       // SSD1306 framebuffer allocated; no draw call is legal before this
   unsigned long _lastDisplayProbeMs = 0;     // Last cheap re-probe while the display was marked unhealthy
   unsigned long _displayProbeIntervalMs = 2000;  // Re-probe cadence; doubles after each wedged push (flaky buses
                                                  // ACK a probe during momentary releases, and every re-trusted
@@ -387,12 +392,15 @@ LSScreen::LSScreen() {
 void LSScreen::begin() {
 
   if (_display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {  // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
+    _begun = true;
     g_displayConnected = true;
   } else {
     Serial.println(F("ERROR: Display SSD1306 allocation failed"));
 
     g_displayConnected = false;
-    //TODO Handle screen not initialized error
+    _displayHealthy = false;
+    _begun = false;
+    return;  // Adafruit_SSD1306 draw calls dereference a null framebuffer after allocation failure
   }
 
   setupDisplay();  // Clear screen
@@ -416,6 +424,7 @@ void LSScreen::begin() {
 // Return     : void
 //*********************************//
 void LSScreen::clear() {
+  if (!_begun) return;
   //_display.clearDisplay();
   setupDisplay();
 }
@@ -478,6 +487,7 @@ bool LSScreen::inputIsFrozen() {
 // Return     : void
 //*********************************//
 void LSScreen::activateMenu() {
+  if (!_begun || !g_displayConnected) return;
   if (inputIsFrozen()) return;  // A scheduled page transition owns the menu right now (wrap/stale-safe — see inputIsFrozen)
   if (!Wire.busHealthy()) return;  // Held I2C bus — the menu could not draw anyway; don't feed the timeout tax
 
@@ -550,6 +560,10 @@ void LSScreen::scheduleTransition(unsigned long delayMs, void (*transitionFn)())
     _screenStateTimer.deleteTimer(_transitionTimerId);
   }
   _transitionTimerId = _screenStateTimer.setTimeout(delayMs, transitionFn);
+  if (_transitionTimerId < 0) {
+    _inputFrozenUntil = 0;
+    if (transitionFn != nullptr) transitionFn();
+  }
 }
 
 // Each continuation first clears the pending-transition id (the timer just
@@ -597,20 +611,21 @@ void LSScreen::calibrationEndsByClosingMenu(bool enable) {
 void LSScreen::finishChangeMode() {
   _transitionTimerId = -1;
 
-  if (_communicationMode != _tempCommunicationMode) {
-    _communicationMode = _tempCommunicationMode;
-    setCommunicationMode(false, false, _tempCommunicationMode);  // Sets new communication mode, saves in memory
+  // Persist both halves before the single reset. Calling the public setters
+  // sequentially is not atomic: CM resets immediately on change, so a
+  // Bluetooth-mouse -> USB-gamepad menu change rebooted after CM and never
+  // stored OM. Direct validated writes make the pair land together from the
+  // menu's already constrained choices.
+  bool stored = storeModePair(_tempOperatingMode, _tempCommunicationMode);
+  if (!stored) {
+    buzzerErrorCue();
+    modeMenu();
+    return;
   }
 
-  if (_operatingMode != _tempOperatingMode) {
-    _operatingMode = _tempOperatingMode;
-    setOperatingMode(false, false, _tempOperatingMode);  // Sets new operating mode, saves in memory, and conducts software reset
-  }
-
-  softwareReset();  // TODO: is there a way to avoid software reset if just changing com mode?
-
-  _currentMenu = MAIN_MENU;
-  mainMenu();
+  _communicationMode = _tempCommunicationMode;
+  _operatingMode = _tempOperatingMode;
+  softwareReset();
 }
 
 void LSScreen::fullCalibrationConfirmMenu() {
@@ -719,7 +734,7 @@ void LSScreen::finishSplashClear() {
 }
 
 bool LSScreen::isDisplayHealthy() {
-  return _displayHealthy;
+  return _begun && _displayHealthy;
 }
 
 //*********************************//
@@ -741,6 +756,7 @@ bool LSScreen::isDisplayHealthy() {
 // Return     : void
 //*********************************//
 void LSScreen::flushDisplay() {
+  if (!_begun || !g_displayConnected) return;
   // Display health gate (mirrors the pressure sensors'): a full framebuffer
   // push against a held or absent display costs seconds of bounded
   // transaction timeouts — and a flaky bus ACKs probes during momentary
@@ -809,6 +825,7 @@ bool LSScreen::isMenuActive() {
 // Return     : void
 //*********************************//
 void LSScreen::splashScreen() {
+  if (!_begun) return;
   setupDisplay();
 
   _display.setTextSize(2);
@@ -831,6 +848,7 @@ void LSScreen::splashScreen() {
 // Return     : void
 //*********************************//
 void LSScreen::splashScreen2() {
+  if (!_begun) return;
   setupDisplay();
 
   _display.setTextSize(2);
@@ -907,6 +925,7 @@ void LSScreen::splashScreen2() {
 // Return     : void
 //*********************************//
 void LSScreen::nextMenuItem() {
+  if (!_begun) return;
   if (inputIsFrozen()) return;  // A scheduled page transition owns the menu right now (wrap/stale-safe — see inputIsFrozen)
   if (!_isActive) return;  // No open menu (4.5.7 review): the serial CH,1 vector used to keep driving the STALE page after a close — deactivateMenu never nulls _currentMenuText, so a NEXT painted a cursor over the ready splash and a SELECT executed the stale page's switch (a stale RESTART_PAGE row reset the device; a stale MORE walk reached the factory reset) while CH,0:0 truthfully answered "no menu". Physical inputs were already gated on isMenuActive(); the serial vector now gets the same gate.
   if (_currentMenuText == nullptr) return;  // No menu page is registered yet (the safe-mode/error boot pages set _isActive before safeModeMenu registers state)
@@ -947,11 +966,28 @@ void LSScreen::nextMenuItem() {
 // Return     : void
 //*********************************//
 void LSScreen::selectMenuItem() {
+  if (!_begun) return;
   if (inputIsFrozen()) return;  // A scheduled page transition owns the menu right now (wrap/stale-safe — see inputIsFrozen)
   if (!_isActive) return;  // No open menu (4.5.7 review) — see nextMenuItem(): a closed menu's stale page must not execute from the serial CH,1 vector
   if (_currentMenuText == nullptr) return;  // No menu page is registered yet (the safe-mode/error boot pages set _isActive before safeModeMenu registers state)
 
   _lastActivityMillis = millis();
+
+  // Destructive safe-menu and confirmation selections require a deliberate
+  // hold. Short electrical glitches previously walked and confirmed these
+  // rows; serial CH presses carry UINT32_MAX and intentionally bypass because
+  // the wire has no hold-duration concept.
+  bool destructiveSelection =
+      (_currentMenu == SAFEMODE_MENU && (_currentSelection == 0 || _currentSelection == 1)) ||
+      (_currentMenu == RESTART_PAGE && _currentSelection == 0) ||
+      (_currentMenu == FACTORY_RESET_PAGE && _currentSelection == 0) ||
+      (_currentMenu == FACTORY_RESET_CONFIRM2_PAGE && _currentSelection == 0);
+  unsigned long confirmHoldMs = effectiveWindowMs(CONF_INPUT_WINDOW_SHORT_DEFAULT_MS) / 2;
+  if (confirmHoldMs < CONF_MENU_CONFIRM_HOLD_MIN_MS) confirmHoldMs = CONF_MENU_CONFIRM_HOLD_MIN_MS;
+  if (destructiveSelection && g_menuInputHoldMs != 0xFFFFFFFFUL && g_menuInputHoldMs < confirmHoldMs) {
+    buzzerErrorCue();
+    return;
+  }
 
   _countMenuScroll = 0;
   switch (_currentMenu) {
@@ -1516,6 +1552,7 @@ void LSScreen::selectMenuItem() {
 // Return     : void
 //*********************************//
 void LSScreen::setupDisplay() {
+  if (!_begun) return;
   _display.clearDisplay();
   _scrollOn = false;
 
@@ -1536,13 +1573,17 @@ void LSScreen::setupDisplay() {
 // Return     : void
 //*********************************//
 void LSScreen::displayMenu() {
+  if (!_begun || _currentMenuText == nullptr) return;
   setupDisplay();
 
+  const int textLength = _cursorStart + _currentMenuLength;
   for (int i = 0; i < TEXT_ROWS; i++) {
+    int textIndex = (i >= _cursorStart) ? (i + _countMenuScroll) : i;
+    if (textIndex < 0 || textIndex >= textLength) break;
     if (i >= _cursorStart) {
-      _display.print(" "), _display.println(_currentMenuText[i + _countMenuScroll]);
+      _display.print(" "), _display.println(_currentMenuText[textIndex]);
     } else {
-      _display.println(_currentMenuText[i]);
+      _display.println(_currentMenuText[textIndex]);
     }
   }
 
@@ -1567,6 +1608,7 @@ void LSScreen::displayMenu() {
 // Return     : void
 //*********************************//
 void LSScreen::displayCursor() {
+  if (!_begun) return;
 
   if (_currentSelection + _cursorStart > TEXT_ROWS - 1) {
     _cursorPos = TEXT_ROWS - 1;
@@ -1593,7 +1635,7 @@ void LSScreen::displayCursor() {
   flushDisplay();
 
   _selectedLine = _cursorStart + _currentSelection;
-  if (_currentMenuText == nullptr || _selectedLine < 0 || _selectedLine >= _currentMenuLength) {
+  if (_currentMenuText == nullptr || _selectedLine < 0 || _selectedLine >= (_cursorStart + _currentMenuLength)) {
     _selectedText = "";
   } else {
     _selectedText = _currentMenuText[_selectedLine];
@@ -1620,6 +1662,7 @@ void LSScreen::displayCursor() {
 // Return     : void
 //*********************************//
 void LSScreen::scrollLongText() {
+  if (!_begun) return;
   int minPos = -CHAR_PIXEL_WIDTH_S2 * _selectedText.length();
 
   _display.setTextSize(2);                              // 2x scale text
@@ -1659,6 +1702,7 @@ void LSScreen::scrollLongText() {
 // Return     : void
 //*********************************//
 void LSScreen::drawCentreString(const String &buf, int y) {
+  if (!_begun) return;
   int16_t x1, y1;
   uint16_t w, h;
   int x = 64;
@@ -1761,6 +1805,7 @@ void LSScreen::modeMenu(void) {
 // Return     : void
 //*********************************//
 void LSScreen::modeMenuHighlight() {
+  if (!_begun) return;
 
   _display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);  // Draw 'inverse' coloured text
 
@@ -1819,6 +1864,7 @@ void LSScreen::confirmModeChange() {
 // Return     : void
 //*********************************//
 void LSScreen::changeMode() {
+  if (!_begun) return;
   _currentMenu = CHANGING_MODE_PAGE;  // Name the dwell (4.5.7 review): the remote's post-press poll sees "Changing mode." while the 2 s window runs — the device resets at its end, so no restore is needed
   setupDisplay();
   _display.println("Changing");
@@ -2025,6 +2071,7 @@ void LSScreen::moreMenu() {
 // Return     : void
 //*********************************//
 void LSScreen::centerResetPage(void) {
+  if (!_begun) return;
   // Freeze menu input for the flow's duration (4.5.7 review): the ~2.6 s
   // timer-driven center used to leave the page live to the input poll — a
   // Next redrew the CALIB menu over the "do not move joystick"
@@ -2058,6 +2105,10 @@ void LSScreen::centerResetPage(void) {
   // Perform cursor center
   showCenterResetComplete = true;
   setJoystickInitialization(true, false);
+  if (!g_centerRunning) {
+    showCenterResetComplete = false;
+    scheduleTransition(1000, screenReturnToMenuTransitionDone);
+  }
 }
 
 //*********************************//
@@ -2071,6 +2122,7 @@ void LSScreen::centerResetPage(void) {
 //*********************************//
 void LSScreen::centerResetCompletePage(void) {
   showCenterResetComplete = false;
+  if (!_begun) return;
 
   _display.clearDisplay();
   _display.setCursor(0, 0);
@@ -2083,6 +2135,22 @@ void LSScreen::centerResetCompletePage(void) {
   scheduleTransition(2000, screenReturnToMenuTransitionDone);  // was delay(2000) — returnToMenu runs on the timer
 }
 
+void LSScreen::centerResetFailedPage(void) {
+  showCenterResetComplete = false;
+  if (!_begun) {
+    returnToMenu();
+    return;
+  }
+  setupDisplay();
+  _display.println("Center");
+  _display.println("reset");
+  _display.println("failed");
+  _display.setTextSize(1);
+  _display.println("Keep prior center");
+  flushDisplay();
+  scheduleTransition(2000, screenReturnToMenuTransitionDone);
+}
+
 //*********************************//
 // Function   : fullCalibrationPage
 //
@@ -2093,6 +2161,7 @@ void LSScreen::centerResetCompletePage(void) {
 // Return     : void
 //*********************************//
 void LSScreen::fullCalibrationPage(void) {
+  if (!_begun) return;
   _currentMenu = FULL_CALIB_PAGE;  // Name the run (4.5.7 review): CH,0:0 answers the page actually shown for a mid-run poll; a mid-run Select has no case here (dropped) until the prompts/completion re-register real menus
   // 4.5.7 review: mirror centerResetPage's sensor guard — without the
   // joystick sensor the flow's chain never runs (calibrationTimer is only
@@ -2113,6 +2182,12 @@ void LSScreen::fullCalibrationPage(void) {
   flushDisplay();
 
   setJoystickCalibration(false, false);
+  if (!g_calibrationRunning) {
+    // A center/calibration flow was already active or the timer registration
+    // failed. Do not strand the menu on a prompt whose continuation will
+    // never run.
+    scheduleTransition(1000, screenReturnToMenuTransitionDone);
+  }
 }
 
 //*********************************//
@@ -2125,6 +2200,10 @@ void LSScreen::fullCalibrationPage(void) {
 // Return     : void
 //*********************************//
 void LSScreen::fullCalibrationPrompt(int stepNum) {
+  if (!_begun) {
+    if (stepNum == 6) returnToMenu();
+    return;
+  }
   // 4.5.7 review: roll the input freeze across the run's steps (each
   // prompt re-arms a window that covers the step) — a mid-run NEXT used to
   // repaint the confirm page's selection column over the instruction
@@ -2132,7 +2211,7 @@ void LSScreen::fullCalibrationPrompt(int stepNum) {
   // schedules its own return-to-menu transition and must NOT freeze past
   // it.
   if (stepNum >= 1 && stepNum <= 5) {
-    _inputFrozenUntil = millis() + CONF_CENTER_RESET_FREEZE_MS;
+    _inputFrozenUntil = millis() + CONF_FULL_CALIB_STEP_FREEZE_MS;
   }
   setupDisplay();
 
@@ -2180,6 +2259,20 @@ void LSScreen::fullCalibrationPrompt(int stepNum) {
   }
 
   flushDisplay();
+}
+
+void LSScreen::calibrationAbortedPage(void) {
+  if (!_begun) {
+    returnToMenu();
+    return;
+  }
+  setupDisplay();
+  _display.println("Calibration");
+  _display.println("failed");
+  _display.setTextSize(1);
+  _display.println("Previous values kept");
+  flushDisplay();
+  scheduleTransition(2000, screenReturnToMenuTransitionDone);
 }
 
 // ----- MORE SETTINGS MENUS ----- //
@@ -2318,6 +2411,7 @@ void LSScreen::adjustPuffThreshMenu(void) {
 // Return     : void
 //*********************************//
 void LSScreen::fullCalibrationConfirmPage(void) {
+  if (!_begun) return;
   _currentMenu = FULL_CALIB_WARN_PAGE;  // Name the dwell (4.5.7 review): the 3 s warning window reads as itself on CH,0:0; the continuation restores FULL_CALIB_CONFIRM_PAGE
   setupDisplay();
   _display.println("Incorrect");
@@ -2383,6 +2477,7 @@ void LSScreen::factoryResetConfirm1Page(void) {
 // Return     : void
 //*********************************//
 void LSScreen::factoryResetConfirm2Page(void) {
+  if (!_begun) return;
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::factoryResetConfirm2Page()"); }
 
   _currentMenu = FACTORY_RESET_WARN_PAGE;  // Name the dwell (4.5.7 review): the 2 s warning window reads as itself on CH,0:0; the continuation restores FACTORY_RESET_CONFIRM2_PAGE
@@ -2487,6 +2582,7 @@ void LSScreen::reportMenuState() {
 // Return     : void
 //*********************************//
 void LSScreen::modeLockedPage(void) {
+  if (!_begun) return;
   // Name the page in the menu state (CH,0:0 reads it): a remote pressing
   // a locked mode row must be able to tell "refused, reason showing" apart
   // from "still on the Mode options" — this is the drift case that built
@@ -2525,6 +2621,7 @@ void LSScreen::finishModeLocked(void) {
 // Return     : void
 //*********************************//
 void LSScreen::infoMenu(void) {
+  if (!_begun) return;
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::infoPage()"); }
 
   _infoMenuText[1] = "V"+CONF_LIPSYNC_VERSION_STRING;
@@ -2555,6 +2652,7 @@ void LSScreen::infoMenu(void) {
 // Return     : void
 //*********************************//
 void LSScreen::testPage(unsigned int usbConnectDelay) {
+  if (!_begun) return;
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::testPage()"); }
 
   setupDisplay();
@@ -2594,6 +2692,7 @@ void LSScreen::testPage(unsigned int usbConnectDelay) {
 // Return     : void
 //*********************************//
 void LSScreen::noUsbPage(void) {
+  if (!_begun) return;
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::noUsbPage()"); }
 
   setupDisplay();
@@ -2621,6 +2720,7 @@ void LSScreen::noUsbPage(void) {
 // Return     : void
 //*********************************//
 void LSScreen::updateModePage(void) {
+  if (!_begun) return;
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::updateModePage()"); }
 
   setupDisplay();
@@ -2650,6 +2750,7 @@ void LSScreen::updateModePage(void) {
 // Return     : void
 //*********************************//
 void LSScreen::warningUSBDebugOn(void) {
+  if (!_begun) return;
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::warningUSBDebugOn()"); }
 
   setupDisplay();
@@ -2676,6 +2777,7 @@ void LSScreen::warningUSBDebugOn(void) {
 //*********************************//
 
 void LSScreen::restartPage() {
+  if (!_begun) return;
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::restartPage()"); }
 
   setupDisplay();
@@ -2703,6 +2805,7 @@ void LSScreen::restartPage() {
 //*********************************//
 
 void LSScreen::factoryResetPage() {
+  if (!_begun) return;
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::factoryResetPage()"); }
 
   setupDisplay();
@@ -2729,6 +2832,7 @@ void LSScreen::factoryResetPage() {
 //*********************************//
 
 void LSScreen::connectionTimingPage(unsigned long before, unsigned long after) {
+  if (!_begun) return;
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::connectionTimingPage()"); }
 
   setupDisplay();
@@ -2759,6 +2863,15 @@ void LSScreen::connectionTimingPage(unsigned long before, unsigned long after) {
 void LSScreen::safeModePage(int safeModeReason) {
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::safeModePage()"); }
   bootTrailStamp(2);  // witness v7: a safe/degraded boot's dwell window begins
+
+  if (!_begun) {
+    // A missing/failed display has no framebuffer; every Adafruit_GFX draw
+    // dereferences it. Safe mode remains fully recoverable over serial, but
+    // there is no honest visual menu to activate on a headless unit.
+    _isActive = false;
+    _currentMenuText = nullptr;
+    return;
+  }
 
   _isActive = true;
   // Freeze menu input for the dwell (the safe-mode menu registers on the
@@ -2856,8 +2969,17 @@ void LSScreen::safeModePage(int safeModeReason) {
         default:
         {
           _display.println("");
+          _safeModeReasonText = "Unknown";
+          if (_screenStateTimerId >= 0) {
+            _screenStateTimer.deleteTimer(_screenStateTimerId);
+          }
+          _screenStateTimerId = _screenStateTimer.setTimeout<LSScreen, &LSScreen::safeModeMenu>(CONF_SAFEMODE_MENU_TIMEOUT, this);
           break;
         }
+  }
+  if (_screenStateTimerId < 0) {
+    safeModeMenu();
+    return;
   }
   _display.println("");
 
@@ -2902,6 +3024,7 @@ void LSScreen::safeModeMenu(void) {
 //*********************************//
 
 void LSScreen::print4LineString(String s1, String s2, String s3, String s4) {
+  if (!_begun) return;
 
   setupDisplay();
   _display.println(s1);

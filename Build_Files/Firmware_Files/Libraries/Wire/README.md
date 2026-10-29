@@ -35,8 +35,10 @@ in older firmware.
   I2C bus-clear (I2C-bus spec 3.1.16: up to 9 SCL clocks — each verified
   to actually rise, since SCL is open-drain and a clock-stretching slave
   turns unverified clocks into silent no-ops — to release a
-  slave stuck mid-byte), and the TWIM is re-attached and re-enabled. The
-  pins' `PIN_CNF` registers are then restored to the `begin()`
+  slave stuck mid-byte), then emits an explicit STOP once the lines release;
+  all TWIM completion events are cleared before the next DMA transaction, so
+  stale events cannot make it appear to finish immediately. The TWIM is
+  re-attached and re-enabled. The pins' `PIN_CNF` registers are then restored to the `begin()`
   configuration (input, pull-up, open-drain) — the bus-clear leaves SCL as
   a GPIO output, which PSEL re-attachment makes benign, but a recovered
   bus should be bit-identical to a freshly begun one (4.3.0, roadmap

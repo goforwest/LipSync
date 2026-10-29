@@ -13,6 +13,8 @@ on:
 jobs:
   update-about:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout this repo
@@ -20,7 +22,9 @@ jobs:
 
       - name: Fetch shared About MMC section
         run: |
-          curl -s https://raw.githubusercontent.com/makersmakingchange/Makers-Making-Change/refs/heads/main/README.md -o about.md
+          curl --silent --show-error --location --fail \
+            https://raw.githubusercontent.com/makersmakingchange/Makers-Making-Change/refs/heads/main/README.md \
+            -o about.md
 
       - name: Replace About MMC section in README
         run: |
@@ -29,25 +33,27 @@ jobs:
             exit 1
           fi
 
-          awk '
-            BEGIN { inside=0 }
-            /<!-- ABOUT MMC START -->/ {
-              print
-              system("cat about.md")
-              inside=1
-              next
-            }
-            /<!-- ABOUT MMC END -->/ {
-              inside=0
-              print
-              next
-            }
-            inside == 0 {
-              print
-            }
-          ' README.md > temp.md
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
 
-          mv temp.md README.md
+          start = '<!-- ABOUT MMC START -->'
+          end = '<!-- ABOUT MMC END -->'
+          readme = Path('README.md').read_text()
+          shared = Path('about.md').read_text()
+
+          if readme.count(start) != 1 or readme.count(end) != 1:
+              raise SystemExit('README.md must contain exactly one About MMC marker pair')
+
+          match = re.search(r'<!-- ABOUT MMC START\s*-->(.*?)<!-- ABOUT MMC END\s*-->', shared, re.S)
+          if not match or not match.group(1).strip():
+              raise SystemExit('Downloaded README did not contain a non-empty About MMC section')
+
+          before, rest = readme.split(start, 1)
+          _, after = rest.split(end, 1)
+          replacement = f'{start}\n{match.group(1).strip()}\n{end}'
+          Path('README.md').write_text(before + replacement + after)
+          PY
 
       - name: Commit and push changes
         run: |

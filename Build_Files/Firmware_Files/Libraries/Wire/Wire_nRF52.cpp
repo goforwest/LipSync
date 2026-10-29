@@ -128,6 +128,11 @@ static void wireRecoverBus(NRF_TWIM_Type * twim, uint32_t pinSDA, uint32_t pinSC
   twim->EVENTS_STOPPED = 0x0UL;
   twim->EVENTS_ERROR = 0x0UL;
   twim->ERRORSRC = twim->ERRORSRC;  // error sources are write-1-to-clear
+  twim->EVENTS_RXSTARTED = 0x0UL;
+  twim->EVENTS_TXSTARTED = 0x0UL;
+  twim->EVENTS_LASTRX = 0x0UL;
+  twim->EVENTS_LASTTX = 0x0UL;
+  twim->EVENTS_SUSPENDED = 0x0UL;
 
   // Release the pins and disable the peripheral so they can be driven as GPIO
   twim->ENABLE = (TWIM_ENABLE_ENABLE_Disabled << TWIM_ENABLE_ENABLE_Pos);
@@ -160,10 +165,33 @@ static void wireRecoverBus(NRF_TWIM_Type * twim, uint32_t pinSDA, uint32_t pinSC
     if (nrf_gpio_pin_read(pinSDA)) { break; }  // SDA released — the bus is free
   }
 
+  // Finish with an explicit STOP (SDA low -> high while SCL is high). Clock
+  // pulses alone can release a slave but leave it between protocol states;
+  // STOP returns compliant targets to idle before TWIM takes the pins back.
+  if (nrf_gpio_pin_read(pinSCL))
+  {
+    nrf_gpio_pin_clear(pinSDA);
+    nrf_gpio_cfg(pinSDA, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_CONNECT,
+                 NRF_GPIO_PIN_PULLUP, NRF_GPIO_PIN_S0D1, NRF_GPIO_PIN_NOSENSE);
+    delayMicroseconds(5);
+    nrf_gpio_pin_set(pinSDA);
+    delayMicroseconds(5);
+  }
+
   // Re-attach and re-enable the TWIM for the next transaction
   twim->PSEL.SCL = pinSCL;
   twim->PSEL.SDA = pinSDA;
   twim->ENABLE = (TWIM_ENABLE_ENABLE_Enabled << TWIM_ENABLE_ENABLE_Pos);
+
+  // No stale completion event may satisfy the next transaction before its
+  // DMA task has actually run.
+  twim->EVENTS_STOPPED = 0x0UL;
+  twim->EVENTS_ERROR = 0x0UL;
+  twim->EVENTS_RXSTARTED = 0x0UL;
+  twim->EVENTS_TXSTARTED = 0x0UL;
+  twim->EVENTS_LASTRX = 0x0UL;
+  twim->EVENTS_LASTTX = 0x0UL;
+  twim->EVENTS_SUSPENDED = 0x0UL;
 
   // Restore the begin()-equivalent pin configuration (roadmap item 4): the
   // bus-clear above left SCL configured as a GPIO output (and SDA as a plain

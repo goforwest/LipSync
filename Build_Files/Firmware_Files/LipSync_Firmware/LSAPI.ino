@@ -36,6 +36,7 @@ _functionList getOperatingModeFunction =          {"OM", "0", "0", &getOperating
 _functionList setOperatingModeFunction =          {"OM", "1", "",  &setOperatingMode};
 _functionList getCommunicationModeFunction =      {"CM", "0", "0", &getCommunicationMode};
 _functionList setCommunicationModeFunction =      {"CM", "1", "",  &setCommunicationMode};
+_functionList setModePresetFunction =             {"MP", "1", "",  &setModePreset};
 
 _functionList getJoystickInitializationFunction = {"IN", "0", "0", &getJoystickInitialization};
 _functionList setJoystickInitializationFunction = {"IN", "1", "1", &setJoystickInitialization};
@@ -121,6 +122,7 @@ _functionList apiFunction[] = { //Let compiler determine number of functions
   setOperatingModeFunction,
   getCommunicationModeFunction,
   setCommunicationModeFunction,
+  setModePresetFunction,
   getJoystickInitializationFunction,
   setJoystickInitializationFunction,
   getJoystickCalibrationFunction,
@@ -204,10 +206,73 @@ const size_t SERIAL_RX_MAX_LEN = 32;              // Longest legal command is 11
 String serialRxBuf = "";
 unsigned long serialRxBufLastByteMs = 0;
 
+// Non-blocking response queue. Adafruit_USBD_CDC::write() spins/yields while
+// DTR is asserted and its TX FIFO is full; a host that opens the port but
+// stops reading could therefore freeze the assistive-device loop indefinitely.
+// Canonical API/MANUAL/DEBUG lines enqueue here and loop() drains at most the
+// FIFO space currently available. On overflow, oldest complete line remnants
+// are discarded so the newest command response wins over stale debug output.
+const size_t SERIAL_TX_BUFFER_SIZE = 4096;
+char serialTxBuffer[SERIAL_TX_BUFFER_SIZE];
+size_t serialTxHead = 0;
+size_t serialTxTail = 0;
+size_t serialTxCount = 0;
+
+void serialTxClear() {
+  serialTxHead = 0;
+  serialTxTail = 0;
+  serialTxCount = 0;
+}
+
+void serialTxDropOldestLine() {
+  while (serialTxCount > 0) {
+    char c = serialTxBuffer[serialTxTail];
+    serialTxTail = (serialTxTail + 1) % SERIAL_TX_BUFFER_SIZE;
+    serialTxCount--;
+    if (c == '\n') break;
+  }
+}
+
+void serialTxService() {
+  if (serialTxCount == 0 || !Serial) return;
+  int available = Serial.availableForWrite();
+  if (available <= 0) return;
+  size_t contiguous = min(serialTxCount, SERIAL_TX_BUFFER_SIZE - serialTxTail);
+  size_t toWrite = min(contiguous, (size_t)available);
+  size_t written = Serial.write((const uint8_t*)&serialTxBuffer[serialTxTail], toWrite);
+  serialTxTail = (serialTxTail + written) % SERIAL_TX_BUFFER_SIZE;
+  serialTxCount -= written;
+}
+
+bool serialTxEnqueueLine(const String &line) {
+  // Preserve the stock CDC behavior: output generated before DTR opens is
+  // discarded, not replayed as stale unsolicited traffic on the next session.
+  if (!Serial) return false;
+  size_t needed = line.length() + 1;
+  if (needed >= SERIAL_TX_BUFFER_SIZE) return false;
+  while ((SERIAL_TX_BUFFER_SIZE - serialTxCount) < needed) {
+    serialTxDropOldestLine();
+  }
+  for (size_t i = 0; i < line.length(); i++) {
+    serialTxBuffer[serialTxHead] = line.charAt(i);
+    serialTxHead = (serialTxHead + 1) % SERIAL_TX_BUFFER_SIZE;
+    serialTxCount++;
+  }
+  serialTxBuffer[serialTxHead] = '\n';
+  serialTxHead = (serialTxHead + 1) % SERIAL_TX_BUFFER_SIZE;
+  serialTxCount++;
+  serialTxService();
+  return true;
+}
+
 // Process one delimited message. Returns the settings-mode flag for the
 // caller to carry across loop iterations.
 bool processSerialMessage(String commandString, bool settingsFlag) {
   commandString.trim();  // Tolerate CR/LF line endings and stray whitespace
+  // A newly received request takes priority over stale queued DEBUG/MANUAL
+  // output. The host protocol is request/response sequential, so no valid
+  // command response is pending when the next request arrives.
+  serialTxClear();
 
   if (settingsFlag == false && commandString == "SETTINGS") {
     // SETTINGS received
@@ -321,7 +386,14 @@ void performCommand(String inputString) {
         inputCodeString == apiFunction[apiIndex].code) {
 
       // Matching Command String found
-      if (!isValidCommandParameter( inputParameterString )) {
+      // Only the four analog settings accept a decimal point. Every other
+      // endpoint is integer-valued; accepting "1.9" and then calling toInt()
+      // silently executed it as 1 instead of rejecting malformed input.
+      bool floatParameter = (inputCodeString == "1") &&
+                            (inputEndpointString == "IZ" || inputEndpointString == "OZ" ||
+                             inputEndpointString == "ST" || inputEndpointString == "PT");
+      if (!isValidCommandParameter(inputParameterString) ||
+          (!floatParameter && inputParameterString.indexOf('.') >= 0)) {
         printResponseInt(true, true, false, 2, inputString, false, 0);
       }
       else if (inputParameterString == apiFunction[apiIndex].parameter || apiFunction[apiIndex].parameter == "") {
@@ -408,20 +480,24 @@ boolean isStrNumber(String str) {
   if (str.length() == 0) return false;
   unsigned int startIndex = 0;
   boolean hasDecimal = false;
+  boolean hasDigit = false;
   if (str.charAt(0) == '-' || str.charAt(0) == '+') {
     startIndex = 1;
     if (str.length() == 1) return false;  // A bare sign is not a number
   }
   for (unsigned int i = startIndex; i < str.length(); i++) {
     char c = str.charAt(i);
-    if (isDigit(c)) continue;
+    if (isDigit(c)) {
+      hasDigit = true;
+      continue;
+    }
     if (c == '.' && !hasDecimal) {
       hasDecimal = true;
       continue;
     }
     return false;  // Non numeric character detected
   }
-  return true;  // Valid numeric grammar
+  return hasDigit;  // A decimal point (with or without a sign) is not a number
 }
 
 //***CHECK IF CHAR IS A VALID DELIMITER FUNCTION***//
@@ -460,10 +536,17 @@ void getModelNumber(bool responseEnabled, bool apiEnabled) {
   String commandKey = "MN";
   int tempModelNumber = mem.readInt(CONF_SETTINGS_FILE, commandKey);
   if (tempModelNumber != CONF_LIPSYNC_MODEL) {                          // If the previous firmware was different model then reset the settings
-    resetSettings(false, false);
+    // MN=0 is the compiled fresh-file placeholder, not another model. Only
+    // reset a successfully read, genuinely different model; a transient
+    // failed read also converts to 0 and must never erase valid settings.
+    if (mem.isLastReadOk() && tempModelNumber != 0) {
+      resetSettings(false, false);
+    }
 
     tempModelNumber = CONF_LIPSYNC_MODEL;                               // And store the model number
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempModelNumber);
+    if (mem.isLastReadOk()) {
+      mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempModelNumber);
+    }
   }
   printResponseInt(responseEnabled, apiEnabled, true, 0, "MN,0", true, tempModelNumber);
 
@@ -1067,11 +1150,10 @@ void setJoystickInitialization(bool responseEnabled, bool apiEnabled) {
   // final-run check (which keys the flash persistence AND the CA,n ack
   // line) read the center's 5-run timer, never matched the calibration's
   // 10th run, and that corner silently never persisted while step 6 still
-  // reported "calibrated". Refuse honestly (the calibration's own internal
-  // step-5 center bypasses via g_calibrationCenterStep; overlapping
-  // CENTERS stay allowed by design — their completions are driven by their
-  // own pool slots, so only LED cosmetics share the stale id).
-  if (g_calibrationRunning && !g_calibrationCenterStep) {
+  // reported "calibrated". Refuse honestly; the calibration's own internal
+  // step-5 center bypasses via g_calibrationCenterStep. Center flows are now
+  // serialized too because they share the sample buffer and timer-id slots.
+  if (g_centerRunning || (g_calibrationRunning && !g_calibrationCenterStep)) {
     printResponseInt(responseEnabled, apiEnabled, false, 3, "IN,1", true, 1);
     return;
   }
@@ -1081,10 +1163,11 @@ void setJoystickInitialization(bool responseEnabled, bool apiEnabled) {
   // the calibration's internal step 5) prints MANUAL instead, so a boot
   // straggler can never falsely resolve a host's pending IN,1:1 waiter.
   // 4.5.4: the initiator rides the flow's own timer payload
-  // (CONF_CENTER_INIT_API_FLAG) instead of a shared global, so overlapping
-  // centers each carry their own initiator through their own chain.
+  // (CONF_CENTER_INIT_API_FLAG) instead of a shared global, so every accepted
+  // flow carries its own initiator structurally.
   int stepPayload = apiEnabled ? CONF_CENTER_INIT_API_FLAG : 0;
   canOutputAction = false;
+  g_centerRunning = true;
   calibrationTimerId[0] = calibrationTimer.setTimeout(CONF_JOY_INIT_START_DELAY, performJoystickCenter, (int *)stepPayload);
   if (calibrationTimerId[0] < 0) {
     // Registration refused (a loud, counted LSTimer failure): the flow never
@@ -1093,6 +1176,13 @@ void setJoystickInitialization(bool responseEnabled, bool apiEnabled) {
     // FAIL,3 so the host's IN,1 waiter resolves honestly instead of timing
     // out on a center that will never run.
     canOutputAction = true;
+    g_centerRunning = false;
+    g_resetCenterComplete = true;
+    if (screen.showCenterResetComplete) screen.centerResetFailedPage();
+    if (g_startupCenterReset) {
+      g_startupCenterReset = false;
+      readyToUse();
+    }
     printResponseInt(responseEnabled, apiEnabled, false, 3, "IN,1", true, 1);
   }
 }
@@ -1148,6 +1238,7 @@ void getJoystickCalibration(bool responseEnabled, bool apiEnabled) {
   }
   if (!calibrationInFlight) {
     js.setMinimumRadius();  // Update the minimum cursor operating radius
+    js.reprocessLastReading();  // A stationary stick must reflect reloaded corners immediately
   }
   printResponseFloatPointArray(responseEnabled, apiEnabled, true, 0, "CA,0", true, "", 5, ',', calibrationPointArray);
 
@@ -1201,7 +1292,7 @@ void setJoystickCalibration(bool responseEnabled, bool apiEnabled) {
   // mid-run, register a second concurrent chain, interleave two corner
   // sequences on the wire, and let last-writer-wins persistence fight over
   // the shared corner slots. Refuse honestly; the running chain finishes.
-  if (g_calibrationRunning) {
+  if (g_calibrationRunning || g_centerRunning) {
     printResponseInt(responseEnabled, apiEnabled, false, 3, "CA,1", true, 1);
     return;
   }
@@ -1210,7 +1301,6 @@ void setJoystickCalibration(bool responseEnabled, bool apiEnabled) {
   // immediate ack — a host retry inside that window used to pass the
   // step-0-set flag, js.clear() the accumulating state, and double-chain.
   g_calibrationRunning = true;
-  js.clear();                                                                                           // Clear previous calibration values
   // The initiator rides the chain's payload (CONF_CALIB_API_FLAG): the
   // per-corner lines print SUCCESS only for a host-requested calibration
   // (CA,1:1) and MANUAL for a Hub-menu one — the 4.5.2 initiator contract.
@@ -1230,7 +1320,8 @@ void setJoystickCalibration(bool responseEnabled, bool apiEnabled) {
     // waiter resolves honestly instead of timing out on a calibration that
     // will never run.
     canOutputAction = true;
-    screen.calibrationEndsByClosingMenu(false);
+    g_calibrationRunning = false;
+    screen.calibrationAbortedPage();
     printResponseInt(responseEnabled, apiEnabled, false, 3, "CA,1", true, 1);
   }
 }
@@ -1253,6 +1344,35 @@ void setJoystickCalibration(bool responseEnabled, bool apiEnabled, String option
 }
 
 
+// Load and sanitize the deadzone pair as one invariant. Both values must be
+// finite, strictly inside (0,1), and inner must stay below outer; otherwise
+// apply and persist the known-safe pair together. The old independent checks
+// accepted inner >= outer, which reaches mapRoundInt with a zero/reversed
+// input span, and the setters accepted 1.0 even though the next GET silently
+// reset it.
+void loadJoystickDeadzonePair(float &innerDeadzone, float &outerDeadzone) {
+  JsonObject settings = mem.readObject(CONF_SETTINGS_FILE);
+  innerDeadzone = settings["IZ"].as<float>();
+  outerDeadzone = settings["OZ"].as<float>();
+
+  bool valid = mem.isLastReadOk() &&
+               isfinite(innerDeadzone) && isfinite(outerDeadzone) &&
+               innerDeadzone > CONF_JOY_DEADZONE_MIN &&
+               innerDeadzone < CONF_JOY_DEADZONE_MAX &&
+               outerDeadzone > CONF_JOY_DEADZONE_MIN &&
+               outerDeadzone < CONF_JOY_DEADZONE_MAX &&
+               innerDeadzone < outerDeadzone;
+  if (!valid) {
+    innerDeadzone = CONF_JOY_DEADZONE_INNER_DEFAULT;
+    outerDeadzone = CONF_JOY_DEADZONE_OUTER_DEFAULT;
+    if (!settings.isNull()) {
+      settings["IZ"] = innerDeadzone;
+      settings["OZ"] = outerDeadzone;
+      mem.writeObject(CONF_SETTINGS_FILE, "IZ/OZ", settings);
+    }
+  }
+}
+
 //*** GET JOYSTICK DEADZONE FUNCTION***//
 // Function   : getJoystickInnerDeadzone
 //
@@ -1266,15 +1386,12 @@ void setJoystickCalibration(bool responseEnabled, bool apiEnabled, String option
 // Return     : void
 //*********************************//
 float getJoystickInnerDeadzone(bool responseEnabled, bool apiEnabled) {
-  String deadzoneCommand = "IZ";
   float tempDeadzone;
-  tempDeadzone = mem.readFloat(CONF_SETTINGS_FILE, deadzoneCommand);
-
-  if ((tempDeadzone <= CONF_JOY_DEADZONE_MIN) || (tempDeadzone >= CONF_JOY_DEADZONE_MAX)) {
-    tempDeadzone = CONF_JOY_DEADZONE_INNER_DEFAULT;
-    mem.writeFloat(CONF_SETTINGS_FILE, deadzoneCommand, tempDeadzone);
-  }
+  float tempOuterDeadzone;
+  loadJoystickDeadzonePair(tempDeadzone, tempOuterDeadzone);
+  (void)tempOuterDeadzone;
   js.setInnerDeadzone(true, tempDeadzone);
+  js.reprocessLastReading();
   printResponseFloat(responseEnabled, apiEnabled, true, 0, "IZ,0", true, tempDeadzone);
   return tempDeadzone;
 }
@@ -1310,11 +1427,19 @@ void getJoystickInnerDeadzone(bool responseEnabled, bool apiEnabled, String opti
 //*********************************//
 void setJoystickInnerDeadzone(bool responseEnabled, bool apiEnabled, float inputDeadzone) {
   String deadzoneCommand = "IZ";
-  if (((inputDeadzone > CONF_JOY_DEADZONE_MIN) && (inputDeadzone <= CONF_JOY_DEADZONE_MAX))
+  float currentInnerDeadzone;
+  float currentOuterDeadzone;
+  loadJoystickDeadzonePair(currentInnerDeadzone, currentOuterDeadzone);
+  (void)currentInnerDeadzone;
+  if ((isfinite(inputDeadzone) &&
+       (inputDeadzone > CONF_JOY_DEADZONE_MIN) &&
+       (inputDeadzone < CONF_JOY_DEADZONE_MAX) &&
+       (inputDeadzone < currentOuterDeadzone))
       && mem.writeFloat(CONF_SETTINGS_FILE, deadzoneCommand, inputDeadzone)) {
     // The store and the live value only land together: a refused store
     // (settings budget, LSMemory) falls to the FAIL,3 branch below.
     js.setInnerDeadzone(true, inputDeadzone);
+    js.reprocessLastReading();
     printResponseFloat(responseEnabled, apiEnabled, true, 0, "IZ,1", true, inputDeadzone);
   }
   else {
@@ -1350,15 +1475,12 @@ void setJoystickInnerDeadzone(bool responseEnabled, bool apiEnabled, String opti
 // Return     : void
 //*********************************//
 float getJoystickOuterDeadzone(bool responseEnabled, bool apiEnabled) {
-  String outerDeadzoneCommand = "OZ";
+  float tempInnerDeadzone;
   float tempOuterDeadzone;
-  tempOuterDeadzone = mem.readFloat(CONF_SETTINGS_FILE, outerDeadzoneCommand);
-
-  if ((tempOuterDeadzone <= CONF_JOY_DEADZONE_MIN) || (tempOuterDeadzone >= CONF_JOY_DEADZONE_MAX)) {
-    tempOuterDeadzone = CONF_JOY_DEADZONE_OUTER_DEFAULT;
-    mem.writeFloat(CONF_SETTINGS_FILE, outerDeadzoneCommand, tempOuterDeadzone);
-  }
+  loadJoystickDeadzonePair(tempInnerDeadzone, tempOuterDeadzone);
+  (void)tempInnerDeadzone;
   js.setOuterDeadzone(true, tempOuterDeadzone);
+  js.reprocessLastReading();
   printResponseFloat(responseEnabled, apiEnabled, true, 0, "OZ,0", true, tempOuterDeadzone);
   return tempOuterDeadzone;
 }
@@ -1395,10 +1517,18 @@ void getJoystickOuterDeadzone(bool responseEnabled, bool apiEnabled, String opti
 //*********************************//
 void setJoystickOuterDeadzone(bool responseEnabled, bool apiEnabled, float inputUpperDeadZone) {
   String outerDeadzoneCommand = "OZ";
-  if (((inputUpperDeadZone > CONF_JOY_DEADZONE_MIN) && (inputUpperDeadZone <= CONF_JOY_DEADZONE_MAX))
+  float currentInnerDeadzone;
+  float currentOuterDeadzone;
+  loadJoystickDeadzonePair(currentInnerDeadzone, currentOuterDeadzone);
+  (void)currentOuterDeadzone;
+  if ((isfinite(inputUpperDeadZone) &&
+       (inputUpperDeadZone > CONF_JOY_DEADZONE_MIN) &&
+       (inputUpperDeadZone < CONF_JOY_DEADZONE_MAX) &&
+       (inputUpperDeadZone > currentInnerDeadzone))
       && mem.writeFloat(CONF_SETTINGS_FILE, outerDeadzoneCommand, inputUpperDeadZone)) {
     // See setJoystickInnerDeadzone: a refused store must not report SUCCESS.
     js.setOuterDeadzone(true, inputUpperDeadZone);
+    js.reprocessLastReading();
     printResponseFloat(responseEnabled, apiEnabled, true, 0, "OZ,1", true, inputUpperDeadZone);
   }
   else {
@@ -1643,7 +1773,9 @@ float getSipPressureThreshold(bool responseEnabled, bool apiEnabled) {
   float tempSipThreshold;
   tempSipThreshold = mem.readFloat(CONF_SETTINGS_FILE, commandKey);
 
-  if ((tempSipThreshold <= 0.0) || (tempSipThreshold >= CONF_PRESS_MAX_THRESHOLD)) {
+  if (!isfinite(tempSipThreshold) ||
+      (tempSipThreshold < CONF_PRESS_MIN_THRESHOLD) ||
+      (tempSipThreshold >= CONF_PRESS_MAX_THRESHOLD)) {
     tempSipThreshold = CONF_SIP_THRESHOLD;
     mem.writeFloat(CONF_SETTINGS_FILE, commandKey, tempSipThreshold);
   }
@@ -1686,7 +1818,7 @@ void getSipPressureThreshold(bool responseEnabled, bool apiEnabled, String optio
 void setSipPressureThreshold(bool responseEnabled, bool apiEnabled, float inputSipThreshold) {
   String commandKey = "ST";
 
-  if ((inputSipThreshold >= CONF_PRESS_MIN_THRESHOLD && inputSipThreshold < CONF_PRESS_MAX_THRESHOLD)
+  if ((isfinite(inputSipThreshold) && inputSipThreshold >= CONF_PRESS_MIN_THRESHOLD && inputSipThreshold < CONF_PRESS_MAX_THRESHOLD)
       && mem.writeFloat(CONF_SETTINGS_FILE, commandKey, inputSipThreshold)) {
     // A refused store (settings budget, LSMemory) reports FAIL,3 — a
     // SUCCESS here would tell the app a threshold the device did not keep.
@@ -1732,7 +1864,9 @@ float getPuffPressureThreshold(bool responseEnabled, bool apiEnabled) {
   float tempPuffThreshold;
   tempPuffThreshold = mem.readFloat(CONF_SETTINGS_FILE, commandKey);
 
-  if ((tempPuffThreshold <= 0.0) || (tempPuffThreshold >= CONF_PRESS_MAX_THRESHOLD)) {
+  if (!isfinite(tempPuffThreshold) ||
+      (tempPuffThreshold < CONF_PRESS_MIN_THRESHOLD) ||
+      (tempPuffThreshold >= CONF_PRESS_MAX_THRESHOLD)) {
     tempPuffThreshold = CONF_PUFF_THRESHOLD;
     mem.writeFloat(CONF_SETTINGS_FILE, commandKey, tempPuffThreshold);
   }
@@ -1777,7 +1911,7 @@ void getPuffPressureThreshold(bool responseEnabled, bool apiEnabled, String opti
 void setPuffPressureThreshold(bool responseEnabled, bool apiEnabled, float inputPuffThreshold) {
   String commandKey = "PT";
 
-  if ((inputPuffThreshold >= CONF_PRESS_MIN_THRESHOLD && inputPuffThreshold < CONF_PRESS_MAX_THRESHOLD)
+  if ((isfinite(inputPuffThreshold) && inputPuffThreshold >= CONF_PRESS_MIN_THRESHOLD && inputPuffThreshold < CONF_PRESS_MAX_THRESHOLD)
       && mem.writeFloat(CONF_SETTINGS_FILE, commandKey, inputPuffThreshold)) {
     // See setSipPressureThreshold: a refused store reports FAIL,3.
     ps.setPuffThreshold(inputPuffThreshold);
@@ -2092,6 +2226,57 @@ void setCommunicationMode(bool responseEnabled, bool apiEnabled, String optional
   setCommunicationMode(responseEnabled, apiEnabled, optionalParameter.toInt());
 }
 
+bool storeModePair(int operatingMode, int communicationMode) {
+  if (operatingMode < CONF_OPERATING_MODE_MIN ||
+      operatingMode > CONF_OPERATING_MODE_SETTABLE_MAX ||
+      communicationMode < CONF_COM_MODE_MIN ||
+      communicationMode > CONF_COM_MODE_MAX ||
+      (operatingMode == CONF_OPERATING_MODE_GAMEPAD && communicationMode == CONF_COM_MODE_BLE)) {
+    return false;
+  }
+  JsonObject settings = mem.readObject(CONF_SETTINGS_FILE);
+  if (!mem.isLastReadOk() || settings.isNull()) return false;
+  settings["OM"] = operatingMode;
+  settings["CM"] = communicationMode;
+  return mem.writeObject(CONF_SETTINGS_FILE, "OM/CM", settings);
+}
+
+void setModePreset(bool responseEnabled, bool apiEnabled, int inputPreset) {
+  int targetOperatingMode = CONF_OPERATING_MODE_NONE;
+  int targetCommunicationMode = CONF_COM_MODE_NONE;
+  switch (inputPreset) {
+    case CONF_MODE_PRESET_MOUSE_USB:
+      targetOperatingMode = CONF_OPERATING_MODE_MOUSE;
+      targetCommunicationMode = CONF_COM_MODE_USB;
+      break;
+    case CONF_MODE_PRESET_MOUSE_BLE:
+      targetOperatingMode = CONF_OPERATING_MODE_MOUSE;
+      targetCommunicationMode = CONF_COM_MODE_BLE;
+      break;
+    case CONF_MODE_PRESET_GAMEPAD_USB:
+      targetOperatingMode = CONF_OPERATING_MODE_GAMEPAD;
+      targetCommunicationMode = CONF_COM_MODE_USB;
+      break;
+    default:
+      printResponseInt(responseEnabled, apiEnabled, false, 3, "MP,1", true, inputPreset);
+      return;
+  }
+
+  const bool changed = (g_operatingMode != targetOperatingMode) ||
+                       (g_comMode != targetCommunicationMode);
+  if (!storeModePair(targetOperatingMode, targetCommunicationMode)) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "MP,1", true, inputPreset);
+    return;
+  }
+
+  printResponseInt(responseEnabled, apiEnabled, true, 0, "MP,1", true, inputPreset);
+  if (changed) softwareReset();
+}
+
+void setModePreset(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  setModePreset(responseEnabled, apiEnabled, optionalParameter.toInt());
+}
+
 
 //***TOGGLE COMMUNICATION MODE FUNCTION***//
 // Function   : toggleCommunicationMode
@@ -2282,6 +2467,7 @@ void setLightMode(bool responseEnabled, bool apiEnabled, int inputLightMode) {
     // See setSoundMode: a refused store reports FAIL,3.
     g_lightMode = inputLightMode;
     led.setLightModeLevel(inputLightMode);
+    setLedDefault();  // Apply OFF/status changes immediately, not on a later unrelated event
     printResponseInt(responseEnabled, apiEnabled, true, 0, "LM,1", true, inputLightMode);
   }
   else {
@@ -2663,8 +2849,13 @@ int getInputWindowShort(bool responseEnabled, bool apiEnabled) {
   int tempWindow = CONF_INPUT_WINDOW_SHORT_DEFAULT_MS;
   if (CONF_API_ENABLED) {
     int stored = mem.readInt(CONF_SETTINGS_FILE, commandKey);
-    if (stored > 0) tempWindow = stored;
+    if (stored < 0) {
+      stored = 0;
+      mem.writeInt(CONF_SETTINGS_FILE, commandKey, 0);
+    }
     g_inputWindowShortMs = (stored > 0) ? (unsigned long)stored : 0;
+    sanitizeInputWindows();
+    tempWindow = (g_inputWindowShortMs > 0) ? (int)g_inputWindowShortMs : CONF_INPUT_WINDOW_SHORT_DEFAULT_MS;
   }
   printResponseInt(responseEnabled, apiEnabled, true, 0, "WS,0", true, tempWindow);
   return tempWindow;
@@ -2724,8 +2915,13 @@ int getInputWindowLong(bool responseEnabled, bool apiEnabled) {
   int tempWindow = CONF_INPUT_WINDOW_LONG_DEFAULT_MS;
   if (CONF_API_ENABLED) {
     int stored = mem.readInt(CONF_SETTINGS_FILE, commandKey);
-    if (stored > 0) tempWindow = stored;
+    if (stored < 0) {
+      stored = 0;
+      mem.writeInt(CONF_SETTINGS_FILE, commandKey, 0);
+    }
     g_inputWindowLongMs = (stored > 0) ? (unsigned long)stored : 0;
+    sanitizeInputWindows();
+    tempWindow = (g_inputWindowLongMs > 0) ? (int)g_inputWindowLongMs : CONF_INPUT_WINDOW_LONG_DEFAULT_MS;
   }
   printResponseInt(responseEnabled, apiEnabled, true, 0, "WL,0", true, tempWindow);
   return tempWindow;
@@ -2781,8 +2977,13 @@ int getInputWindowMax(bool responseEnabled, bool apiEnabled) {
   int tempWindow = CONF_INPUT_WINDOW_MAX_DEFAULT_MS;
   if (CONF_API_ENABLED) {
     int stored = mem.readInt(CONF_SETTINGS_FILE, commandKey);
-    if (stored > 0) tempWindow = stored;
+    if (stored < 0) {
+      stored = 0;
+      mem.writeInt(CONF_SETTINGS_FILE, commandKey, 0);
+    }
     g_inputWindowMaxMs = (stored > 0) ? (unsigned long)stored : 0;
+    sanitizeInputWindows();
+    tempWindow = (g_inputWindowMaxMs > 0) ? (int)g_inputWindowMaxMs : CONF_INPUT_WINDOW_MAX_DEFAULT_MS;
   }
   printResponseInt(responseEnabled, apiEnabled, true, 0, "WM,0", true, tempWindow);
   return tempWindow;
@@ -3375,8 +3576,15 @@ void softReset(bool responseEnabled, bool apiEnabled, String optionalParameter) 
 //
 // Return     : void
 //***************************//
-void resetSettings(bool responseEnabled, bool apiEnabled) {
-  printResponseInt(responseEnabled, apiEnabled, true, 0, "RS,1", true, 0);
+bool resetSettings(bool responseEnabled, bool apiEnabled) {
+  // Reset only the settings document (unlike FR, this does not format the
+  // whole filesystem). One atomic replacement avoids the factory-reset
+  // chain's many intermediate states. Internal migration callers pass
+  // apiEnabled=false and continue booting; the serial wrapper below resets
+  // after the acknowledgement so every live subsystem reloads the defaults.
+  bool resetOk = mem.writeAll(CONF_SETTINGS_FILE, CONF_SETTINGS_JSON);
+  printResponseInt(responseEnabled, apiEnabled, resetOk, resetOk ? 0 : 3, "RS,1", true, resetOk ? 0 : 1);
+  return resetOk;
 }
 
 //***RESET SETTINGS API FUNCTION***//
@@ -3393,7 +3601,9 @@ void resetSettings(bool responseEnabled, bool apiEnabled) {
 // Return     : void
 void resetSettings(bool responseEnabled, bool apiEnabled, String optionalParameter) {
   if (optionalParameter.length() == 1 && optionalParameter.toInt() == 1) {
-    resetSettings(responseEnabled, apiEnabled);
+    if (resetSettings(responseEnabled, apiEnabled) && apiEnabled) {
+      softwareReset();
+    }
   }
 }
 
@@ -3426,55 +3636,16 @@ void doFactoryReset(bool responseEnabled, bool apiEnabled) {
   performLedAction(ledCurrentState);
 
   // Factory reset process 
-  Serial.println("FACTORY RESET TRIGGERED");
+  if (USB_DEBUG) Serial.println("FACTORY RESET TRIGGERED");
   
-  resetMemory();  // Format and reinitialize internal file system 
-
-  // (4.5.8: the com-mode default is applied by the ALIGNED pair below — the
-  // bare call that used to live here fired setCommunicationMode's reset
-  // mid-chain from a CM=2 state.)
-  // 4.5.7 review: with the reset-on-change contract live again, a factory
-  // reset from gamepad/safe mode used to fire changeOperatingMode's
-  // softwareReset at THIS step — aborting the chain before the FR,1 ack and
-  // most of the default-writes (the app's FR waiter timed out). Align the
-  // live mode first so the setter's comparison sees no change; the chain
-  // ends in its own deliberate softwareReset.
-  g_operatingMode = CONF_OPERATING_MODE_DEFAULT;
-  setOperatingMode(false, false, CONF_OPERATING_MODE_DEFAULT);
-  // Same alignment for the com mode (4.5.8): setCommunicationMode now also
-  // resets on change — without the align, a factory reset from a CM=2 state
-  // aborted here.
-  g_comMode = CONF_COM_MODE_DEFAULT;
-  setCommunicationMode(false, false, CONF_COM_MODE_DEFAULT);
-  setDebugMode(false, false, CONF_DEBUG_MODE_DEFAULT);
-  setJoystickInnerDeadzone(false, false, CONF_JOY_DEADZONE_INNER_DEFAULT);
-  setJoystickOuterDeadzone(false, false, CONF_JOY_DEADZONE_OUTER_DEFAULT);
-  setSipPressureThreshold(false, false, CONF_SIP_THRESHOLD);
-  setPuffPressureThreshold(false, false, CONF_PUFF_THRESHOLD);
-  setCursorSpeed(false, false, CONF_JOY_CURSOR_SPEED_LEVEL_DEFAULT);  
-  setScrollLevel(false, false, CONF_SCROLL_LEVEL_DEFAULT);
-  setLightBrightnessLevel(false, false, CONF_LED_BRIGHTNESS_LEVEL_DEFAULT);
-  setJoystickAcceleration(false, false, CONF_JOY_ACCELERATION_LEVEL_DEFAULT);
-  setSapDisabled(false, false, CONF_SAP_DISABLED_DEFAULT);          // Restrictions reset to the
-  setMenuButtonsOnly(false, false, CONF_MENU_BUTTONS_ONLY_DEFAULT);  // unrestricted defaults —
-  setModeLocked(false, false, CONF_MODE_LOCK_DEFAULT);              // a factory reset can never
-  setCursorHoldDuringSap(false, false, CONF_CURSOR_HOLD_DEFAULT);   // lock a device out
-  setInputWindowShort(false, false, 0);   // Timing windows reset to the
-  setInputWindowLong(false, false, 0);    // compiled factory feel
-  setInputWindowMax(false, false, 0);
-  setSwitchAction(false, false, "SA", 0);  // Switch action remaps reset
-  setSwitchAction(false, false, "SB", 0);  // to the compiled factory
-  setSwitchAction(false, false, "SC", 0);  // mapping — a factory reset can
-  setSwitchAction(false, false, "GA", 0);  // never leave a caregiver
-  setSwitchAction(false, false, "GB", 0);  // mapping behind
-  setSwitchAction(false, false, "GC", 0);
-  printResponseInt(responseEnabled, apiEnabled, true, 0, "FR,1", true, 1);
+  bool resetOk = resetMemory();  // Format and atomically seed one complete default settings document
+  printResponseInt(responseEnabled, apiEnabled, resetOk, resetOk ? 0 : 3, "FR,1", true, resetOk ? 1 : 0);
 
   // Clear all LEDs to indicate factory reset process is finished 
   setLedState(LED_ACTION_OFF, LED_CLR_NONE, CONF_JOY_CALIB_LED_NUMBER, 0, 0, CONF_LED_BRIGHTNESS_MAX);                           
   performLedAction(ledCurrentState);  
 
-  Serial.println("Activating software reset");
+  if (USB_DEBUG) Serial.println("Activating software reset");
 
   softwareReset();
 
@@ -3597,22 +3768,22 @@ void printResponseString(bool responseEnabled,
                          bool responseParameterEnabled, 
                          String responseParameter) {
   if (responseEnabled) {
-
+    String line;
+    line.reserve(responseCommand.length() + responseParameter.length() + 24);
     if (responseStatus) {
-      (apiEnabled) ? Serial.print("SUCCESS") : Serial.print("MANUAL");
+      line += apiEnabled ? "SUCCESS" : "MANUAL";
     } else {
-      Serial.print("FAIL");
+      line += "FAIL";
     }
-    Serial.print(",");
-    Serial.print(responseNumber);
-    Serial.print(":");
-    Serial.print(responseCommand);
+    line += ',';
+    line += String(responseNumber);
+    line += ':';
+    line += responseCommand;
     if (responseParameterEnabled) {
-      Serial.print(":");
-      Serial.println(responseParameter);
-    } else {
-      Serial.println("");
+      line += ':';
+      line += responseParameter;
     }
+    serialTxEnqueueLine(line);
   }
 }
 

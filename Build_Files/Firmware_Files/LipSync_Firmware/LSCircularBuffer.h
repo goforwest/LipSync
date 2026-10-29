@@ -29,18 +29,21 @@ class LSCircularBuffer {
   public:
     LSCircularBuffer();
     ~LSCircularBuffer();
+    LSCircularBuffer(const LSCircularBuffer&) = delete;
+    LSCircularBuffer& operator=(const LSCircularBuffer&) = delete;
     T getElement( uint16_t );  // Zero is the push location of new element 
     void begin( uint16_t inputSize );
+    void clear();
     void pushElement(const T elementVal);
     void updateLastElement(const T elementVal);
     T getLastElement( void ); 
     uint16_t getLength( void );
 
   private:
-    uint16_t cBufferSize;
+    uint16_t cBufferSize = 0;
     T *cBufferData = nullptr;  // null until begin() (the destructor checks)
-    int16_t cBufferLastPtr;
-    uint8_t cBufferElementsUsed;
+    int32_t cBufferLastPtr = 0;
+    uint16_t cBufferElementsUsed = 0;
 };
 
 //*********************************//
@@ -100,10 +103,33 @@ void LSCircularBuffer<T>::begin(uint16_t inputSize)
   // joystickLoop's CF gate) read uninitialized memory into live logic.
   // Zeros are the harmless reading for every instantiation here (state
   // structs, points, pressures).
+  if (cBufferData) {
+    delete[] cBufferData;
+    cBufferData = nullptr;
+  }
+  cBufferSize = 0;
+  cBufferLastPtr = 0;
+  cBufferElementsUsed = 0;
+  if (inputSize == 0) return;
+
   cBufferData = new T[inputSize]();
+  if (!cBufferData) return;
   cBufferLastPtr = 0;
   cBufferElementsUsed = 0;
   cBufferSize = inputSize;
+}
+
+//*********************************//
+// Function   : clear
+//
+// Description: Discard every logical element while retaining the allocated
+//              storage. The next push starts a fresh sample window.
+//*********************************//
+template<typename T>
+void LSCircularBuffer<T>::clear()
+{
+  cBufferLastPtr = 0;
+  cBufferElementsUsed = 0;
 }
 
 //*********************************//
@@ -120,14 +146,12 @@ template<typename T>
 T LSCircularBuffer<T>::getElement( uint16_t elementNum )
 {
   if (cBufferData == nullptr || cBufferSize == 0) {
-    T empty = {0};
-    return empty;
+    return T{};
   }
   if (elementNum >= cBufferElementsUsed && cBufferElementsUsed > 0) {
     elementNum = cBufferElementsUsed - 1;
   } else if (cBufferElementsUsed == 0) {
-    T empty = {0};
-    return empty;
+    return T{};
   }
   // Translate elementNum into terms of cBufferLastPtr.
   int16_t virtualElementNum;
@@ -153,6 +177,7 @@ T LSCircularBuffer<T>::getElement( uint16_t elementNum )
 template<typename T>
 void LSCircularBuffer<T>::pushElement(const T elementVal )
 {
+  if (cBufferData == nullptr || cBufferSize == 0) return;
   // inc. the pointer
   cBufferLastPtr++;
 
@@ -181,6 +206,7 @@ void LSCircularBuffer<T>::pushElement(const T elementVal )
 //*********************************//
 template<typename T>
 void LSCircularBuffer<T>::updateLastElement(const T elementVal){
+  if (cBufferData == nullptr || cBufferSize == 0 || cBufferElementsUsed == 0) return;
   // Write data
   cBufferData[cBufferLastPtr] = elementVal; 
 }
@@ -198,8 +224,7 @@ template<typename T>
 T LSCircularBuffer<T>::getLastElement( void )
 {
   if (cBufferData == nullptr || cBufferSize == 0 || cBufferElementsUsed == 0) {
-    T empty = {0};
-    return empty;
+    return T{};
   }
   // Output the value of last element
   return cBufferData[cBufferLastPtr];

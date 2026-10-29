@@ -30,7 +30,7 @@
 
 #define CONF_LIPSYNC_VERSION_MAJOR  4
 #define CONF_LIPSYNC_VERSION_MINOR  6
-#define CONF_LIPSYNC_VERSION_REV    1
+#define CONF_LIPSYNC_VERSION_REV    4
 
 // 4.5.22 RESCUE-BUILD SWITCH (bench round 15): the device's settings
 // filesystem was left corrupted by the 4.5.20 race + the zombie phase's
@@ -106,13 +106,23 @@ const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + 
                                           // 2 = Gamepad  
 
 // Communication mode values 
-#define CONF_COM_MODE_MIN  0
+#define CONF_COM_MODE_MIN  CONF_COM_MODE_USB
 #define CONF_COM_MODE_NONE 0 
 #define CONF_COM_MODE_USB  1
 #define CONF_COM_MODE_BLE  2
 #define CONF_COM_MODE_MAX  2
 
 #define CONF_COM_MODE_DEFAULT CONF_COM_MODE_USB
+
+// Atomic host-facing mode presets (MP,1:n). OM/CM setters reset on change,
+// so a two-command Gamepad -> Bluetooth transition cannot land both halves
+// before the first command reboots. MP stores one validated pair, acks, then
+// performs exactly one reset.
+#define CONF_MODE_PRESET_MOUSE_USB     1
+#define CONF_MODE_PRESET_MOUSE_BLE     2
+#define CONF_MODE_PRESET_GAMEPAD_USB   3
+#define CONF_MODE_PRESET_MIN           CONF_MODE_PRESET_MOUSE_USB
+#define CONF_MODE_PRESET_MAX           CONF_MODE_PRESET_GAMEPAD_USB
 
 #define CONF_LED_NONE 0
 #define CONF_LED_LEFT 1
@@ -290,6 +300,7 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 // cannot redraw the menu over the "do not move joystick" instruction and a
 // mid-flow Select cannot hit selectMenuItem's unhandled page id.
 #define CONF_CENTER_RESET_FREEZE_MS 3000
+#define CONF_FULL_CALIB_STEP_FREEZE_MS 6000  // Covers the ~4.95 s corner/center step, including scheduling margin
 
 // Bench fix (4.5.7): destructive menu confirms (safe-menu Restart / Factory
 // Reset and their confirm pages) require the select to be HELD for at least

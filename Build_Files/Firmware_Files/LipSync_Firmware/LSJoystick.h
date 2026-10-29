@@ -95,12 +95,14 @@ class LSJoystick {
     int getMinimumRadius();                                               // Get the minimum input radius for square to circle mapping.
     void setMinimumRadius();                                              // Set or update the minimum input radius for square to circle mapping.
     pointFloatType getInputCenter();                                      // Get the updated center compensation point.
-    void evaluateInputCenter();                                           // Evaluate the center compensation point.
+    bool evaluateInputCenter();                                           // Evaluate the center compensation point; false when this sample window is incomplete.
+    void resetInputCenterBuffer();                                        // Start a fresh center-measurement sample window.
     void updateInputCenterBuffer();                                       // Push new center compensation point to joystickCenter
     pointFloatType getInputMax(int quad);                                 // Get the updated maximum input reading from the selected corner of joystick using the input quadrant. (Calibration purposes)
     void setInputMax(int quad, pointFloatType point);                     // Set the maximum input reading for each corner of joystick using the input quadrant. 
     void zeroInputMax(int quad);                                          // Zero the maximum input reading for each corner of joystick using the input quadrant. 
     void update();                                                        // Update the joystick reading to get new input from the magnetic sensor and calculate the output.
+    void reprocessLastReading();                                           // Recompute input/output after center, radius, or deadzone settings change.
     int getXOut();                                                        // Get the output x value.
     int getYOut();                                                        // Get the output y value.
     pointFloatType getXYRaw();                                            // Get the raw x and y values.
@@ -634,7 +636,7 @@ pointFloatType LSJoystick::getInputCenter() {
 // 
 // Return     : void
 //*********************************//
-void LSJoystick::evaluateInputCenter() {
+bool LSJoystick::evaluateInputCenter() {
   // Averaging a partially-filled buffer would fold uninitialized heap into
   // the neutral (4.5.7 review): the center chain's 5-sample setTimer
   // registration can in principle be refused by the pool — the samples are
@@ -644,7 +646,7 @@ void LSJoystick::evaluateInputCenter() {
   // time a healthy chain has pushed all five (and value-initialized buffer
   // storage plus this check keep a refused chain from poisoning the
   // center with garbage).
-  if (_joystickCenterBuffer.getLength() < JOY_CENTER_BUFF_SIZE) return;
+  if (_joystickCenterBuffer.getLength() < JOY_CENTER_BUFF_SIZE) return false;
   float centerX = 0.0;
   float centerY = 0.0;
   pointFloatType centerPoint = {centerX, centerY};
@@ -656,6 +658,11 @@ void LSJoystick::evaluateInputCenter() {
   centerX = centerX / JOY_CENTER_BUFF_SIZE;
   centerY = centerY / JOY_CENTER_BUFF_SIZE;
   _magnetInputCalibration[0] = {centerX, centerY};
+  return true;
+}
+
+void LSJoystick::resetInputCenterBuffer() {
+  _joystickCenterBuffer.clear();
 }
 
 
@@ -862,6 +869,20 @@ void LSJoystick::update() {
   // too — 4.5.7 review)
 }
 
+// Recompute the derived buffers without another sensor transaction. Settings
+// changes can alter the output while the raw field is stationary; relying on
+// the 0.1 mT change gate left the pre-change movement replaying indefinitely
+// after a center reset or deadzone/radius update.
+void LSJoystick::reprocessLastReading() {
+  _rawPoint = _joystickRawBuffer.getLastElement();
+  _skipInputChange = false;
+  _processCount++;
+  _inputPoint = processInputReading(_rawPoint);
+  _joystickInputBuffer.pushElement(_inputPoint);
+  _outputPoint = processOutputResponse(_inputPoint);
+  _joystickOutputBuffer.pushElement(_outputPoint);
+}
+
 //*********************************//
 // Function   : getXOut 
 // 
@@ -1031,7 +1052,7 @@ pointIntType LSJoystick::applyRadialDeadzone(pointIntType inputPoint, float inpu
   } else { // (innerDeadzoneValue < inputPointMagnitude < outerDeadzoneValue)
     // Map the input magnitudes between the lower and outer deadzones to between 0 and the maximum value
     
-    int outputMagnitude = mapRoundInt(inputPointMagnitude, _innerDeadzoneValue, _outerDeadzoneValue, 0, JOY_INPUT_XY_MAX);
+    int outputMagnitude = mapRoundInt(inputPointMagnitude, innerDeadzoneValue, outerDeadzoneValue, 0, JOY_INPUT_XY_MAX);
     outputPoint = pointIntFromMagnitudeAngle(outputMagnitude, inputPointAngle);
 
   }
@@ -1122,10 +1143,13 @@ pointIntType LSJoystick::processInputReading(pointFloatType inputPoint) {
   pointIntType outputPoint = {0,0};
   pointFloatType center = _magnetInputCalibration[0];  // Center / neutral point reading of joystick from calibration
   
-  if ((sq(inputPoint.x) + sq(inputPoint.y)) >= sq(JOY_INPUT_DEADZONE)) {  //  TODO 2025-Mar-07 Look at this constant / fixed input deadzone
-    // Center the input point
-    centeredPoint = {(inputPoint.x - center.x) * _joystickXDirection, 
-                     (inputPoint.y - center.y) * _joystickYDirection};
+  // Center first, then apply the raw fixed deadzone around the CALIBRATED
+  // neutral. Testing magnitude around the sensor origin made readings near
+  // {0,0} disappear even when a compensated center made them real movement.
+  centeredPoint = {(inputPoint.x - center.x) * _joystickXDirection,
+                   (inputPoint.y - center.y) * _joystickYDirection};
+  if ((sq(centeredPoint.x) + sq(centeredPoint.y)) < sq(JOY_INPUT_DEADZONE)) {
+    centeredPoint = {0.0f, 0.0f};
   }
 
   float thetaVal = atan2(centeredPoint.y, centeredPoint.x);         // Get the angle of the point
@@ -1202,6 +1226,8 @@ int LSJoystick::mapFloatInt(float input, float inputStart, float inputEnd, int o
   float inputRange = inputEnd - inputStart;
   int outputRange = outputEnd - outputStart;
 
+  if (!isfinite(inputRange) || inputRange == 0.0f) return outputStart;
+
   int output = round((input - inputStart) * outputRange / inputRange + outputStart);
   
   return output;
@@ -1221,6 +1247,7 @@ int LSJoystick::mapFloatInt(float input, float inputStart, float inputEnd, int o
 // Return     : output : int : Mapped input value 
 //*********************************//
 int LSJoystick::mapRoundInt(int input, int inputStart, int inputEnd, int outputStart, int outputEnd) {
+  if (inputEnd == inputStart) return outputStart;
   int output = round(float(input - inputStart) * float(outputEnd - outputStart) / float(inputEnd - inputStart) + outputStart);
   
   return output;
@@ -1240,6 +1267,7 @@ int LSJoystick::mapRoundInt(int input, int inputStart, int inputEnd, int outputS
 // Return     : output : float : Mapped input value 
 //*********************************//
 float LSJoystick::mapIntToFloat(int input, int inputStart, int inputEnd, int outputStart, int outputEnd) {
+  if (inputEnd == inputStart) return (float)outputStart;
   float output = float(input - inputStart) * float(outputEnd - outputStart) / float(inputEnd - inputStart) + float(outputStart);
   
   return output;

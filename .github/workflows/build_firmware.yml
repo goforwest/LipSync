@@ -84,6 +84,11 @@ jobs:
             -o lstimer_host_tests \
             Build_Files/Firmware_Files/host_tests/lstimer_host_tests.cpp
           ./lstimer_host_tests
+          c++ -std=c++17 -g -fsanitize=address,undefined \
+            -IBuild_Files/Firmware_Files/LipSync_Firmware \
+            -o core_host_tests \
+            Build_Files/Firmware_Files/host_tests/core_host_tests.cpp
+          ./core_host_tests
 
       - name: Read firmware version and verify the tag matches
         run: |
@@ -122,12 +127,21 @@ jobs:
           curl -sL --fail \
             https://raw.githubusercontent.com/microsoft/uf2/90e9741f217f5a40c98ba74d663e408041037578/utils/uf2families.json \
             -o uf2families.json
+          printf '%s  %s\n' \
+            'ad36ba2d61fb2ea371832262392088281eee474c609df4142adbee4ea3c20f26' uf2conv.py \
+            '9d8f561e050507c5909063005cd6f5b157e6fe6db1e8d25b5d9027d57064c194' uf2families.json \
+            | sha256sum --check --strict
           python3 uf2conv.py -c -f 0xADA52840 \
             -o "build/LipSync_Firmware_${VERSION}.uf2" \
             "build/LipSync_Firmware.ino.hex"
 
       - name: Stage release artifacts + manifest
         run: |
+          # A release checkout may already contain bench artifacts in dist/.
+          # Start clean so gh release upload and the workflow artifact contain
+          # exactly this build's three images plus its manifest—not stale stock,
+          # recovery, or hardened packages committed by an earlier bench round.
+          rm -rf dist
           mkdir -p dist
           cp build/LipSync_Firmware.ino.zip "dist/LipSync_Firmware_${VERSION}_dfu.zip"
           cp build/LipSync_Firmware.ino.hex "dist/LipSync_Firmware_${VERSION}.hex"

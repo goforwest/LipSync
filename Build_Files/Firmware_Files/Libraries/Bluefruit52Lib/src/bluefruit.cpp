@@ -121,11 +121,9 @@ static void bluefruit_blinky_cb( TimerHandle_t xTimer )
 // moment it returns — every BLE-boot death on the bench read identically
 // (rst=0x4, no markers, no fault page) and the fault class was provable
 // only by elimination. This handler names the assertion instead:
-//  - The SD passes (id, pc, info); for NRF_FAULT_ID_SD_ASSERT, info points
-//    at the SD's own {line_num, p_file_name} — the exact violated invariant.
-//  - Everything is printed to the CDC port (the bench's deaths cluster
-//    right where the port IS open, so these bytes land more often than not;
-//    the retained copy below survives even when they do not).
+//  - The SD passes (id, pc, info); for NRF_FAULT_ID_SD_ASSERT, info carries
+//    the assertion line. A compact summary is written only when the CDC FIFO
+//    can accept it without waiting; fault handling must never block on USB.
 //  - The asserting PC's 8 KB flash page goes into GPREGRET as 0xC0|page —
 //    the same encoding the app's HardFault capture uses (values 0xC0-0xCF
 //    collide with none of the bootloader's DFU magics). The next boot
@@ -140,13 +138,7 @@ static void nrf_error_cb(uint32_t id, uint32_t pc, uint32_t info)
   // page lands in GPREGRET, the next boot reports fp=.
   NRF_POWER->GPREGRET = 0xC0UL | ((pc >> 13) & 0x0FUL);
 
-  Serial.print(F("SDFAULT id=0x"));
-  Serial.print(id, HEX);
-  Serial.print(F(" pc=0x"));
-  Serial.print(pc, HEX);
-  Serial.print(F(" info=0x"));
-  Serial.print(info, HEX);
-
+  uint32_t assertLine = 0;
   if ( id == NRF_FAULT_ID_SD_ASSERT && info != 0)
   {
     typedef struct
@@ -157,18 +149,24 @@ static void nrf_error_cb(uint32_t id, uint32_t pc, uint32_t info)
 
     assert_info_t* assert_info = (assert_info_t*) info;
 
-    Serial.print(F(" assert at "));
-    Serial.print((const char*) assert_info->p_file_name);
-    Serial.print(F(" : "));
-    Serial.print(assert_info->line_num);
-    Serial.println();
-  }
-  else
-  {
-    Serial.println();
+    assertLine = assert_info->line_num;
   }
 
-  // 4.5.25 (bench round 18): the prints above only ever LANDED when the port
+  // Never enter Adafruit_USBD_CDC::write()'s unbounded "connected but TX
+  // FIFO full" yield loop from fault context. Build one compact line and
+  // enqueue it only if the entire line fits immediately; fp= above remains
+  // the reset-proof source of truth when the port cannot take it.
+  char faultLine[64];
+  int faultLen = snprintf(faultLine, sizeof(faultLine),
+                          "SDFAULT id=%lx pc=%lx info=%lx line=%lu\n",
+                          (unsigned long)id, (unsigned long)pc,
+                          (unsigned long)info, (unsigned long)assertLine);
+  if (faultLen > 0 && faultLen < (int)sizeof(faultLine) &&
+      Serial.availableForWrite() >= faultLen) {
+    Serial.write((const uint8_t*)faultLine, (size_t)faultLen);
+  }
+
+  // 4.5.25 (bench round 18): the line above only ever LANDED when the port
   // was already open AND the CDC buffer happened to be flushed by the core's
   // Serial maintenance — which never runs before our reset. tud_cdc_write_
   // flush() starts the IN transaction by writing the USBD peripheral

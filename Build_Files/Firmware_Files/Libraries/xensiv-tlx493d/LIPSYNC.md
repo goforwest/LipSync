@@ -41,8 +41,8 @@ shipped with. 4.4.0 vendored a *bounded fork* of it (see
 `../TLV493D-A1B6/README.md`) instead of migrating, because the joystick read
 path is the live cursor path of an assistive device — any change there
 touches what the user's mouth-puff-and-stick feels, and it was deliberately
-left for a bench-validated pass. This is that pass (branch
-`xensiv-tlx493d-migration`; **bench validation required before merge**).
+left for a bench-validated pass. This is that pass; it was bench-validated
+and merged in firmware 4.5.1.
 
 ## Boundedness audit (the fork's guarantees, verified against the successor)
 
@@ -73,10 +73,10 @@ cheaper than the fork**:
   numerically comparable across the migration (the bench JV parity check
   compares them directly). Same concat model, same mT units.
 
-Trade-off the bench must sign off: master-controlled measurement draws the
-sensor continuously (~mA-scale, vs µA-scale power-down between reads under
-the old fork's POWERDOWNMODE). The LipSync is a powered device, but the BLE
-battery budget is a real question — see the bench protocol.
+Master-controlled measurement draws the sensor continuously (~mA-scale, vs
+µA-scale power-down between reads under the old fork's POWERDOWNMODE). The
+hardware has no internal battery, so this was documented and accepted during
+the completed bench validation (see the status section above).
 
 ## What LipSync uses from this library
 
@@ -123,4 +123,3 @@ vendoring.
 ---
 
 *The remainder of this file is upstream's README.*
-

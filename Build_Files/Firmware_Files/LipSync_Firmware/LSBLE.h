@@ -37,6 +37,7 @@ class LSBLEMouse {
     inline void moveAll(signed char x, signed char y, signed char wheel = 0, signed char pan = 0);
     inline void scroll(signed char wheel = 0);
     inline void pan(signed char pan = 0);
+    inline void service(void);
     inline void click(uint8_t b = MOUSE_LEFT);
     inline void press(uint8_t b = MOUSE_LEFT);   // press LEFT by default
     inline void release(uint8_t b = MOUSE_LEFT); // release LEFT by default
@@ -46,7 +47,11 @@ class LSBLEMouse {
     uint8_t _buttons;
     void buttons(uint8_t b);
   private:
-    void mouseReport(signed char b, signed char x, signed char y, signed char wheel = 0, signed char pan = 0);
+    bool mouseReport(signed char b, signed char x, signed char y, signed char wheel = 0, signed char pan = 0);
+    bool _buttonStatePending = false;
+    bool _clickPending = false;
+    bool _clickPressedSent = false;
+    uint8_t _clickButton = 0;
 };
 
 // LSBLEKeyboard removed (4.5.7 review): never instantiated anywhere — a
@@ -245,7 +250,7 @@ void LSBLEMouse::end(void)
 {
 }
 
-void LSBLEMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t pan)
+bool LSBLEMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t pan)
 {
   // 4.5.10: the BLE stack comes up on its own task now (see the 16 KB
   // init task in LipSync_Firmware.ino) — an SVC call on a never-begun or
@@ -253,8 +258,10 @@ void LSBLEMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t 
   // worse than a dropped report. Skip until needsInitialization clears;
   // the buttons state still mutates, so the first post-init movement
   // report carries it.
-  if (needsInitialization || !Bluefruit.connected()) return;
-  blehid.mouseReport(b, x, y, wheel, pan);
+  if (needsInitialization || !Bluefruit.connected()) return false;
+  bool sent = blehid.mouseReport(b, x, y, wheel, pan);
+  if (sent) _buttonStatePending = false;
+  return sent;
 }
 
 void LSBLEMouse::move(int8_t x, int8_t y)
@@ -276,12 +283,46 @@ void LSBLEMouse::pan(int8_t pan)
   mouseReport(_buttons, 0, 0, 0, pan);
 }
 
+void LSBLEMouse::service(void)
+{
+  if (!_clickPending && !_buttonStatePending) return;
+  if (needsInitialization || !Bluefruit.connected()) {
+    // A disconnect releases HID state at the host. Do not replay a stale
+    // pre-disconnect click when a different host reconnects later.
+    _buttons = 0;
+    _buttonStatePending = false;
+    _clickPending = false;
+    _clickPressedSent = false;
+    _clickButton = 0;
+    return;
+  }
+
+  if (_clickPending) {
+    if (!_clickPressedSent) {
+      _buttons |= _clickButton;
+      if (mouseReport(_buttons, 0, 0, 0, 0)) _clickPressedSent = true;
+    } else {
+      _buttons &= (uint8_t)~_clickButton;
+      if (mouseReport(_buttons, 0, 0, 0, 0)) {
+        _clickPending = false;
+        _clickPressedSent = false;
+        _clickButton = 0;
+      }
+    }
+    return;
+  }
+
+  if (_buttonStatePending) mouseReport(_buttons, 0, 0, 0, 0);
+}
+
 void LSBLEMouse::click(uint8_t b)
 {
-  _buttons = b;
-  mouseReport(_buttons, 0, 0, 0, 0);
-  _buttons = 0;
-  mouseReport(_buttons, 0, 0, 0, 0);
+  if (_clickPending || needsInitialization || !Bluefruit.connected()) return;
+  _clickButton = b & MOUSE_ALL;
+  if (_clickButton == 0) return;
+  _clickPending = true;
+  _clickPressedSent = false;
+  service();
 }
 
 void LSBLEMouse::buttons(uint8_t b)
@@ -289,7 +330,7 @@ void LSBLEMouse::buttons(uint8_t b)
   if (b != _buttons)
   {
     _buttons = b;
-    mouseReport(_buttons, 0, 0, 0, 0);
+    if (!mouseReport(_buttons, 0, 0, 0, 0)) _buttonStatePending = true;
   }
 }
 

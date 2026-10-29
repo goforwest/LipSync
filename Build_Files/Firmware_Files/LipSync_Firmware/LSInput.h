@@ -41,26 +41,33 @@ class LSInput {
   
   private: 
     LSCircularBuffer <inputStateStruct> inputBuffer;
-    int *_inputPinArray;
-    int _inputNumber;
-    int inputState[3];
-    int inputAllState;
+    int *_inputPinArray = nullptr;
+    int _inputNumber = 0;
+    int inputState[3] = {0, 0, 0};
+    int inputAllState = 0;
     inputStateStruct inputCurrState = {0, 0, 0};
     inputStateStruct inputPrevState = {0, 0, 0};
     LSTimer <void> inputStateTimer;
-    int inputStateTimerId;
+    int inputStateTimerId = -1;
 
 };
 
 LSInput::LSInput(int* inputPinArray, int inputNumber)
 {
   inputBuffer.begin(INPUT_BUFF_SIZE);
-  _inputPinArray = new int[inputNumber]();
-
-  _inputNumber = inputNumber;
+  // The encoded input state and fixed inputState array are three bits wide.
+  // Bound the count before allocating or copying so an invalid constructor
+  // argument cannot become a huge allocation or an out-of-bounds walk.
+  _inputNumber = constrain(inputNumber, 0, 3);
+  if (_inputNumber > 0 && inputPinArray != nullptr) {
+    _inputPinArray = new int[_inputNumber]();
+  }
+  if (_inputPinArray == nullptr) {
+    _inputNumber = 0;
+  }
   
   // Set the input mode for each of the pins to an INPUT_PULLUP
-  for (int i = 0; i < inputNumber; i++){
+  for (int i = 0; i < _inputNumber; i++){
     pinMode(inputPinArray[i], INPUT_PULLUP);
     _inputPinArray[i] = inputPinArray[i];
   }
@@ -95,7 +102,7 @@ void LSInput::update() {
   inputAllState = 0;
 
   // for each input pin, do a digital read and create a single number to represent the collective states
-  for (int i = 0; i < _inputNumber && i < 3; i++){
+  for (int i = 0; i < _inputNumber; i++){
     inputState[i] = !digitalRead(_inputPinArray[i]);
     inputAllState += (1 << i) * inputState[i];  // create single integer to represent combination of button presses (integer shift, not pow())
   }

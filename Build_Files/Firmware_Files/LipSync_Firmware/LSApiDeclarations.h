@@ -56,6 +56,9 @@ void setOperatingMode(bool responseEnabled, bool apiEnabled, String optionalPara
 int getCommunicationMode(bool responseEnabled, bool apiEnabled);
 void setCommunicationMode(bool responseEnabled, bool apiEnabled, int inputCommunicationMode);
 void setCommunicationMode(bool responseEnabled, bool apiEnabled, String optionalParameter);
+bool storeModePair(int operatingMode, int communicationMode);  // Atomic menu-mode persistence; caller resets once
+void setModePreset(bool responseEnabled, bool apiEnabled, int inputPreset);
+void setModePreset(bool responseEnabled, bool apiEnabled, String optionalParameter);
 int getSoundMode(bool responseEnabled, bool apiEnabled);
 void setSoundMode(bool responseEnabled, bool apiEnabled, int inputSoundMode);
 void setSoundMode(bool responseEnabled, bool apiEnabled, String optionalParameter);
@@ -195,7 +198,7 @@ void runTest(bool responseEnabled, bool apiEnabled, int inputTest);
 void runTest(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void softReset(bool responseEnabled, bool apiEnabled);
 void softReset(bool responseEnabled, bool apiEnabled, String optionalParameter);
-void resetSettings(bool responseEnabled, bool apiEnabled);
+bool resetSettings(bool responseEnabled, bool apiEnabled);
 void resetSettings(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void doFactoryReset(bool responseEnabled, bool apiEnabled);
 void doFactoryReset(bool responseEnabled, bool apiEnabled, String optionalParameter);
@@ -221,6 +224,7 @@ void printResponseIntArray(bool responseEnabled,
                            int responseParameterSize,
                            char responseParameterDelimiter,
                            int responseParameter[]);
+void serialTxService();  // Non-blocking CDC response queue; called from loop()
 
 // ---- Cross-tab free functions (defined in LipSync_Firmware.ino) ----
 
@@ -373,5 +377,6 @@ void performJoystickCenter(int* args);
 void performJoystickCenterStep(int* args);
 void performJoystickCalibration(int* args);
 void performJoystickCalibrationStep(int* args);
+void abortJoystickCalibration(bool calibFromApi, const char* reason);
 
 #endif // _LSAPIDECLARATIONS_H

@@ -1,3 +1,5 @@
 # macOS debug-symbol bundles and the compiled host-test binary (Build_Files/Firmware_Files/host_tests)
+.DS_Store
 *.dSYM/
 Build_Files/Firmware_Files/host_tests/lstimer_host_tests
+Build_Files/Firmware_Files/host_tests/core_host_tests

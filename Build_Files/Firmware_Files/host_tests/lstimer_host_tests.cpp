@@ -238,6 +238,23 @@ static void test_invalid_ids_are_harmless_noops() {
   CHECK_EQ(s_watchdogFeeds, 1);             // and still fires
 }
 
+static void test_freed_slots_reject_state_operations() {
+  resetCounters();
+  LSTimer<void> pool;
+  int id = pool.setTimeout(1, onceCb);
+  CHECK(id >= 0);
+  pump(pool, 1);
+  CHECK_EQ(pool.getNumTimers(), 0);
+
+  CHECK(!pool.isEnabled(id));
+  pool.enable(id);
+  pool.disable(id);
+  pool.toggle(id);
+  CHECK_EQ(pool.getNumRuns(id), 0);
+  CHECK_EQ(pool.getInvalidOperations(), 5);
+  CHECK_EQ(pool.getNumTimers(), 0);
+}
+
 static void test_stopwatch_slot_is_not_stolen() {
   resetCounters();
   LSTimer<void> pool;
@@ -594,6 +611,7 @@ int main() {
   test_disabled_anchor_advances_resume_within_one_interval();
   test_run_once_timeout_deletes_itself();
   test_invalid_ids_are_harmless_noops();
+  test_freed_slots_reject_state_operations();
   test_stopwatch_slot_is_not_stolen();
   test_registration_refusal_is_loud_and_consistent();
   test_zero_interval_run_forever_is_refused();
