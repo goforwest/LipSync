@@ -19,6 +19,7 @@
 
 //***API FUNCTIONS***// - DO NOT CHANGE
 #include "LSApiDeclarations.h"  // Explicit declarations for the API surface (roadmap item 5) — the function table below references functions defined further down the merged tabs
+#include "LSSerialTxQueue.h"
 typedef void (*FunctionPointer)(bool, bool, String);      // Type definition for API function pointer
 
 typedef struct {                                  // Type definition for API function list
@@ -210,59 +211,32 @@ unsigned long serialRxBufLastByteMs = 0;
 // DTR is asserted and its TX FIFO is full; a host that opens the port but
 // stops reading could therefore freeze the assistive-device loop indefinitely.
 // Canonical API/MANUAL/DEBUG lines enqueue here and loop() drains at most the
-// FIFO space currently available. On overflow, oldest complete line remnants
-// are discarded so the newest command response wins over stale debug output.
+// FIFO space currently available. On overflow, stale whole lines are
+// discarded so the newest response wins; a line whose prefix already reached
+// USB is protected through its newline (LSSerialTxQueue).
 const size_t SERIAL_TX_BUFFER_SIZE = 4096;
-char serialTxBuffer[SERIAL_TX_BUFFER_SIZE];
-size_t serialTxHead = 0;
-size_t serialTxTail = 0;
-size_t serialTxCount = 0;
-
-void serialTxClear() {
-  serialTxHead = 0;
-  serialTxTail = 0;
-  serialTxCount = 0;
-}
-
-void serialTxDropOldestLine() {
-  while (serialTxCount > 0) {
-    char c = serialTxBuffer[serialTxTail];
-    serialTxTail = (serialTxTail + 1) % SERIAL_TX_BUFFER_SIZE;
-    serialTxCount--;
-    if (c == '\n') break;
-  }
-}
+LSSerialTxQueue<SERIAL_TX_BUFFER_SIZE> serialTxQueue;
 
 void serialTxService() {
-  if (serialTxCount == 0 || !Serial) return;
+  if (serialTxQueue.size() == 0 || !Serial) return;
   int available = Serial.availableForWrite();
   if (available <= 0) return;
-  size_t contiguous = min(serialTxCount, SERIAL_TX_BUFFER_SIZE - serialTxTail);
-  size_t toWrite = min(contiguous, (size_t)available);
-  size_t written = Serial.write((const uint8_t*)&serialTxBuffer[serialTxTail], toWrite);
-  serialTxTail = (serialTxTail + written) % SERIAL_TX_BUFFER_SIZE;
-  serialTxCount -= written;
+  size_t toWrite = serialTxQueue.nextChunkSize((size_t)available);
+  size_t written = Serial.write((const uint8_t*)serialTxQueue.readPointer(), toWrite);
+  serialTxQueue.consume(written);
 }
 
-bool serialTxEnqueueLine(const String &line) {
+bool serialTxEnqueueLine(const char* line, size_t length) {
   // Preserve the stock CDC behavior: output generated before DTR opens is
   // discarded, not replayed as stale unsolicited traffic on the next session.
   if (!Serial) return false;
-  size_t needed = line.length() + 1;
-  if (needed >= SERIAL_TX_BUFFER_SIZE) return false;
-  while ((SERIAL_TX_BUFFER_SIZE - serialTxCount) < needed) {
-    serialTxDropOldestLine();
-  }
-  for (size_t i = 0; i < line.length(); i++) {
-    serialTxBuffer[serialTxHead] = line.charAt(i);
-    serialTxHead = (serialTxHead + 1) % SERIAL_TX_BUFFER_SIZE;
-    serialTxCount++;
-  }
-  serialTxBuffer[serialTxHead] = '\n';
-  serialTxHead = (serialTxHead + 1) % SERIAL_TX_BUFFER_SIZE;
-  serialTxCount++;
+  if (!serialTxQueue.enqueueLine(line, length)) return false;
   serialTxService();
   return true;
+}
+
+bool serialTxEnqueueLine(const String &line) {
+  return serialTxEnqueueLine(line.c_str(), line.length());
 }
 
 // Process one delimited message. Returns the settings-mode flag for the
@@ -272,7 +246,7 @@ bool processSerialMessage(String commandString, bool settingsFlag) {
   // A newly received request takes priority over stale queued DEBUG/MANUAL
   // output. The host protocol is request/response sequential, so no valid
   // command response is pending when the next request arrives.
-  serialTxClear();
+  serialTxQueue.prioritizeRequest();
 
   if (settingsFlag == false && commandString == "SETTINGS") {
     // SETTINGS received
@@ -1166,7 +1140,11 @@ void setJoystickInitialization(bool responseEnabled, bool apiEnabled) {
   // (CONF_CENTER_INIT_API_FLAG) instead of a shared global, so every accepted
   // flow carries its own initiator structurally.
   int stepPayload = apiEnabled ? CONF_CENTER_INIT_API_FLAG : 0;
+  if (outputAction == CONF_ACTION_DRAG || outputAction == CONF_ACTION_SCROLL) {
+    releaseOutputAction();
+  }
   canOutputAction = false;
+  g_resetCenterComplete = false;  // Freeze cursor immediately, including the 1 s start-delay window
   g_centerRunning = true;
   calibrationTimerId[0] = calibrationTimer.setTimeout(CONF_JOY_INIT_START_DELAY, performJoystickCenter, (int *)stepPayload);
   if (calibrationTimerId[0] < 0) {
@@ -1305,7 +1283,11 @@ void setJoystickCalibration(bool responseEnabled, bool apiEnabled) {
   // per-corner lines print SUCCESS only for a host-requested calibration
   // (CA,1:1) and MANUAL for a Hub-menu one — the 4.5.2 initiator contract.
   int stepPayload = apiEnabled ? CONF_CALIB_API_FLAG : 0;
+  if (outputAction == CONF_ACTION_DRAG || outputAction == CONF_ACTION_SCROLL) {
+    releaseOutputAction();
+  }
   canOutputAction = false;
+  g_resetCenterComplete = false;  // Freeze cursor immediately, before the delayed step-0 callback
   // #36: apiEnabled is true only on the serial-dispatch path — a calibration
   // the app started must not end by parking the Hub's menu on screen. The
   // menu-driven path (fullCalibrationPage) passes false and keeps the
@@ -1320,6 +1302,7 @@ void setJoystickCalibration(bool responseEnabled, bool apiEnabled) {
     // waiter resolves honestly instead of timing out on a calibration that
     // will never run.
     canOutputAction = true;
+    g_resetCenterComplete = true;
     g_calibrationRunning = false;
     screen.calibrationAbortedPage();
     printResponseInt(responseEnabled, apiEnabled, false, 3, "CA,1", true, 1);
@@ -1621,8 +1604,14 @@ void getJoystickValue(bool responseEnabled, bool apiEnabled, String optionalPara
 // Return     : void
 //*********************************//
 void getPressureValue(bool responseEnabled, bool apiEnabled) {
-
-  ps.update();      // Request new values from pressure class
+  // Read the 50 ms pressure poll's last complete sample instead of taking an
+  // extra synchronous sample in the serial-dispatch path. Besides making a
+  // flaky I2C device able to stall command handling, the extra update could
+  // run immediately beside the scheduled poll and read the same 25 Hz sensor
+  // conversion twice. That defeated the 4.6.5 consecutive-sample engagement
+  // qualifier while Connect was watching PV: one transient conversion could
+  // be counted twice and become a click. The scheduled pressureLoop is the
+  // sole owner of sensor sampling and sip/puff state advancement.
   
   const int outputArraySize = 3;   
   float tempSapPressure[outputArraySize];
@@ -1699,7 +1688,7 @@ void getBusHealth(bool responseEnabled, bool apiEnabled) {
     pressureHealth = ps.isSensorsHealthy() ? 1 : 2;
 
   int joystickHealth = 0;
-  if (g_joystickSensorConnected) joystickHealth = js.isPollBackedOff() ? 2 : 1;
+  if (g_joystickSensorConnected) joystickHealth = (!js.isBegun() || js.isPollBackedOff()) ? 2 : 1;
 
   // HID-layer + joystick-pipeline telemetry (bench 2026-10-16 hunt):
   // [6..14] = usbMounted, hidReady, hidRetrying, hidTimedOut,
@@ -2561,21 +2550,21 @@ void setLightBrightnessLevel(bool responseEnabled, bool apiEnabled, int inputLig
     // See setSoundMode: a refused store reports FAIL,3.
     led.setLedBrightnessLevel(inputLightLevel);
     printResponseInt(responseEnabled, apiEnabled, true, 0, "LL,1", true, inputLightLevel);
+
+    // Feedback belongs to a successful setting change only. The old
+    // unconditional block blinked even when validation/persistence failed.
+    setLedState(LED_ACTION_BLINK,
+                LED_CLR_RED,
+                CONF_LED_ALL,
+                1,
+                1000,
+                led.getLedBrightness());
+    performLedAction(ledCurrentState);
   }
   else {
     printResponseInt(responseEnabled, apiEnabled, false, 3, "LL,1", true, inputLightLevel);
 
   }
-
-  //TODO: Add LED blink
-  setLedState(LED_ACTION_BLINK,
-            LED_CLR_RED, 
-            CONF_LED_ALL, 
-            1,                     // number of blinks
-            1000,                     // blink time
-            led.getLedBrightness());  // brightness
-  // Perform led action
-  performLedAction(ledCurrentState);
 
 }
 
@@ -3698,6 +3687,22 @@ void doFactoryReset(bool responseEnabled, bool apiEnabled, String optionalParame
 // Return     : void
 //*********************************//
 void enterUpdateMode(bool responseEnabled, bool apiEnabled) {
+  // With the SoftDevice live, prepare the DFU retention magic through its
+  // sanctioned SVCs before promising success. The old code ignored both
+  // return values, acknowledged, and reset even if the magic was not stored
+  // — which simply rebooted back into the app while Connect waited for a
+  // bootloader that never appeared.
+  if (g_softDeviceEnabled) {
+    uint32_t clearRc = sd_power_gpregret_clr(0, 0xFF);
+    uint32_t setRc = (clearRc == NRF_SUCCESS)
+                   ? sd_power_gpregret_set(0, 0x4E)  // DFU_MAGIC_SERIAL_ONLY_RESET
+                   : clearRc;
+    if (clearRc != NRF_SUCCESS || setRc != NRF_SUCCESS) {
+      printResponseInt(responseEnabled, apiEnabled, false, 3, "UM,1", true, 1);
+      return;
+    }
+  }
+
   // Ack BEFORE anything else: the reset below kills USB, and the host must
   // already hold the confirmation when the port departs. The bounded dwell
   // then gives the ack time to reach the host and the splash's framebuffer
@@ -3718,8 +3723,6 @@ void enterUpdateMode(bool responseEnabled, bool apiEnabled) {
   // the sanctioned SVCs and reset ourselves; with it down (the normal
   // USB-mode update flow), the core's path is exactly right.
   if (g_softDeviceEnabled) {
-    (void) sd_power_gpregret_clr(0, 0xFF);
-    (void) sd_power_gpregret_set(0, 0x4E);  // DFU_MAGIC_SERIAL_ONLY_RESET (wiring.c:26 — not exported in any core header)
     NVIC_SystemReset();
   } else {
     enterSerialDfu();

@@ -73,13 +73,4 @@ typedef struct {
   unsigned long elapsedTime;     // in ms
 } inputStateStruct;
 
-// acceleration structure
-typedef struct
-{
-  uint8_t accNumber;
-  float accCoefficient;
-  uint8_t accStartSpeed;
-  uint8_t accEndSpeed;
-} accStruct;
-
 #endif

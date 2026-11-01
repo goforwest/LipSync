@@ -23,6 +23,24 @@
 // 3. Add the switch case to the activateTest function
 // 4. Implement the test below.
 
+static void testLog(const char* line) {
+  serialTxEnqueueLine(line, strlen(line));
+}
+
+static void testLog(const String& line) {
+  serialTxEnqueueLine(line);
+}
+
+static void testDelay(unsigned long durationMs) {
+  const unsigned long started = millis();
+  while (millis() - started < durationMs) {
+    buzzer.update();
+    serialTxService();
+    if (g_watchdogArmed) watchdogLoop();
+    delay(10);
+  }
+}
+
 //***ACTIVATE TEST FUNCTION***//
 // Function   : activateTest
 //
@@ -57,7 +75,7 @@ void activateTest(int inputTest) {
 
   } // end switch inputTest
   g_shutdownInProgress = false;
-  Serial.println("Test Complete");
+  testLog("Test Complete");
 }
 
 
@@ -74,57 +92,57 @@ void testLED() {
 
   //setLedColor(int ledNumber, int ledColorNumber, int ledBrightness)
 
-  Serial.println("LED TEST ACTIVATED");
-  Serial.println("TEST_MODE_LED: All LED OFF");
+  testLog("LED TEST ACTIVATED");
+  testLog("TEST_MODE_LED: All LED OFF");
   led.clearLedAll();
-  delay(1000);
+  testDelay(1000);
 
-  Serial.println("TEST_MODE_LED: Left LED ON");
+  testLog("TEST_MODE_LED: Left LED ON");
   led.clearLedAll();
   led.setLedColor(CONF_LED_LEFT, LED_CLR_RED, CONF_LED_BRIGHTNESS);
-  delay(1000);
+  testDelay(1000);
 
-  Serial.println("TEST_MODE_LED: Middle LED ON");
+  testLog("TEST_MODE_LED: Middle LED ON");
   led.clearLedAll();
   led.setLedColor(CONF_LED_MIDDLE, LED_CLR_RED, CONF_LED_BRIGHTNESS);
-  delay(1000);
+  testDelay(1000);
 
 
-  Serial.println("TEST_MODE_LED: Right LED ON");
+  testLog("TEST_MODE_LED: Right LED ON");
   led.clearLedAll();
   led.setLedColor(CONF_LED_RIGHT, LED_CLR_RED, CONF_LED_BRIGHTNESS);
-  delay(1000);
+  testDelay(1000);
 
-  Serial.println("TEST_MODE_LED: ALL LED OFF");
+  testLog("TEST_MODE_LED: ALL LED OFF");
   led.clearLedAll();
 
 
-  Serial.println("TEST_MODE_LED: Micro LED Blue");
+  testLog("TEST_MODE_LED: Micro LED Blue");
   led.clearLedAll();
   led.setLedColor(CONF_LED_MICRO, LED_CLR_BLUE, CONF_LED_BRIGHTNESS);
-  delay(1000);
+  testDelay(1000);
 
-  Serial.println("TEST_MODE_LED: Micro LED Purple");
+  testLog("TEST_MODE_LED: Micro LED Purple");
   led.clearLedAll();
   led.setLedColor(CONF_LED_MICRO, LED_CLR_PURPLE, CONF_LED_BRIGHTNESS);
-  delay(1000);
+  testDelay(1000);
 
-  Serial.println("TEST_MODE_LED: Micro LED Red");
+  testLog("TEST_MODE_LED: Micro LED Red");
   led.clearLedAll();
   led.setLedColor(CONF_LED_MICRO, LED_CLR_RED, CONF_LED_BRIGHTNESS);
-  delay(1000);
+  testDelay(1000);
 
-  Serial.println("TEST_MODE_LED: Micro LED Orange");
+  testLog("TEST_MODE_LED: Micro LED Orange");
   led.clearLedAll();
   led.setLedColor(CONF_LED_MICRO, LED_CLR_ORANGE, CONF_LED_BRIGHTNESS);
-  delay(1000);
+  testDelay(1000);
 
-  Serial.println("TEST_MODE_LED: Micro LED Yellow");
+  testLog("TEST_MODE_LED: Micro LED Yellow");
   led.clearLedAll();
   led.setLedColor(CONF_LED_MICRO, LED_CLR_YELLOW, CONF_LED_BRIGHTNESS);
-  delay(1000);
+  testDelay(1000);
 
-  Serial.println("TEST_MODE_LED: Left LED Brightness");
+  testLog("TEST_MODE_LED: Left LED Brightness");
   led.clearLedAll();
 
   int brightnessDirection = 1;
@@ -134,12 +152,12 @@ void testLED() {
     if (brightness == 255) {
       brightnessDirection = -1;  // Switch direction at peak
     }
-    delay(10);
+    testDelay(10);
   }
-  delay(1000);
+  testDelay(1000);
 
 
-  Serial.println("TEST_MODE_LED: Error 3");
+  testLog("TEST_MODE_LED: Error 3");
   led.clearLedAll();
   
   int blinks = 3;
@@ -149,14 +167,17 @@ void testLED() {
   while (ledTimerId[CONF_TIMER_LED_ERROR] >= 0 &&
          ledStateTimer.isEnabled(ledTimerId[CONF_TIMER_LED_ERROR]) == true) {
     ledStateTimer.run();  // Timer for lights
+    buzzer.update();
+    serialTxService();
+    if (g_watchdogArmed) watchdogLoop();
     delay(10);
   }
 
-  delay(1000);
-  Serial.println("TEST_MODE_LED: LED DEFAULT");
+  testDelay(1000);
+  testLog("TEST_MODE_LED: LED DEFAULT");
   setLedDefault();  // set LEDs to default
  
-  Serial.println("TEST_MODE_LED: TEST COMPLETE");
+  testLog("TEST_MODE_LED: TEST COMPLETE");
 }
 
 //***TEST BUZZER FUNCTION***//
@@ -170,36 +191,36 @@ void testLED() {
 //****************************************//
 void testBuzzer() {
 
-  Serial.println("BUZZER TEST ACTIVATED");
+  testLog("BUZZER TEST ACTIVATED");
 
-  Serial.println("TEST_MODE_BUZZER: Playing startup sound.");
+  testLog("TEST_MODE_BUZZER: Playing startup sound.");
   buzzer.playStartupSound();
-  delay(1000);
+  testDelay(1000);
 
-  Serial.println("TEST_MODE_BUZZER: Playing ready sounds.");
+  testLog("TEST_MODE_BUZZER: Playing ready sounds.");
   buzzer.playReadySound();
-  delay(1000);
+  testDelay(1000);
 
-  Serial.println("TEST_MODE_BUZZER: Playing error sound.");
+  testLog("TEST_MODE_BUZZER: Playing error sound.");
   buzzer.playErrorSound();
-  delay(1000);
+  testDelay(1000);
 
-  Serial.println("TEST_MODE_BUZZER: Playing corner calibration sound.");
+  testLog("TEST_MODE_BUZZER: Playing corner calibration sound.");
   buzzer.calibCornerTone();
-  delay(1000);
+  testDelay(1000);
 
-  Serial.println("TEST_MODE_BUZZER: Playing center calibration sound.");
+  testLog("TEST_MODE_BUZZER: Playing center calibration sound.");
   buzzer.calibCenterTone();
-  delay(1000);
+  testDelay(1000);
 
-  Serial.println("TEST_MODE_BUZZER: Playing shutdown sound.");
+  testLog("TEST_MODE_BUZZER: Playing shutdown sound.");
   buzzer.playShutdownSound();
-  delay(1000);
+  testDelay(1000);
 
   // TODO Test Sound levels
   // TODO test enable/disable sound
 
-  Serial.println("SOUND TEST COMPLETE");
+  testLog("SOUND TEST COMPLETE");
 }  // end testBuzzer()
 
 //***TEST WATCHDOG FUNCTION***//
@@ -213,11 +234,10 @@ void testBuzzer() {
 //****************************************//
 void testWatchdog() {
 
-  Serial.println("WATCHDOG TEST ACTIVATED");
+  testLog("WATCHDOG TEST ACTIVATED");
 
-  Serial.println("TEST_MODE_WATCHDOG: Delaying longer than watchdog reset...");
-  Serial.print("TEST_MODE_WATCHDOG: CONF_WATCHDOG_TIMEOUT_SEC:");
-  Serial.println(CONF_WATCHDOG_TIMEOUT_SEC);
+  testLog("TEST_MODE_WATCHDOG: Delaying longer than watchdog reset...");
+  testLog(String("TEST_MODE_WATCHDOG: CONF_WATCHDOG_TIMEOUT_SEC:") + String(CONF_WATCHDOG_TIMEOUT_SEC));
 
   unsigned long watchdogTestStart = millis();
   unsigned long currentTime = millis();
@@ -226,10 +246,10 @@ void testWatchdog() {
 
   while (currentTime - watchdogTestStart < watchdogTestTimeout) {
     delay(1000);
-    Serial.println((currentTime-watchdogTestStart)/1000);
+    testLog(String((currentTime-watchdogTestStart)/1000));
     currentTime = millis();
   }
-  Serial.println("TEST_MODE_WATCHDOG:TEST FAILED"); // Should never reach this if watchdog is enabled
+  testLog("TEST_MODE_WATCHDOG:TEST FAILED"); // Should never reach this if watchdog is enabled
   
-  Serial.println("WATCHDOG TEST COMPLETE");
+  testLog("WATCHDOG TEST COMPLETE");
 }  // end testBuzzer()

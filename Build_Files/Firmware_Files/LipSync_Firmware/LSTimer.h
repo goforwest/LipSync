@@ -22,6 +22,7 @@
 #ifndef _LSTIMER_H
 #define _LSTIMER_H
 
+#include <stdio.h>
 
 template<typename T>
 class LSTimer {
@@ -73,6 +74,7 @@ class LSTimer {
     // overwriting the stopwatch (elapsedTime then reports the new timer's
     // schedule) while numTimers double-counts one slot. See startTimer().
     boolean stopwatch[MAX_TIMERS];
+    boolean callbackActive[MAX_TIMERS];  // Re-entrant run() must not select a slot whose callback is currently executing
     
     int numTimers; 
     // Refused/invalid operation counters (bench 2026-10-18, pool hygiene):
@@ -90,6 +92,7 @@ class LSTimer {
 
     int findFirstFreeSlot();                                                      // Find the first available slot
     int setupTimer(unsigned long interval, unsigned long startDelay, boolean on, boolean hasParam, unsigned n, void* f, T* p);  
+    void reportRefusal(const char* kind);
     
   public:
     LSTimer();                                                                    // Constructor
@@ -144,6 +147,7 @@ LSTimer<T>::LSTimer() { // TODO 2025-Feb-07 Consider adding overridden function 
         memset(&timer[i], 0, sizeof (timer_t)); //  Initialize each timer
         timer[i].previousTime = current_millis;  //  Set the start time for each timer
         stopwatch[i] = false;                   //  No stopwatch slots in use yet
+        callbackActive[i] = false;
     }
 
     numTimers = 0;
@@ -174,6 +178,9 @@ void LSTimer<T>::run() {
     // Determine which timers should be called
     for (i = 0; i < MAX_TIMERS; i++) {
 
+        // A nested run() must leave the outer callback's deferred disposition
+        // intact (especially RUNANDDEL, which the outer pass still owns).
+        if (callbackActive[i]) continue;
         timer[i].toBeCalled = DEFCALL_DONTRUN;  // Default case is not to run
 
         if (timer[i].callback != NULL) {
@@ -240,14 +247,19 @@ void LSTimer<T>::run() {
     //    after its current fire.
     for (i = 0; i < MAX_TIMERS; i++) {
 
+      if (callbackActive[i]) continue;
       if (timer[i].toBeCalled != DEFCALL_DONTRUN){    // Check if timer should be run, if not equal to DONTRUN (either RUNONLY or RUNANDDEL)
           if (timer[i].toBeCalled == DEFCALL_RUNONLY){
             timer[i].toBeCalled = DEFCALL_DONTRUN;  // Cleared BEFORE the invoke: a nested run() cannot double-fire this slot
           }
           if (timer[i].hasParam) {
+            callbackActive[i] = true;
             (*(timerCallbackParamPtr)timer[i].callback)(timer[i].param);
+            callbackActive[i] = false;
           } else {
+            callbackActive[i] = true;
             (*(timerCallbackPtr)timer[i].callback)();
+            callbackActive[i] = false;
           }
 
           if (timer[i].toBeCalled == DEFCALL_RUNANDDEL){  // Check if timer should be deleted
@@ -316,9 +328,7 @@ int LSTimer<T>::setupTimer(unsigned long interval, unsigned long startDelay, boo
         if (!refusalPrinted || (millis() - lastRefusalPrintMs) > 30000UL) {
           refusalPrinted = true;
           lastRefusalPrintMs = millis();
-          Serial.print("ERROR: LSTimer refused a 0-interval RUN_FOREVER registration (");
-          Serial.print(refusedRegistrations);
-          Serial.println(" total) -- it would livelock run(); NOT registered");
+          reportRefusal("0ms interval");
         }
         return -1;
     }
@@ -337,11 +347,7 @@ int LSTimer<T>::setupTimer(unsigned long interval, unsigned long startDelay, boo
         if (!refusalPrinted || (millis() - lastRefusalPrintMs) > 30000UL) {
           refusalPrinted = true;
           lastRefusalPrintMs = millis();
-          Serial.print("ERROR: LSTimer registration refused (");
-            Serial.print(refusedRegistrations);
-            Serial.print(" total, ");
-            Serial.print(getNumAvailableTimers());
-            Serial.println(" slots free) -- the timer/callback was NOT registered");
+          reportRefusal("registration");
         }
         return -1;
     }
@@ -356,10 +362,35 @@ int LSTimer<T>::setupTimer(unsigned long interval, unsigned long startDelay, boo
     timer[freeTimerIndex].startDelayTime = startDelay;
     timer[freeTimerIndex].startDelayEnabled = on;
     timer[freeTimerIndex].previousTime = millis();
+    timer[freeTimerIndex].toBeCalled = DEFCALL_DONTRUN;
+    callbackActive[freeTimerIndex] = false;
 
     numTimers++;
 
     return freeTimerIndex;
+}
+
+// One compact diagnostic. Firmware builds route it through the framed CDC
+// queue; standalone/host users get an all-or-nothing immediate write. Direct
+// Serial.print chains can enter the CDC driver's unbounded full-FIFO wait
+// between fragments, and timer exhaustion must never become a loop hang.
+template<typename T>
+void LSTimer<T>::reportRefusal(const char* kind) {
+    char line[64];
+    int len = snprintf(line, sizeof(line), "ERROR: LSTimer %s refused; total=%d free=%d",
+                       kind, refusedRegistrations, getNumAvailableTimers());
+    if (len <= 0 || len >= (int)sizeof(line)) return;
+#ifdef LSTIMER_USE_SERIAL_TX_QUEUE
+    serialTxEnqueueLine(line, (size_t)len);
+#else
+    // Standalone/host users do not have the firmware queue. Keep their sink
+    // non-blocking and append the frame delimiter only when the whole record
+    // fits immediately.
+    if (len + 1 < (int)sizeof(line) && Serial.availableForWrite() >= len + 1) {
+        line[len++] = '\n';
+        Serial.write((const uint8_t*)line, (size_t)len);
+    }
+#endif
 }
 
 
@@ -552,11 +583,7 @@ int LSTimer<T>::startTimer() {
         if (!refusalPrinted || (millis() - lastRefusalPrintMs) > 30000UL) {
           refusalPrinted = true;
           lastRefusalPrintMs = millis();
-          Serial.print("ERROR: LSTimer stopwatch registration refused (");
-            Serial.print(refusedRegistrations);
-            Serial.print(" total, ");
-            Serial.print(getNumAvailableTimers());
-            Serial.println(" slots free) -- the stopwatch was NOT started");
+          reportRefusal("stopwatch");
         }
         return -1;
     }
@@ -650,6 +677,7 @@ int LSTimer<T>::deleteTimer(int timerId) {
         memset(&timer[timerId], 0, sizeof (timer_t));
         timer[timerId].previousTime = millis();
         stopwatch[timerId] = false;
+        callbackActive[timerId] = false;
 
         // update number of timers
         numTimers--;

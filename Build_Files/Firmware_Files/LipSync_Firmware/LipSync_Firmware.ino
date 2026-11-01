@@ -23,6 +23,7 @@
 #include "LSUtils.h"
 #include "LSApiDeclarations.h"  // Explicit cross-tab declarations (roadmap item 5) — early so every tab sees them
 #include "LSConfig.h"
+#define LSTIMER_USE_SERIAL_TX_QUEUE 1  // Normal-context timer diagnostics share the line-safe CDC queue
 #include "LSTimer.h"
 #include <ArduinoJson.h>
 #include "LSOutput.h"
@@ -59,6 +60,7 @@ uint32_t g_lastRebootReason = 0;
 bool g_watchdogReset = false;
 uint8_t g_watchdogBootCount = 0;  // Consecutive watchdog-reset boots (see LSWatchdog.h)
 uint8_t g_hangBootStreak = 0;     // Consecutive TIMER3-witnessed loop-hang deaths (survives the SREQ resets via GPREGRET2 bits 0-1 — see checkResetReason)
+bool g_usbRecoveryRestartedPrev = false; // True only on the immediate successor of the automatic USB-recovery reset
 bool g_safeModeEnabled = false;
 int  g_safeModeReason = 0;
 bool readyToUseFirstTime = true;
@@ -93,7 +95,7 @@ int sapActionSize;
 unsigned long sapActionMaxTime = 0;
 
 // Timer related variables
-int actionTimerId[1] = {-1};  // 1 action timer
+int actionTimerId[8] = {-1, -1, -1, -1, -1, -1, -1, -1};  // Independent B1-B8 pulse-release timers
 LSTimer<int> actionTimer;
 
 int calibrationTimerId[2] = {-1, -1};  // 2 calibration timers: 0 - , 1-
@@ -108,7 +110,6 @@ LSTimer<ledStateStruct> ledStateTimer;
 int usbConnectTimerId[1] = {-1};
 LSTimer<int> usbConnectTimer;
 
-unsigned int g_usbAttempt = 0;
 unsigned int g_usbConnectDelay = CONF_USB_HID_INIT_DELAY;
 unsigned long g_usbNotReadySinceMs = 0;  // When the current HID-not-ready stretch began; 0 = none in progress
 unsigned int g_usbReenumCount = 0;        // Forced re-enumerations spent on the current episode
@@ -245,7 +246,7 @@ extern "C" void TIMER3_IRQHandler(void) {
   // watchdogLoop()'s reset. 4 consecutive un-fed seconds = the loop stalled
   // past 3 s with interrupts alive.
   if (!g_shutdownInProgress && g_watchdogArmed && ++g_witnessSecondsUnfed >= 4) {
-    lipsyncRetentionUpdate(1, 0x1C, 0x04);  // 4.5.27: the SD-aware marker write (the raw POWER write was an APP_MEMACC kill with the SD up) — marker 1: loop hang witnessed (trail bits preserved)
+    lipsyncRetentionUpdate(1, 0x1C, (uint8_t)(CONF_RETENTION_MARKER_HANG << 2));  // SD-aware marker write; trail bits preserved
     NVIC_SystemReset();  // SREQ — retention survives; the next boot reports pt=/pm=
   }
 }
@@ -283,7 +284,7 @@ void bootTrailStamp(uint8_t step) {
 // pm=1 keeps its meaning (witnessed hang); pm=0 + a dead BLE boot now means
 // "SD assert / non-HardFault reset" by elimination. The capture ALSO
 // encodes the faulting PC's 8 KB flash page into GPREGRET (0xC0|page —
-// values 0xC0-0xCF collide with none of the bootloader's DFU magics
+  // values 0xC0-0xFF collide with none of the bootloader's DFU magics
 // 0x4e/0x57/0xa8; the SD exposes GPREGRET set only via SVC, so the write is
 // best-effort from fault context — if the SD eats it or the bootloader
 // clears it, only the location is lost, never the class). The successor
@@ -310,11 +311,14 @@ extern "C" __attribute__((used, noinline)) void lipsyncFaultCapture(uint32_t* fr
   // RAW, deliberately (4.5.27): SVCs are impossible at fault priority, and
   // the SD's watch unit is a WATCH — the write itself completes, the
   // violation is only reported afterwards, and we reset 100 ms later anyway.
-  NRF_POWER->GPREGRET2 = (NRF_POWER->GPREGRET2 & ~0x1CUL) | (2UL << 2);
+  NRF_POWER->GPREGRET2 = (NRF_POWER->GPREGRET2 & ~0x1CUL) | ((uint32_t)CONF_RETENTION_MARKER_HARDFAULT << 2);
   // location: the faulting PC's 8 KB flash page into GPREGRET (best-effort —
   // see the header note). The app's flash spans 0x26000-0x75000, so
-  // (pc >> 13) is 4 bits; 0xC0 | that can never equal a bootloader magic.
-  NRF_POWER->GPREGRET = 0xC0UL | ((g_faultFramePc >> 13) & 0x0FUL);
+  // (pc >> 13) fits in 6 bits across the whole nRF52840 flash. The previous
+  // 4-bit mask aliased app pages 0x26000+ into the SoftDevice range and made
+  // fp= point at the wrong module. 0xC0 marks the record; low 6 bits retain
+  // the complete 8 KB page index.
+  NRF_POWER->GPREGRET = 0xC0UL | ((g_faultFramePc >> 13) & 0x3FUL);
   // Best-effort, strictly non-blocking print. Adafruit_USBD_CDC::write()
   // otherwise yields forever when DTR is up but the host is not draining;
   // fault context must always reach the reset. The retention markers above
@@ -456,6 +460,7 @@ uint32_t g_scrollNumRuns = 0;  // unsigned wrap is defined for long-lived scroll
 
 int outputAction;
 bool canOutputAction = true;
+int g_outputHoldInputClass = -1;  // Input class that owns the active drag/scroll latch
 // 4.5.7 bench fix: the hold duration (ms) of the input that is CURRENTLY
 // dispatching, for selectMenuItem's hold-to-confirm gate on the destructive
 // rows. Set fresh on every evaluateOutputAction pass (0 = no input in
@@ -529,7 +534,7 @@ static void bleInitTaskBody(void* arg) {
   btmouse.begin(g_bleDeviceName);
   g_bleInitDone = true;               // completion flag first...
   if (needsInitialization) {          // ...then the verdict (true = a stage failed)
-    Serial.println(F("BOOT: BLE task FAILED (see stage line above)"));
+    if (USB_DEBUG) { Serial.println(F("BOOT: BLE task FAILED (see stage line above)")); }
   } else {
     if (USB_DEBUG) { Serial.println(F("BOOT: BLE task up")); }
   }
@@ -555,12 +560,18 @@ void setup() {
   g_bootTrailPrev = readTrailByte();
   g_hangMarkerPrev = (lipsyncRetentionGet(1) >> 2) & 0x07;
   lipsyncRetentionUpdate(1, 0x1C, 0);  // consume the marker — one hang reports once (4.5.27: SD-aware)
+  // Marker 3 is a deliberate USB-recovery reset, not an abnormal boot. Its
+  // boolean guard was captured by checkResetReason(); suppress it from the
+  // crash report while retaining the one-shot decision for this whole boot.
+  if (g_hangMarkerPrev == CONF_RETENTION_MARKER_USB_RECOVERY) {
+    g_hangMarkerPrev = 0;
+  }
   // 4.5.23: consume the previous boot's HardFault PC page (written by
   // lipsyncFaultCapture into GPREGRET; 0xC0|page — see the discriminator
   // note above the handler). Absent/cleared → 0xFF = "no fault recorded".
   const uint32_t faultReg = lipsyncRetentionGet(0);
   if ((faultReg & 0xC0UL) == 0xC0UL) {
-    g_faultPrevPage = (uint8_t)(faultReg & 0x0FUL);
+    g_faultPrevPage = (uint8_t)(faultReg & 0x3FUL);
     lipsyncRetentionUpdate(0, 0xFF, 0);  // consume — one fault reports once (4.5.27: SD-aware)
   } else {
     g_faultPrevPage = 0xFF;
@@ -657,16 +668,63 @@ void setup() {
   // CM=2 safe boot).
   checkSafeMode();
 
-  beforeComOpMillis = millis() - beginMillis;  // Note time before USB/BT connection
-  beginComOpMode();                            // Initialize Operating Mode, Communication Mode, and start instance of mouse or gamepad
-  afterComOpMillis = millis() - beginMillis;   // Note time after USB/BT connection
+  // Arm the hardware watchdog BEFORE third-party device begin() calls. The
+  // pinned Adafruit pressure drivers contain unbounded software-reset-bit
+  // loops; on an I2C failure their BusIO read returns all ones, which those
+  // loops interpret as "still resetting" forever. A normal boot can now lose
+  // at most one watchdog interval, and its watchdog-safe successor skips the
+  // suspect sensor initialization below and remains recoverable over CDC.
+  if (CONF_ENABLE_WATCHDOG && g_watchdogBootCount < CONF_WATCHDOG_BOOT_RETRY_LIMIT) {
+    initWatchdog();
+  } else if (NRF_WDT->RUNSTATUS != 0) {
+    // nRF52 WDT cannot be stopped once started and survives warm resets.
+    // The settled safe boot (or a developer build that disables future WDT
+    // starts) must keep feeding an inherited instance even though it does not
+    // arm another hang-witness cycle.
+    g_watchdogArmed = true;
+    watchdogLoop();
+  }
 
-
+  // Missing required hardware is also a safe-mode DECISION and must land
+  // before beginComOpMode() registers HID or defers a BLE initialization
+  // task. The old order probed I2C afterwards, so a degraded CM=BLE boot
+  // still attached and started the SoftDevice task before calling itself
+  // safe. Every safe boot's recovery surface is CDC-only, regardless of the
+  // reason that selected it.
   checkI2C();  // Check that I2C devices are connected
 
+  if (!g_displayConnected || !g_mouthpiecePressureSensorConnected
+      || !g_ambientPressureSensorConnected || !g_joystickSensorConnected) {
+    g_safeModeEnabled = true;
+    g_safeModeReason = CONF_SAFE_MODE_REASON_HARDWARE;
+    g_operatingMode = CONF_OPERATING_MODE_SAFE;
+  }
+
+  // Initialize every detected device before committing to an HID/BLE
+  // interface. An address scan can ACK while the driver's configuration
+  // still fails; the begin verdicts below update the same connection globals
+  // used by the hardware-safe decision.
   if (g_displayConnected) {
     initScreen();
   }
+  if (!g_safeModeEnabled && g_mouthpiecePressureSensorConnected && g_ambientPressureSensorConnected) {
+    initSipAndPuff();
+  }
+  if (!g_safeModeEnabled && g_joystickSensorConnected) {
+    initJoystick();
+  }
+  initAcceleration();  // Load the stored cursor acceleration level (roadmap item 9)
+
+  if (!g_displayConnected || !g_mouthpiecePressureSensorConnected
+      || !g_ambientPressureSensorConnected || !g_joystickSensorConnected) {
+    g_safeModeEnabled = true;
+    g_safeModeReason = CONF_SAFE_MODE_REASON_HARDWARE;
+    g_operatingMode = CONF_OPERATING_MODE_SAFE;
+  }
+
+  beforeComOpMillis = millis() - beginMillis;  // Note time before USB/BT connection
+  beginComOpMode();                            // Initialize Operating Mode, Communication Mode, and start instance of mouse or gamepad
+  afterComOpMillis = millis() - beginMillis;   // Note time after USB/BT connection
 
   if (USB_DEBUG) {
     unsigned long startSerialWaitTime = millis();
@@ -676,6 +734,7 @@ void setup() {
       screen.print4LineString("Waiting", "for serial", "connection", "...");
     }
     while (!Serial) {  //wait for serial connection to establish
+      if (g_watchdogArmed) watchdogLoop();
       delay(1);
       currentSerialWaitTime = millis();
       if (currentSerialWaitTime - startSerialWaitTime > SERIAL_WAIT_TIMEOUT){
@@ -691,16 +750,6 @@ void setup() {
   if (g_displayConnected) {
     screen.splashScreen();
   }
-
-  if (g_mouthpiecePressureSensorConnected && g_ambientPressureSensorConnected) {
-    initSipAndPuff();  // Initialize Sip And Puff
-  }
-
-  if (g_joystickSensorConnected) {
-    initJoystick();  // Initialize Joystick
-  }
-
-  initAcceleration();  // Load the stored cursor acceleration level (roadmap item 9)
 
   startupFeedback();  // Startup LED Feedback
 
@@ -725,9 +774,10 @@ void setup() {
   // names the dead feature at boot instead of leaving it a mystery.
   for (int timerIdx = 0; timerIdx < CONF_TIMER_NUM; timerIdx++) {
     if (pollTimerId[timerIdx] < 0) {
-      Serial.print("ERROR: poll timer ");
-      Serial.print(timerIdx);
-      Serial.println(" failed to register — that loop WILL NOT RUN");
+      String timerError = "ERROR: poll timer ";
+      timerError += String(timerIdx);
+      timerError += " failed to register — that loop WILL NOT RUN";
+      serialTxEnqueueLine(timerError);
     }
   }
 
@@ -796,16 +846,11 @@ void setup() {
 
   toggleSafeMode(g_safeModeEnabled);
 
-  // Arm the hardware watchdog on every boot — including safe mode and
-  // watchdog-reset boots, which are exactly the boots that need it most (a
-  // safe-mode unit already has hardware trouble, and the old
-  // !g_watchdogReset && !g_safeModeEnabled guard left both with no recovery
-  // from a wedged main loop other than unplugging). Only a run of
-  // CONF_WATCHDOG_BOOT_RETRY_LIMIT consecutive watchdog resets stops
-  // re-arming, so a genuinely wedged device settles in safe mode instead of
-  // resetting forever.
-  if (CONF_ENABLE_WATCHDOG && g_watchdogBootCount < CONF_WATCHDOG_BOOT_RETRY_LIMIT) { 
-    initWatchdog();  // Initialize hardware watchdog
+  // The hardware WDT was armed before device-driver initialization above.
+  // Arm its TIMER3 hang witness only while the crash budget remains. On the
+  // settled safe boot an inherited (unstoppable) WDT is still fed, but no new
+  // witness SREQ is allowed to extend the reset chain.
+  if (CONF_ENABLE_WATCHDOG && g_watchdogArmed && g_watchdogBootCount < CONF_WATCHDOG_BOOT_RETRY_LIMIT) {
     initHangWitness();  // witness v8: the TIMER3 hang witness — converts a loop hang into an SREQ that preserves the trail
     bootTrailStamp(1);  // witness v7: setup complete (the only boot-phase code; deaths are all loop-phase)
   }
@@ -824,7 +869,7 @@ void setup() {
       g_bleInitStage = 1;
       g_bleInitDone = true;
       g_bleVerdictDirty = true;
-      Serial.println(F("BOOT: BLE FAILED to create init task"));
+      if (USB_DEBUG) { Serial.println(F("BOOT: BLE FAILED to create init task")); }
     }
   }
 
@@ -847,6 +892,7 @@ void setup() {
 //*********************************//
 void loop() {
   serialTxService();
+  bool bootReportPendingThisPass = false;
   // 4.5.10: any host byte stops the repeating boot header (below) — the
   // app's connect sends SETTINGS within milliseconds of opening the port,
   // so a connected session falls silent after one extra line at most.
@@ -867,52 +913,7 @@ void loop() {
       // classes keep it — each one leaves a marker, a fault page, a failed
       // verdict, or a lockup bit, and this line still carries the full
       // forensics for exactly those boots.
-      if (g_bootReportWorthy) {
-      int bleStateFinal = 0;
-      if (g_bleInitPending) {
-        bleStateFinal = g_bleInitDone ? (needsInitialization ? 3 : 2) : 1;
-      }
-      Serial.print(F("BOOT: "));
-      Serial.print(CONF_LIPSYNC_VERSION_STRING);
-      Serial.print(F(" rst=0x"));
-      Serial.print(g_lastRebootReason, HEX);
-      Serial.print(F(" pt="));
-      Serial.print(g_bootTrailPrev);
-      Serial.print(F(" pm="));
-      Serial.print(g_hangMarkerPrev);
-      Serial.print(F(" ble="));
-      Serial.print(bleStateFinal);
-      Serial.print(F(" st="));
-      Serial.print(g_bleInitStage);
-      Serial.print(F(" sd="));
-      Serial.print(g_bleSdWasEnabled);  // -1 = probe not run (init still in flight), 0 = SD was down, 1 = SD was ALREADY enabled (bootloader leftover)
-      Serial.print(F(" pstep="));
-      Serial.print(g_bleProbeStep);
-      Serial.print(F(" pcode=0x"));
-      Serial.print(g_bleProbeCode, HEX);
-      Serial.print(F(" need=0x"));
-      Serial.print(g_bleProbeNeed, HEX);
-      Serial.print(F(" bad1=0x"));
-      Serial.print(g_bleIrqBad1, HEX);
-      Serial.print(F(" bad2=0x"));
-      Serial.print(g_bleIrqBad2, HEX);
-      Serial.print(F(" dem="));
-      Serial.print(g_bleProbeDemoted);
-      Serial.print(F(" rc=0x"));
-      Serial.print(g_bleInitRc, HEX);
-      Serial.print(F(" pst="));
-      Serial.print(g_blePrevSt);  // 4.5.20: the PREVIOUS BLE boot's persisted verdict (-1 = none, 0 = died during begin, 1..4 = stage failure, 5 = init succeeded)
-      Serial.print(F(" prc=0x"));
-      Serial.print(g_blePrevRc, HEX);
-      Serial.print(F(" fp=0x"));
-      if (g_faultPrevPage == 0xFF) {
-        Serial.println(F("none"));  // 4.5.23: no HardFault recorded by the previous boot
-      } else {
-        Serial.print(((uint32_t)g_faultPrevPage) << 13, HEX);  // the faulting PC's 8 KB flash page — map it against the .map file
-      }
-      Serial.print(F(" sw="));
-      Serial.println(g_loopTaskHandle ? uxTaskGetStackHighWaterMark(g_loopTaskHandle) : 0);  // 4.5.26: loop-task stack high-water (FreeRTOS words) — near-zero = the 4 KB stack overflows on the BLE path
-      }
+      bootReportPendingThisPass = g_bootReportWorthy;
     }
     g_hostHasSpoken = true;
   }
@@ -944,6 +945,7 @@ void loop() {
   // poll). This service is non-blocking and sends only when HID is ready.
   usbmouse.service();
   btmouse.service();
+  gamepad.service();
 
   // Degraded-state heartbeat (bench 2026-10-18, boot-with-unseated-cable
   // forensics): a 4.5.0 boot with the interface cable unseated reset at an
@@ -984,72 +986,39 @@ void loop() {
   const unsigned long heartbeatIntervalMs = 5000;
   if (degradedNow && (millis() - lastHeartbeatMs >= heartbeatIntervalMs)) {
     lastHeartbeatMs = millis();
-    Serial.print(F("HB: ms="));
-    Serial.print(millis());
-    Serial.print(F(" mode="));
-    Serial.print(g_operatingMode);
-    Serial.print(F(" safe="));
-    Serial.print(g_safeModeEnabled ? 1 : 0);
-    Serial.print(F(" wdt="));
-    Serial.print(g_watchdogArmed ? 1 : 0);
-    Serial.print(F(" feed="));
-    if (g_watchdogLastFeedMs == 0) {
-      Serial.print(F("never"));
-    } else {
-      Serial.print(millis() - g_watchdogLastFeedMs);
-      Serial.print(F("ms"));
-    }
-    Serial.print(F(" rst=0x"));
-    Serial.print(g_lastRebootReason, HEX);
-    Serial.print(F(" pt="));
-    Serial.print(g_bootTrailPrev);
-    Serial.print(F(" pm="));
-    Serial.print(g_hangMarkerPrev);
-    Serial.print(F(" trail="));
-    Serial.print(readTrailByte());
-    Serial.print(F(" bus="));
-    Serial.print(Wire.busHealthy() ? 1 : 0);
-    Serial.print(F(" recov="));
-    Serial.print(Wire.recoveryCount());
-
-    Serial.print(F(" sns="));
-    Serial.print(g_joystickSensorConnected ? 1 : 0);
-    Serial.print(g_mouthpiecePressureSensorConnected ? 1 : 0);
-    Serial.print(g_ambientPressureSensorConnected ? 1 : 0);
-    Serial.print(g_displayConnected ? 1 : 0);
+    static char diagnosticLine[512];  // Static: do not consume the loop task's 4 KB stack
+    char feedText[24];
+    if (g_watchdogLastFeedMs == 0) snprintf(feedText, sizeof(feedText), "never");
+    else snprintf(feedText, sizeof(feedText), "%lums", (unsigned long)(millis() - g_watchdogLastFeedMs));
+    char faultText[16];
+    if (g_faultPrevPage == 0xFF) snprintf(faultText, sizeof(faultText), "none");
+    else snprintf(faultText, sizeof(faultText), "%lX", (unsigned long)(((uint32_t)g_faultPrevPage) << 13));
+    int diagnosticLen;
     if (bleInitFailed) {
-      Serial.print(F(" ble=3 st="));
-      Serial.print(g_bleInitStage);
-      Serial.print(F(" sd="));
-      Serial.print(g_bleSdWasEnabled);
-      Serial.print(F(" pstep="));
-      Serial.print(g_bleProbeStep);
-      Serial.print(F(" pcode=0x"));
-      Serial.print(g_bleProbeCode, HEX);
-      Serial.print(F(" need=0x"));
-      Serial.print(g_bleProbeNeed, HEX);
-      Serial.print(F(" bad1=0x"));
-      Serial.print(g_bleIrqBad1, HEX);
-      Serial.print(F(" bad2=0x"));
-      Serial.print(g_bleIrqBad2, HEX);
-      Serial.print(F(" dem="));
-      Serial.print(g_bleProbeDemoted);
-      Serial.print(F(" rc=0x"));
-      Serial.print(g_bleInitRc, HEX);
-      Serial.print(F(" pst="));
-      Serial.print(g_blePrevSt);
-      Serial.print(F(" prc=0x"));
-      Serial.print(g_blePrevRc, HEX);
-      Serial.print(F(" fp=0x"));
-      if (g_faultPrevPage == 0xFF) {
-        Serial.print(F("none"));
-      } else {
-        Serial.print(((uint32_t)g_faultPrevPage) << 13, HEX);
-      }
-      Serial.print(F(" sw="));
-      Serial.println(g_loopTaskHandle ? uxTaskGetStackHighWaterMark(g_loopTaskHandle) : 0);  // 4.5.26: stack high-water — the overflow verdict
+      diagnosticLen = snprintf(diagnosticLine, sizeof(diagnosticLine),
+        "HB: ms=%lu mode=%d safe=%d wdt=%d feed=%s rst=0x%lX pt=%u pm=%u trail=%u bus=%d recov=%lu sns=%d%d%d%d ble=3 st=%d sd=%d pstep=%u pcode=0x%lX need=0x%lX bad1=0x%lX bad2=0x%lX dem=%u rc=0x%lX pst=%d prc=0x%X fp=0x%s sw=%lu",
+        (unsigned long)millis(), g_operatingMode, g_safeModeEnabled ? 1 : 0,
+        g_watchdogArmed ? 1 : 0, feedText, (unsigned long)g_lastRebootReason,
+        g_bootTrailPrev, g_hangMarkerPrev, readTrailByte(), Wire.busHealthy() ? 1 : 0,
+        (unsigned long)Wire.recoveryCount(), g_joystickSensorConnected ? 1 : 0,
+        g_mouthpiecePressureSensorConnected ? 1 : 0, g_ambientPressureSensorConnected ? 1 : 0,
+        g_displayConnected ? 1 : 0, g_bleInitStage, (int)g_bleSdWasEnabled,
+        g_bleProbeStep, (unsigned long)g_bleProbeCode, (unsigned long)g_bleProbeNeed,
+        (unsigned long)g_bleIrqBad1, (unsigned long)g_bleIrqBad2, g_bleProbeDemoted,
+        (unsigned long)g_bleInitRc, (int)g_blePrevSt, (unsigned int)g_blePrevRc,
+        faultText, (unsigned long)(g_loopTaskHandle ? uxTaskGetStackHighWaterMark(g_loopTaskHandle) : 0));
     } else {
-      Serial.println();
+      diagnosticLen = snprintf(diagnosticLine, sizeof(diagnosticLine),
+        "HB: ms=%lu mode=%d safe=%d wdt=%d feed=%s rst=0x%lX pt=%u pm=%u trail=%u bus=%d recov=%lu sns=%d%d%d%d",
+        (unsigned long)millis(), g_operatingMode, g_safeModeEnabled ? 1 : 0,
+        g_watchdogArmed ? 1 : 0, feedText, (unsigned long)g_lastRebootReason,
+        g_bootTrailPrev, g_hangMarkerPrev, readTrailByte(), Wire.busHealthy() ? 1 : 0,
+        (unsigned long)Wire.recoveryCount(), g_joystickSensorConnected ? 1 : 0,
+        g_mouthpiecePressureSensorConnected ? 1 : 0, g_ambientPressureSensorConnected ? 1 : 0,
+        g_displayConnected ? 1 : 0);
+    }
+    if (diagnosticLen > 0 && diagnosticLen < (int)sizeof(diagnosticLine)) {
+      serialTxEnqueueLine(diagnosticLine, (size_t)diagnosticLen);
     }
   }
 
@@ -1057,8 +1026,15 @@ void loop() {
   // flag, the loop (sole owner of all filesystem access) performs the write.
   // Runs within milliseconds of the flag, well before begin() completes.
   if (g_bleVerdictDirty) {
+    // Atomic take-and-clear across the higher-priority BLE init task. Without
+    // the critical section, that task could set dirty between this loop's
+    // test and clear, and the clear would erase the final stage-5 verdict.
+    bool persistVerdict = false;
+    taskENTER_CRITICAL();
+    persistVerdict = g_bleVerdictDirty;
     g_bleVerdictDirty = false;
-    bleVerdictPersist();
+    taskEXIT_CRITICAL();
+    if (persistVerdict) bleVerdictPersist();
   }
 
   ledStateTimer.run();  // Timer for lights
@@ -1080,6 +1056,26 @@ void loop() {
   buzzer.update();  // Fire queued buzzer notes (non-blocking sound sequencing)
 
   settingsEnabled = serialSettings(settingsEnabled);  // Process Serial API commands
+  if (bootReportPendingThisPass) {
+    static char bootLine[384];  // Static: keep the diagnostic off the loop task stack
+    char faultText[16];
+    if (g_faultPrevPage == 0xFF) snprintf(faultText, sizeof(faultText), "none");
+    else snprintf(faultText, sizeof(faultText), "%lX", (unsigned long)(((uint32_t)g_faultPrevPage) << 13));
+    int bleStateFinal = 0;
+    if (g_bleInitPending) bleStateFinal = g_bleInitDone ? (needsInitialization ? 3 : 2) : 1;
+    int bootLen = snprintf(bootLine, sizeof(bootLine),
+      "BOOT: %s rst=0x%lX pt=%u pm=%u ble=%d st=%d sd=%d pstep=%u pcode=0x%lX need=0x%lX bad1=0x%lX bad2=0x%lX dem=%u rc=0x%lX pst=%d prc=0x%X fp=0x%s sw=%lu",
+      CONF_LIPSYNC_VERSION_STRING.c_str(), (unsigned long)g_lastRebootReason,
+      g_bootTrailPrev, g_hangMarkerPrev, bleStateFinal, g_bleInitStage,
+      (int)g_bleSdWasEnabled, g_bleProbeStep, (unsigned long)g_bleProbeCode,
+      (unsigned long)g_bleProbeNeed, (unsigned long)g_bleIrqBad1,
+      (unsigned long)g_bleIrqBad2, g_bleProbeDemoted, (unsigned long)g_bleInitRc,
+      (int)g_blePrevSt, (unsigned int)g_blePrevRc, faultText,
+      (unsigned long)(g_loopTaskHandle ? uxTaskGetStackHighWaterMark(g_loopTaskHandle) : 0));
+    if (bootLen > 0 && bootLen < (int)sizeof(bootLine)) {
+      serialTxEnqueueLine(bootLine, (size_t)bootLen);
+    }
+  }
   serialTxService();
   //yield();
 }
@@ -1099,6 +1095,7 @@ void initGlobals() {
 
   g_lastRebootReason = 0;
   g_ambientPressureSensorConnected = false;
+  g_mouthpiecePressureSensorConnected = false;
   g_joystickSensorConnected = false;
   g_displayConnected = false;
   g_btIsConnected = false;
@@ -1149,7 +1146,8 @@ void hardwareErrorCheck(void) {
   if (!g_displayConnected) {
     // Display not connected / detected
     buzzer.playErrorSound();
-    Serial.println("ERROR: Display not detected");
+    static const char displayError[] = "ERROR: Display not detected";
+    serialTxEnqueueLine(displayError, sizeof(displayError) - 1);
     ledError(3);
     g_safeModeEnabled = true;
     g_safeModeReason = CONF_SAFE_MODE_REASON_HARDWARE;
@@ -1158,7 +1156,8 @@ void hardwareErrorCheck(void) {
   if (!g_joystickSensorConnected && !g_mouthpiecePressureSensorConnected && !g_ambientPressureSensorConnected) {
     // All joystick sensors not detected
     buzzer.playErrorSound();
-    Serial.println("ERROR: No sensors detected in joystick. Check interface cable.");
+    static const char cableError[] = "ERROR: No sensors detected in joystick. Check interface cable.";
+    serialTxEnqueueLine(cableError, sizeof(cableError) - 1);
     g_safeModeEnabled = true;
     g_safeModeReason = CONF_SAFE_MODE_REASON_HARDWARE;
     
@@ -1170,13 +1169,16 @@ void hardwareErrorCheck(void) {
     
     buzzer.playErrorSound();
     if (!g_joystickSensorConnected) {
-      Serial.println("ERROR: Joystick sensor not detected.");
+      static const char joystickError[] = "ERROR: Joystick sensor not detected.";
+      serialTxEnqueueLine(joystickError, sizeof(joystickError) - 1);
     }
     if (!g_mouthpiecePressureSensorConnected) {
-      Serial.println("ERROR: Mouthpiece Pressure Sensor not detected.");
+      static const char mouthpieceError[] = "ERROR: Mouthpiece Pressure Sensor not detected.";
+      serialTxEnqueueLine(mouthpieceError, sizeof(mouthpieceError) - 1);
     }
     if (!g_ambientPressureSensorConnected) {
-      Serial.println("ERROR: Ambient Pressure Sensor not detected.");
+      static const char ambientError[] = "ERROR: Ambient Pressure Sensor not detected.";
+      serialTxEnqueueLine(ambientError, sizeof(ambientError) - 1);
     }
     
   }
@@ -1287,14 +1289,15 @@ void checkSafeMode(void) {
     // interrupts-alive stall — the SREQ resets PRESERVE the retention
     // register, so unlike the watchdog-reset budget this streak actually
     // accumulates). Rest this boot in safe mode: the safe-mode loop is the
-    // minimal machinery, and the watchdog/witness are not re-armed (the
-    // streak feeds the existing g_watchdogBootCount gate in setup()) — the
+    // minimal machinery, and TIMER3 is not re-armed (an inherited hardware
+    // WDT remains fed; the streak feeds g_watchdogBootCount in setup()) — the
     // documented "after N straight crash boots, the device settles in
     // safe mode instead of resetting forever" contract, finally
     // functional on the path that can actually count.
     g_safeModeEnabled = true;
     g_safeModeReason = CONF_SAFE_MODE_REASON_HANG;
-    Serial.println("WARNING: SAFE MODE ENABLED - Repeated witnessed loop hangs");
+    static const char hangWarning[] = "WARNING: SAFE MODE ENABLED - Repeated witnessed loop hangs";
+    serialTxEnqueueLine(hangWarning, sizeof(hangWarning) - 1);
 
   } else {
     g_safeModeEnabled = false;
@@ -1325,22 +1328,26 @@ void toggleSafeMode(bool safeModeEnabled) {
     switch(g_safeModeReason) {
       case CONF_SAFE_MODE_REASON_INPUT:
       {
-        Serial.println("WARNING: SAFE MODE ENABLED - Hub Buttons"); 
+        static const char inputWarning[] = "WARNING: SAFE MODE ENABLED - Hub Buttons";
+        serialTxEnqueueLine(inputWarning, sizeof(inputWarning) - 1);
         break;
       }
       case CONF_SAFE_MODE_REASON_WATCHDOG:
       {
-        Serial.println("WARNING: SAFE MODE ENABLED - Watchdog"); 
+        static const char watchdogWarning[] = "WARNING: SAFE MODE ENABLED - Watchdog";
+        serialTxEnqueueLine(watchdogWarning, sizeof(watchdogWarning) - 1);
         break;
       }
       case CONF_SAFE_MODE_REASON_HARDWARE:
       {
-        Serial.println("WARNING: SAFE MODE ENABLED - Hardware");
+        static const char hardwareWarning[] = "WARNING: SAFE MODE ENABLED - Hardware";
+        serialTxEnqueueLine(hardwareWarning, sizeof(hardwareWarning) - 1);
         break;
       }
       default:
       {
-        Serial.println("WARNING: SAFE MODE ENABLED"); 
+        static const char safeWarning[] = "WARNING: SAFE MODE ENABLED";
+        serialTxEnqueueLine(safeWarning, sizeof(safeWarning) - 1);
         break;
       }
          
@@ -1636,49 +1643,6 @@ void initBuzzer() {
   buzzer.playStartupSound();  // Play a sound to indicate power-up
 }
 
-//***BUZZER LOOP FUNCTION***//
-// Function   : buzzerLoop
-//
-// Description: This function handles updates to the buzzer.
-//
-// Parameters : void
-//
-// Return     : void
-//****************************************//
-void buzzerLoop() {
-  //if (USB_DEBUG) { Serial.println("USBDEBUG: buzzerLoop"); }
-
-  // Request update
-  buzzer.update();
-}
-
-//***BUZZER SOUND ON FUNCTION***//
-// Function   : buzzerSoundOn
-//
-// Description: This function turns on the sound from the buzzer by calling the buzzer enable function.
-//
-// Parameters : void
-//
-// Return     : void
-//****************************************//
-void buzzerSoundOn() {
-  buzzer.enable();
-}
-
-
-//***BUZZER SOUND OFF FUNCTION***//
-// Function   : buzzerSoundOff
-//
-// Description: This function turns off the sound from the buzzer.
-//
-// Parameters : void
-//
-// Return     : void
-//****************************************//
-void buzzerSoundOff() {
-  buzzer.disable();
-}
-
 //***BUZZER ERROR CUE FUNCTION***//
 // Function : buzzerErrorCue
 //
@@ -1797,7 +1761,8 @@ void usbCheckConnection(void) {
   // state is already unusable, and on the post-flash boots where it strikes
   // the cycle lands within seconds of boot, before the app reconnects.
   bool usbHidExpected = ((g_operatingMode == CONF_OPERATING_MODE_MOUSE) && (g_comMode == CONF_COM_MODE_USB))
-                     || (g_operatingMode == CONF_OPERATING_MODE_GAMEPAD);
+                      || (g_operatingMode == CONF_OPERATING_MODE_GAMEPAD);
+  bool usbEpisodeJustStarted = false;
   if (usbHidExpected) {
     bool hidReadyNow = ((g_operatingMode == CONF_OPERATING_MODE_MOUSE) && usbmouse.isReady())
                     || ((g_operatingMode == CONF_OPERATING_MODE_GAMEPAD) && gamepad.isReady());
@@ -1810,12 +1775,17 @@ void usbCheckConnection(void) {
       }
       g_usbNotReadySinceMs = 0;  // Episode over
       g_usbReenumCount = 0;
+      g_usbConnectDelay = CONF_USB_HID_INIT_DELAY;  // A later outage starts with the fast recovery cadence
       // The once-guard now lives in the reset reason itself: this healthy
       // boot will end in whatever reset ends it, and the auto-restart only
       // ever fires on boots that did NOT begin with a software reset.
     } else {
+      if (outputAction == CONF_ACTION_DRAG || outputAction == CONF_ACTION_SCROLL) {
+        releaseOutputAction();  // A disconnected host must not inherit a held mode on reconnect
+      }
       if (g_usbNotReadySinceMs == 0) {
         g_usbNotReadySinceMs = millis();  // Episode begins
+        usbEpisodeJustStarted = true;
       } else if ((millis() - g_usbNotReadySinceMs >= CONF_USB_REENUM_AFTER_MS) && (g_usbReenumCount < CONF_USB_REENUM_MAX)) {
         g_usbReenumCount++;
         if (USB_DEBUG) {
@@ -1830,16 +1800,16 @@ void usbCheckConnection(void) {
         g_usbConnectDelay = CONF_USB_HID_INIT_DELAY;  // Resume fast checks while the fresh enumeration settles
         g_usbNotReadySinceMs = millis();              // Fresh budget for the fresh enumeration
       } else if ((millis() - g_usbNotReadySinceMs >= CONF_USB_REENUM_AFTER_MS) && (g_usbReenumCount >= CONF_USB_REENUM_MAX)
-                 && ((g_lastRebootReason & NRF_POWER_RESETREAS_SREQ_MASK) == 0)) {  // never auto-restart a boot that began with a software reset (the once-guard: the platform wipes .noinit, but RESETREAS survives)
+                 && !g_usbRecoveryRestartedPrev) {
         // The re-enumeration budget is spent and the HID interface is still
         // dead while serial lives — the host is not recovering this
         // composite, and no bus-level cycle left will change that (bench
         // 2026-10-17: a wedge survived three forced cycles). A full device
         // restart has cleared every such boot on the bench — fresh USB
         // peripheral, fresh address, seconds of bus darkness — so spend the
-        // one auto-restart this power cycle allows. The next boot wins the
+        // one auto-restart this recovery chain allows. The next boot wins the
         // enumeration the way every restart boot has; if it somehow wedges
-        // again, the SREQ once-guard keeps this branch from firing and the
+        // again, the dedicated retained marker keeps this branch from firing and the
         // page + retry ticks carry on for the app/user to see honestly.
         // (4.5.7 review: the bootTrailStamp(5) that used to live here is
         // GONE — pt=5 is softwareReset's code, and double-booking it made
@@ -1852,12 +1822,24 @@ void usbCheckConnection(void) {
         }
         screen.restartPage();
         delay(500);  // Bounded: drain the serial line and let the framebuffer push complete (bounded by Wire)
+        lipsyncRetentionUpdate(1, 0x1C, (uint8_t)(CONF_RETENTION_MARKER_USB_RECOVERY << 2));
         NVIC_SystemReset();
       }
     }
   } else {
     g_usbNotReadySinceMs = 0;
     g_usbReenumCount = 0;
+  }
+
+  // Normal host enumeration is asynchronous and commonly outlives the first
+  // few 20 ms report ticks. On the first observation, arm a quiet check and
+  // return—do not draw an error page or call begin() again while the host is
+  // still completing a healthy enumeration. Persistent outages re-enter the
+  // normal ladder on that timeout.
+  if (usbEpisodeJustStarted) {
+    if (usbConnectTimerId[0] >= 0) usbConnectTimer.deleteTimer(usbConnectTimerId[0]);
+    usbConnectTimerId[0] = usbConnectTimer.setTimeout(CONF_USB_HID_INIT_DELAY, usbCheckConnection);
+    return;
   }
 
 
@@ -1917,6 +1899,7 @@ void usbCheckConnection(void) {
     usbmouse.timedOut = false;  // Stale latch: the interface is ready, the episode is over
     usbmouse.consecutiveSkips = 0;  // 4.5.7 review: the skip counter must reset with the latch, or the first transient not-ready tick after recovery re-latches after ONE skip instead of three
     gamepad.timedOut = false;
+    g_usbConnectDelay = CONF_USB_HID_INIT_DELAY;
 
     // Connection healthy. The page clear used to be one-shot — this branch
     // never re-armed — and resetUsbErrorPage cleared the episode latch even
@@ -2071,24 +2054,18 @@ void beginComOpMode() {
     Serial.println("ERROR: stored gamepad+Bluetooth is not a supported combination -- communication mode reset to USB");
   }
 
-  // Bus up only now: setup() detached at the top, so no host could have
-  // locked in a CDC-only enumeration during boot. CDC has been registered
-  // since Serial.begin(); the mode interface registers microseconds below.
-  // A host needs at least a connect-detect + bus-reset cycle (ms) after
-  // attach before it can fetch a descriptor, so every enumeration now sees
-  // the complete composite.
-  // 4.5.9: USB attach moved INTO the mode branches. USB and gamepad boots
-  // keep the bench-validated order (attach, then begin — the host sees the
-  // complete composite); BLE boots now begin the SoftDevice stack FIRST and
-  // attach after — a fresh diagnostic axis for the BLE boot loop, and the
-  // ordering the stock BLE-mouse examples use (no USB composite to build
-  // beyond CDC on that path).
+  // Bus up only after the selected interface is registered: setup() detached
+  // at the top, CDC registered at Serial.begin(), and USB mouse/gamepad add
+  // HID while still detached. This structurally closes the old CDC-only
+  // descriptor race instead of relying on a host taking longer than the
+  // attach->begin call gap to fetch descriptors. BLE/safe boots intentionally
+  // attach CDC-only.
   switch (g_operatingMode) {
     case CONF_OPERATING_MODE_MOUSE:
       switch (g_comMode) {
         case CONF_COM_MODE_USB:  // USB Mouse
-          USBDevice.attach();
           usbmouse.begin();
+          USBDevice.attach();
           break;
         case CONF_COM_MODE_BLE:  // Bluetooth Mouse
           {
@@ -2111,8 +2088,8 @@ void beginComOpMode() {
       }
       break;
     case CONF_OPERATING_MODE_GAMEPAD:  // USB Gamepad
-      USBDevice.attach();
       gamepad.begin();
+      USBDevice.attach();
       break;
       // default: (SAFE is handled by the early return above)
   }
@@ -2573,6 +2550,7 @@ void releaseOutputAction() {
   // Set new state of current output action
   outputAction = CONF_ACTION_NOTHING;
   canOutputAction = true;
+  g_outputHoldInputClass = -1;
 }
 
 //***EVALUATE OUTPUT ACTION FUNCTION***//
@@ -2601,7 +2579,13 @@ void evaluateOutputAction(inputStateStruct actionState, unsigned long actionMaxE
   int tempActionIndex = 0;
 
   // Handle input action when it's in hold state (scroll mode or drag mode)
-  if ((actionState.secondaryState == INPUT_SEC_STATE_RELEASED) && (outputAction == CONF_ACTION_SCROLL || outputAction == CONF_ACTION_DRAG)) {
+  if ((actionState.secondaryState == INPUT_SEC_STATE_RELEASED)
+      && (outputAction == CONF_ACTION_SCROLL || outputAction == CONF_ACTION_DRAG)
+      // Preserve the legacy "any input cancels a hold" affordance, except a
+      // disabled sip/puff must truly have no effect on a button/switch-owned
+      // hold. A sip hold already active when SD is enabled may still clean
+      // itself up through its owner-class release.
+      && (inputClass == g_outputHoldInputClass || !(inputClass == INPUT_CLASS_SAP && g_sapDisabled))) {
     setLedDefault();  // Set default led feedback
     // Set new state of current output action
     releaseOutputAction();
@@ -2703,6 +2687,18 @@ void evaluateOutputAction(inputStateStruct actionState, unsigned long actionMaxE
       // cleans up gamepad pulses.
       if (tempActionIndex != CONF_ACTION_NOTHING) {
         g_menuInputHoldMs = actionState.elapsedTime;  // the hold-to-confirm gate reads this (see selectMenuItem)
+        if (tempActionIndex == CONF_ACTION_SCROLL || tempActionIndex == CONF_ACTION_DRAG) {
+          g_outputHoldInputClass = inputClass;
+        }
+        // Physical input actions travel over HID and historically left no
+        // serial witness. Emit one low-rate MANUAL event per resolved release:
+        // input class, raw input state, output action, measured hold ms.
+        // This makes spontaneous clicks diagnosable without a 10 Hz stream.
+        int inputActionEvent[4] = { inputClass,
+                                    actionState.mainState,
+                                    tempActionIndex,
+                                    (int)actionState.elapsedTime };
+        printResponseIntArray(true, false, true, 0, "IA,0", true, "", 4, ',', inputActionEvent);
         performOutputAction(tempActionIndex);
       }
 
@@ -2929,14 +2925,9 @@ void performOutputAction(int action) {
       }
   }
   if (g_operatingMode == CONF_OPERATING_MODE_GAMEPAD) {
-    //actionTimerId[0] = actionTimer.setTimeout(CONF_BUTTON_PRESS_DELAY, gamepadButtonRelease, (int *)action);
-    actionTimerId[0] = actionTimer.setTimeout(CONF_BUTTON_PRESS_DELAY, gamepadButtonReleaseAll);  // TODO: Change this to just release one
-    if (actionTimerId[0] < 0) {
-      // Any B1-B8 path above may have asserted a report bit. If the shared
-      // release timer cannot register, clear it immediately rather than
-      // leaving a host button held until reboot.
-      gamepadButtonReleaseAll();
-    }
+    // B1-B8 arm their own release timers in gamepadButtonPress(). Do not
+    // schedule a shared release-all here: an older pulse timeout otherwise
+    // cuts a newer button press short, and two switches cannot overlap.
     outputAction = CONF_ACTION_NOTHING;
   }
 
@@ -3057,8 +3048,23 @@ void cursorScroll(void) {
 //****************************************//
 void gamepadButtonPress(int buttonNumber) {
   if (buttonNumber > 0 && buttonNumber <= 8) {
-    gamepad.press(buttonNumber - 1);
+    const int buttonIndex = buttonNumber - 1;
+    // Re-pressing the same logical button extends its pulse. Other button
+    // timers remain independent, so simultaneous assistive-switch inputs can
+    // produce simultaneous gamepad buttons without one timeout clearing all.
+    if (actionTimerId[buttonIndex] >= 0) {
+      actionTimer.deleteTimer(actionTimerId[buttonIndex]);
+      actionTimerId[buttonIndex] = -1;
+    }
+    gamepad.press(buttonIndex);
     gamepad.send();  // Gamepad button press
+    actionTimerId[buttonIndex] = actionTimer.setTimeout(CONF_BUTTON_PRESS_DELAY, gamepadButtonRelease, (int*)buttonNumber);
+    if (actionTimerId[buttonIndex] < 0) {
+      // A refused release timer must fail safe without disturbing another
+      // button whose independent pulse is still in flight.
+      gamepad.release(buttonIndex);
+      gamepad.send();
+    }
   }
 }
 
@@ -3072,17 +3078,7 @@ void gamepadButtonPress(int buttonNumber) {
 // Return     : void
 //****************************************//
 void gamepadButtonClick(int buttonNumber) {
-  if (buttonNumber > 0 && buttonNumber <= 8) {
-    gamepad.press(buttonNumber - 1);
-    gamepad.send();
-    actionTimerId[0] = actionTimer.setTimeout(CONF_BUTTON_PRESS_DELAY, gamepadButtonRelease, (int*)buttonNumber);
-    if (actionTimerId[0] < 0) {
-      // A refused release timer must fail safe. Leaving the report bit set
-      // would hold a gamepad button indefinitely until another release-all.
-      gamepad.release(buttonNumber - 1);
-      gamepad.send();
-    }
-  }
+  gamepadButtonPress(buttonNumber);
 }
 
 //***GAMEPAD BUTTON RELEASE FUNCTION***//
@@ -3097,8 +3093,10 @@ void gamepadButtonClick(int buttonNumber) {
 void gamepadButtonRelease(int* args) {
   int buttonNumber = (int)args;
   if (buttonNumber > 0 && buttonNumber <= 8) {
-    gamepad.release(buttonNumber - 1);
+    const int buttonIndex = buttonNumber - 1;
+    gamepad.release(buttonIndex);
     gamepad.send();
+    actionTimerId[buttonIndex] = -1;
   }
 }
 
@@ -3134,7 +3132,10 @@ void gamepadButtonReleaseAll() {
 //****************************************//
 void initJoystick() {
   if (USB_DEBUG) { Serial.println("USBDEBUG: initJoystick()"); }
-  js.begin();                                                           // Begin joystick
+  if (!js.begin()) {                                                    // Begin joystick and honor the driver's real init verdict
+    g_joystickSensorConnected = false;
+    return;
+  }
   js.setMagnetDirection(JOY_DIRECTION_DEFAULT, JOY_DIRECTION_INVERSE);  // Set x and y magnet direction
   getJoystickInnerDeadzone(true, false);                               // Get joystick deadzone stored in flash memory
   getJoystickOuterDeadzone(true, false);                                     // Get joystick deadzone stored in flash memory
@@ -3204,7 +3205,8 @@ void performJoystickCenter(int* args) {
     js.resetInputCenterBuffer();
     calibrationTimerId[1] = calibrationTimer.setTimer(CONF_JOY_INIT_READING_DELAY, currentReadingStart, CONF_JOY_INIT_READING_NUMBER, performJoystickCenterStep, (int*)args);
     if (calibrationTimerId[1] < 0) {
-      Serial.println("ERROR: center-reset reading timer refused -- keeping previous center");
+      static const char centerReadError[] = "ERROR: center-reset reading timer refused -- keeping previous center";
+      serialTxEnqueueLine(centerReadError, sizeof(centerReadError) - 1);
       setLedDefault();
       canOutputAction = true;
       g_resetCenterComplete = true;
@@ -3224,7 +3226,8 @@ void performJoystickCenter(int* args) {
     calibrationTimerId[0] = calibrationTimer.setTimeout(nextStepStart, performJoystickCenter, (int*)payload);
     if (calibrationTimerId[0] < 0) {
       calibrationTimer.deleteTimer(calibrationTimerId[1]);
-      Serial.println("ERROR: center-reset completion timer refused -- keeping previous center");
+      static const char centerCompletionError[] = "ERROR: center-reset completion timer refused -- keeping previous center";
+      serialTxEnqueueLine(centerCompletionError, sizeof(centerCompletionError) - 1);
       setLedDefault();
       canOutputAction = true;
       g_resetCenterComplete = true;
@@ -3254,7 +3257,11 @@ void performJoystickCenter(int* args) {
     // eaten). Overlapping chains now both complete, each with their own
     // correct ack.
     setLedDefault();                  // Set default led feedback
-    canOutputAction = true;
+    // A standalone center is done here, but the full calibration's internal
+    // step-5 center is only a sub-step. Keep all output locked until the
+    // enclosing flow reaches step 6; the old unconditional true opened a
+    // ~3.5 s window where Hub/switch actions could fire mid-calibration.
+    canOutputAction = !g_calibrationRunning;
     g_resetCenterComplete = true;
     g_centerRunning = false;
 
@@ -3305,8 +3312,9 @@ void performJoystickCenterStep(int* args) {
 // degrade to the last persisted calibration rather than leaving polling and
 // all output disabled for the rest of the boot.
 void abortJoystickCalibration(bool calibFromApi, const char* reason) {
-  Serial.print(F("ERROR: calibration aborted: "));
-  Serial.println(reason);
+  String calibrationError = "ERROR: calibration aborted: ";
+  calibrationError += reason;
+  serialTxEnqueueLine(calibrationError);
   g_calibrationRunning = false;
   g_calibrationCenterStep = false;
 
@@ -3317,8 +3325,13 @@ void abortJoystickCalibration(bool calibFromApi, const char* reason) {
   pollTimer.enable(pollTimerId[CONF_TIMER_INPUT]);
   if (!g_safeModeEnabled) {
     screen.enableTimeout();
-    pollTimer.enable(pollTimerId[CONF_TIMER_JOYSTICK]);
-    pollTimer.enable(pollTimerId[CONF_TIMER_SCROLL]);
+    if (outputAction == CONF_ACTION_SCROLL) {
+      pollTimer.disable(pollTimerId[CONF_TIMER_JOYSTICK]);
+      pollTimer.enable(pollTimerId[CONF_TIMER_SCROLL]);
+    } else {
+      pollTimer.enable(pollTimerId[CONF_TIMER_JOYSTICK]);
+      pollTimer.disable(pollTimerId[CONF_TIMER_SCROLL]);
+    }
     pollTimer.enable(pollTimerId[CONF_TIMER_PRESSURE]);
   }
   screen.calibrationAbortedPage();
@@ -3453,8 +3466,13 @@ void performJoystickCalibration(int* args) {
       // against whatever hardware toggleSafeMode shut down, and re-arm the
       // 5-minute timeout the safe menu deliberately disables.
       screen.enableTimeout();  // The run may have been menu-driven — see step 0
-      pollTimer.enable(pollTimerId[CONF_TIMER_JOYSTICK]);     // Re-Enable joystick data polling
-      pollTimer.enable(pollTimerId[CONF_TIMER_SCROLL]);       // Re-enable scroll data polling
+      if (outputAction == CONF_ACTION_SCROLL) {
+        pollTimer.disable(pollTimerId[CONF_TIMER_JOYSTICK]);
+        pollTimer.enable(pollTimerId[CONF_TIMER_SCROLL]);
+      } else {
+        pollTimer.enable(pollTimerId[CONF_TIMER_JOYSTICK]);
+        pollTimer.disable(pollTimerId[CONF_TIMER_SCROLL]);
+      }
       pollTimer.enable(pollTimerId[CONF_TIMER_PRESSURE]);
     }
     screen.fullCalibrationPrompt(stepNumber);  // update
@@ -3502,30 +3520,33 @@ void performJoystickCalibrationStep(int* args) {
 
   maxPoint = js.getInputMax(stepNumber);  // Get maximum x and y for the step number
 
-  // Check for calibration errors
-  if ((abs(maxPoint.x) < CONF_JOY_CALIB_CORNER_MIN) || (abs(maxPoint.y) < CONF_JOY_CALIB_CORNER_MIN)) {
-    pointFloatType tempDefaultPoint = { 0, 0 };
-    switch (stepNumber) {
-      case 1:  // Top left corner
-        tempDefaultPoint = { float(CONF_JOY_CALIB_CORNER_DEFAULT) * magnetZDirection, float(-CONF_JOY_CALIB_CORNER_DEFAULT) * magnetZDirection };
-        break;
-      case 2:  // Top right corner
-        tempDefaultPoint = { float(-CONF_JOY_CALIB_CORNER_DEFAULT) * magnetZDirection, float(-CONF_JOY_CALIB_CORNER_DEFAULT) * magnetZDirection };
-        break;
-      case 3:  // Bottom right corner
-        tempDefaultPoint = { float(-CONF_JOY_CALIB_CORNER_DEFAULT) * magnetZDirection, float(CONF_JOY_CALIB_CORNER_DEFAULT) * magnetZDirection };
-        break;
-      case 4:  // Bottom left corner
-        tempDefaultPoint = { float(CONF_JOY_CALIB_CORNER_DEFAULT) * magnetZDirection, float(CONF_JOY_CALIB_CORNER_DEFAULT) * magnetZDirection };
-        break;
-    }
-    maxPoint = tempDefaultPoint;
-    js.setInputMax(stepNumber, maxPoint);
-    g_calibrationError = true;
-  }
-
   // Turn off all the LEDs to orange to indicate end of the process
   if (calibrationTimer.getNumRuns(calibrationTimerId[1]) == CONF_JOY_CALIB_READING_NUMBER) {  // Turn LED's OFF when timer is running for last time
+    // Validate only after all ten readings have accumulated. The old
+    // per-reading fallback installed a 13 mT default on the first sample if
+    // the user was still moving into position; that default then beat every
+    // later real corner below 13 mT and could never be replaced.
+    if ((abs(maxPoint.x) < CONF_JOY_CALIB_CORNER_MIN) || (abs(maxPoint.y) < CONF_JOY_CALIB_CORNER_MIN)) {
+      pointFloatType tempDefaultPoint = { 0, 0 };
+      switch (stepNumber) {
+        case 1:  // Top left corner
+          tempDefaultPoint = { float(CONF_JOY_CALIB_CORNER_DEFAULT) * magnetZDirection, float(-CONF_JOY_CALIB_CORNER_DEFAULT) * magnetZDirection };
+          break;
+        case 2:  // Top right corner
+          tempDefaultPoint = { float(-CONF_JOY_CALIB_CORNER_DEFAULT) * magnetZDirection, float(-CONF_JOY_CALIB_CORNER_DEFAULT) * magnetZDirection };
+          break;
+        case 3:  // Bottom right corner
+          tempDefaultPoint = { float(-CONF_JOY_CALIB_CORNER_DEFAULT) * magnetZDirection, float(CONF_JOY_CALIB_CORNER_DEFAULT) * magnetZDirection };
+          break;
+        case 4:  // Bottom left corner
+          tempDefaultPoint = { float(CONF_JOY_CALIB_CORNER_DEFAULT) * magnetZDirection, float(CONF_JOY_CALIB_CORNER_DEFAULT) * magnetZDirection };
+          break;
+      }
+      maxPoint = tempDefaultPoint;
+      js.setInputMax(stepNumber, maxPoint);
+      g_calibrationError = true;
+    }
+
     // The settings-size budget guard can refuse the store (LSMemory): the
     // corner response must then report FAIL,3, not SUCCESS — otherwise the
     // app's calibration readout would show a corner the next boot forgets.
@@ -3533,6 +3554,14 @@ void performJoystickCalibrationStep(int* args) {
     setLedState(LED_ACTION_OFF, LED_CLR_NONE, CONF_JOY_CALIB_LED_NUMBER, 0, 0, led.getLedBrightness());
     performLedAction(ledCurrentState);
     printResponseFloatPoint(true, calibFromApi, cornerStored, cornerStored ? 0 : 3, stepCommand, true, maxPoint);
+    if (!cornerStored) {
+      // A live-only corner is not a completed calibration. Stop the already-
+      // scheduled continuation, reload all persisted corners, and show/report
+      // failure instead of reaching step 6 and telling the user "calibrated"
+      // with values the next boot will forget.
+      abortJoystickCalibration(calibFromApi, "corner persistence failed");
+      return;
+    }
     if (g_calibrationError) {
       screen.fullCalibrationPrompt(CONF_JOY_CALIB_ERROR);
       // Feed the watchdog through the deliberate dwell (4.5.7 review):
@@ -3767,7 +3796,9 @@ void debugLoop() {
     debugJoystickArray[2] = { (float)js.getXYOut().x, (float)js.getXYOut().y };  // Read the output values
     printResponseFloatPointArray(true, true, true, 0, "DEBUG,1", true, "", 3, ',', debugJoystickArray);
   } else if (g_debugMode == CONF_DEBUG_MODE_PRESSURE) {  // Debug #2
-    ps.update();                                       // Request new pressure difference from sensor and push it to array
+    // pressureLoop owns all sampling/state advancement. Taking another
+    // sample here (on a separate 100 ms timer) can land beside its 50 ms tick
+    // and count one 25 Hz sensor conversion twice in the engagement filter.
     float debugPressureArray[4];
     debugPressureArray[0] = ps.getSapPressureAbs();   // Read the main pressure
     debugPressureArray[1] = ps.getAmbientPressure();  // Read the ref pressure
@@ -4327,6 +4358,10 @@ void btFeedbackLoop() {
 
   // Get the current bluetooth connection state
   bool tempIsConnected = btmouse.isConnected();
+
+  if (!tempIsConnected && (outputAction == CONF_ACTION_DRAG || outputAction == CONF_ACTION_SCROLL)) {
+    releaseOutputAction();  // Never carry a drag/scroll latch across hosts
+  }
 
   //if (USB_DEBUG) { Serial.println(tempIsConnected); }
   // Perform Bluetooth LED blinking if Bluetooth is not connected and wasn't connected before

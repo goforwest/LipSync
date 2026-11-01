@@ -30,7 +30,7 @@
 
 #define CONF_LIPSYNC_VERSION_MAJOR  4
 #define CONF_LIPSYNC_VERSION_MINOR  6
-#define CONF_LIPSYNC_VERSION_REV    4
+#define CONF_LIPSYNC_VERSION_REV    5
 
 // 4.5.22 RESCUE-BUILD SWITCH (bench round 15): the device's settings
 // filesystem was left corrupted by the 4.5.20 race + the zombie phase's
@@ -266,9 +266,16 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 
 #define CONF_WATCHDOG_TIMEOUT_SEC 30        // 30 second hardware watchdog
 
-#define CONF_WATCHDOG_BOOT_RETRY_LIMIT 3    // Consecutive watchdog-reset boots before the watchdog stops
-                                            // re-arming (device settles in safe mode instead of resetting forever)
+#define CONF_WATCHDOG_BOOT_RETRY_LIMIT 3    // Consecutive witnessed crash boots before TIMER3 stops re-arming;
+                                            // an already-running hardware WDT remains fed in settled safe mode
 #define CONF_WATCHDOG_BOOT_CLEAR_MS 120000  // Uptime that restores the full watchdog-reset retry budget
+
+// GPREGRET2 marker field (bits 2-4): values that identify why a warm reset
+// was requested. Hang/HardFault markers count toward the crash-settling
+// streak; USB recovery is a deliberate one-shot guard and must not.
+#define CONF_RETENTION_MARKER_HANG         1
+#define CONF_RETENTION_MARKER_HARDFAULT    2
+#define CONF_RETENTION_MARKER_USB_RECOVERY 3
 
 
 // Safe Boot Mode
@@ -277,8 +284,9 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 #define CONF_SAFE_MODE_REASON_HARDWARE 3
 // 4.5.7 review: three-or-more consecutive boots died in a TIMER3-witnessed
 // loop hang (SREQ resets preserve the retention streak — see
-// LSWatchdog.h's hang-streak block). The boot rests in safe mode with the
-// watchdog/witness not re-armed.
+// LSWatchdog.h's hang-streak block). The boot rests in safe mode with TIMER3
+// not re-armed; an inherited hardware WDT remains fed because nRF52 cannot
+// stop it across a warm reset.
 #define CONF_SAFE_MODE_REASON_HANG 4
 
 // Hub Menu
@@ -322,7 +330,6 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 #define CONF_SCREEN_INPUT_FREEZE_MAX_MS 15000
 
 
-#define CONF_USB_HID_TIMEOUT  5000           // 5 seconds - timeout for connecting to USB and continuing with the program
 #define CONF_USB_HID_INIT_DELAY 2000         // initial delay before attempting to reconnect to usb again
 #define CONF_USB_REENUM_AFTER_MS 3000        // a persistent HID outage this old gets a forced re-enumeration (bench
                                              // 2026-10-16: post-flash boots come up configured-but-HID-dead — serial
@@ -616,21 +623,6 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 #define CONF_ERROR_LED_NUMBER CONF_LED_ALL // All LEDs
 #define CONF_ERROR_LED_COLOR LED_CLR_RED   // red Color
 #define CONF_ERROR_LED_BRIGHTNESS 255      // Full brightness
-
-// Acceleration
-// Cursor acceleration structure
-const accStruct accProperty[]{
-  { 0, 1.0, 0, 0 },
-  { 1, 1.0, 0, 0 },
-  { 2, 1.0, 0, 0 },
-  { 3, 1.0, 0, 0 },
-  { 4, 1.0, 0, 0 },
-  { 5, 1.0, 0, 0 },
-  { 6, 1.0, 0, 0 },
-  { 7, 1.0, 0, 0 },
-  { 8, 1.0, 0, 0 },
-  { 9, 1.0, 0, 0 }
-};
 
 /* LIPSYNC INPUT AND OUTPUT MAPPING */
 

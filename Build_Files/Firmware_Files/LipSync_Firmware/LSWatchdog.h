@@ -23,10 +23,10 @@
 #include <nrf_wdt.h>
 #include <hal/nrf_power.h>  //  Defines reset reasons for NRF52 (https://github.com/particle-iot/nrf5_sdk/blob/master/modules/nrfx/hal/nrf_power.h)
 
-const uint32_t WATCHDOG_RESET_MASK = 0x2; //POWER_RESETREAS_DOG_Msk; //  0x2;
 extern bool g_watchdogReset;
 extern uint8_t g_watchdogBootCount;  // Consecutive watchdog-reset boots this power cycle (tracked in GPREGRET2)
 extern uint8_t g_hangBootStreak;    // Consecutive witnessed loop-hang deaths (GPREGRET2 bits 0-1 — the functional budget)
+extern bool g_usbRecoveryRestartedPrev; // Previous boot deliberately spent the one-shot USB recovery restart
 extern unsigned long g_watchdogLastFeedMs;  // Loop-liveness witness (bench 2026-10-18): ms timestamp of the last feed
 extern volatile bool g_watchdogArmed;        // True from initWatchdog() until the retry limit stops re-arming (ISR-read by the TIMER3 witness)
 extern volatile uint32_t g_witnessSecondsUnfed;  // Witness-ISR <-> loop handshake (see LipSync_Firmware.ino)
@@ -79,14 +79,18 @@ void checkResetReason() {
   //   - Previous boot ended any other way (clean power-cycle, reset pin,
   //     software reset, watchdog): streak = 0.
   // checkSafeMode() settles the device in safe mode at
-  // CONF_WATCHDOG_BOOT_RETRY_LIMIT straight witnessed-hang deaths, and
-  // g_watchdogBootCount mirrors the streak so setup()'s existing
-  // "stop re-arming" gate covers the settled boot. A boot that stays up
+  // CONF_WATCHDOG_BOOT_RETRY_LIMIT straight witnessed-hang/fault deaths, and
+  // g_watchdogBootCount mirrors the streak so setup() stops re-arming TIMER3
+  // on the settled boot. The nRF52 hardware WDT itself cannot be stopped once
+  // started, so setup keeps feeding any inherited instance. A boot that stays up
   // for CONF_WATCHDOG_BOOT_CLEAR_MS clears the streak (watchdogLoop), so
   // isolated hangs never exhaust the budget. All writes touch only their
   // own bits; the trail lives in bits 5-7.
   uint8_t prevHangMarker = (uint8_t)((lipsyncRetentionGet(1) >> 2) & 0x07UL);  // 4.5.27: SD-aware
-  if (!g_watchdogReset && prevHangMarker != 0) {
+  g_usbRecoveryRestartedPrev = (prevHangMarker == CONF_RETENTION_MARKER_USB_RECOVERY);
+  const bool previousBootCrashed = (prevHangMarker == CONF_RETENTION_MARKER_HANG)
+                                || (prevHangMarker == CONF_RETENTION_MARKER_HARDFAULT);
+  if (!g_watchdogReset && previousBootCrashed) {
     uint8_t hangStreak = (uint8_t)(lipsyncRetentionGet(1) & 0x03UL) + 1;
     if (hangStreak > 3) hangStreak = 3;
     lipsyncRetentionUpdate(1, 0x03, hangStreak);  // 4.5.27: SD-aware — a raw POWER write is an APP_MEMACC kill with the SD up
@@ -126,6 +130,8 @@ void initWatchdog() {
   NRF_WDT->RREN |= WDT_RREN_RR0_Msk;                                  // Enable reload register 0
   NRF_WDT->TASKS_START = 1;                                           // Start watchdog
   g_watchdogArmed = true;
+  NRF_WDT->RR[0] = WDT_RR_RR_Reload;                                  // Begin every setup with the full timeout budget
+  g_watchdogLastFeedMs = millis();
 }
 
 //***WATCHDOG LOOP FUNCTION***//
@@ -140,9 +146,11 @@ void initWatchdog() {
 void watchdogLoop(void) {
   //if (USB_DEBUG) { Serial.println("USBDEBUG: watchDogLoop"); }
 
-  g_watchdogLastFeedMs = millis();
-  g_witnessSecondsUnfed = 0;  // The loop is alive — reset the witness ISR's un-fed-seconds counter (4.5.7 review; a single aligned volatile store)
-  NRF_WDT->RR[0] = WDT_RR_RR_Reload;  // Feed (reset) the watchdog timer
+  if (g_watchdogArmed) {
+    g_watchdogLastFeedMs = millis();
+    g_witnessSecondsUnfed = 0;  // The loop is alive — reset the witness ISR's un-fed-seconds counter (4.5.7 review; a single aligned volatile store)
+    NRF_WDT->RR[0] = WDT_RR_RR_Reload;  // Feed (reset) the watchdog timer
+  }
 
   // A boot that stays up this long proves any hang was transient — restore
   // the full hang-streak budget for the next one (and the watchdog boot

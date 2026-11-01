@@ -38,7 +38,6 @@
 
 #define GAMEPAD_DESCRIPTOR "LipSync Gamepad" // TODO 2025-Feb-21 Unused due to Tiny USB library hang
 
-extern unsigned int g_usbAttempt;  // global variable to keep track of USB connection attempts
 extern void usbCheckConnection(void);
 
 
@@ -147,6 +146,7 @@ class LSUSBGamepad {
     inline void end(void);
     inline void wakeup(void);
     inline void send(void);
+    inline void service(void);                    // Flush the latest coalesced report after a busy endpoint
     inline bool GamepadReport(void* data, size_t length) {
         return this->usb_hid.sendReport(0, data, (uint8_t)length);
     };
@@ -181,8 +181,8 @@ class LSUSBGamepad {
     int16_t maxAbsReport = 0;         // Largest |x|/|y| delta ever sent — 0 forever means the report PIPELINE sends centered reports
   protected:
     HID_GamepadReport_Data_t _report;
-    uint32_t startMillis;
     bool _begun = false;   // HID interface registered on the USB configuration — must happen exactly once (see begin())
+    bool _reportPending = false;
     Adafruit_USBD_HID usb_hid;
     inline void countReportMovement(void);
 };
@@ -220,29 +220,12 @@ void LSUSBMouse::begin(void)
   }
   if (USB_DEBUG) { Serial.println("USBDEBUG: Initializing USB HID Mouse");  }
 
-  unsigned long timerHidTimeoutBegin = millis();
-  unsigned long usbTimeoutMillis;
-
-  g_usbAttempt++;
-    
-  if (usbRetrying) {
-    usbTimeoutMillis = 200;                     // when reattemping to connect the USB, uses a smaller value to not freeze up the code for long but will keep retrying 
-  } else {
-    usbTimeoutMillis = CONF_USB_HID_TIMEOUT;    // the first time the usb tried to connect, use the default timeout
-  }
-  
-  while( !USBDevice.mounted() ) { //  Wait for USB device to mount
-    delay(1);
-
-    if ((millis() - timerHidTimeoutBegin) > usbTimeoutMillis) { 
-      usbRetrying = true;
-      break;
-    } 
-  }
-
-  if (USBDevice.mounted()) { // If USB device mounts, send blank report
+  // Registration is synchronous; host mounting is not. Never freeze setup
+  // for 5 s (or every retry for 200 ms) waiting for an external host. The
+  // existing usbCheckConnection timer owns asynchronous recovery.
+  usbRetrying = !USBDevice.mounted();
+  if (!usbRetrying) { // If USB device mounted, send blank report
     usbRetrying = false;
-    g_usbAttempt = 0;
     move(0,0);
   }
   
@@ -273,7 +256,7 @@ bool LSUSBMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t 
   // alive — exactly the post-flash / post-bootloader re-enumeration state,
   // or a host that half-configured the composite device after a retry
   // re-added the HID interface — froze the whole firmware for up to
-  // CONF_USB_HID_TIMEOUT (5 s) with the recursion re-arming the retry timer
+  // five seconds with the recursion re-arming the retry timer
   // from inside the spin. A live serial session died right there: the first
   // one or two host exchanges overlapping the freeze timed out waiting for
   // a response (the observed post-flash SS/SL restore drops, firmware-update
@@ -315,6 +298,7 @@ bool LSUSBMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t 
       if (absY > maxAbsReport) maxAbsReport = absY;
     }
     timedOut = false;  // Only an ACCEPTED report clears the episode (4.5.7 review): a ready-but-refused tick is still an outage symptom
+    usbRetrying = false;
     _buttonStatePending = false;
     return true;
   }
@@ -342,6 +326,19 @@ void LSUSBMouse::pan(int8_t pan)
 
 void LSUSBMouse::service(void)
 {
+  if (!_clickPending && !_buttonStatePending && _buttons == 0) return;
+  // A USB disconnect releases state at the old host. Clear both queued click
+  // phases and settled button state before the fast return so a drag cannot
+  // be replayed as a fresh press after re-enumeration.
+  if (!USBDevice.mounted()) {
+    _buttons = 0;
+    _buttonStatePending = false;
+    _clickPending = false;
+    _clickPressedSent = false;
+    _clickButton = 0;
+    return;
+  }
+
   // A click is two reports separated by a host poll. The old immediate
   // press+release sent the release while the endpoint was still busy; when
   // normal joystick polling was disabled (e.g. joystick debug mode), no later
@@ -429,39 +426,16 @@ void LSUSBGamepad::begin(void)
     _begun = this->usb_hid.begin();  // Gate on the returned bool — see LSUSBMouse::begin() (4.5.7 review)
   }
 
-  unsigned long timerHidTimeoutBegin = millis();
-  unsigned long usbTimeoutMillis;
-
-  g_usbAttempt++;
-    
-  if (usbRetrying) {
-    usbTimeoutMillis = 200;                     // when reattemping to connect the USB, uses a smaller value to not freeze up the code for long but will keep retrying 
-  } else {
-    usbTimeoutMillis = CONF_USB_HID_TIMEOUT;    // the first time the usb tried to connect, use the default timeout
-  }
-  
-  while( !USBDevice.mounted() ) {
-    delay(1);
-
-    if ((millis() - timerHidTimeoutBegin) > usbTimeoutMillis){
-      usbRetrying = true;
-      break;
-    } 
-  }
-
-  if (USBDevice.mounted()) {
-    usbRetrying = false;
-    g_usbAttempt = 0;
-  }
+  // Host enumeration is asynchronous. Do not block the assistive-device
+  // loop waiting for it; usbCheckConnection handles retries/re-enumeration.
+  usbRetrying = !USBDevice.mounted();
   
   // Release all the buttons and center joystick
   end();
-  startMillis = millis();
 }
 
 void LSUSBGamepad::send(void)
 {
-  if (startMillis != millis()) {
   wakeup();
 
   // Never block on HID readiness (see LSUSBMouse::mouseReport()): the old
@@ -477,15 +451,23 @@ void LSUSBGamepad::send(void)
     // usbRetrying through usbCheckConnection, exactly as before; the latch
     // only makes the refusal visible in BH. Cleared by any accepted report.
     if (USBDevice.mounted()) timedOut = true;
+    _reportPending = true;
     return;
   }
   if (GamepadReport(&_report, sizeof(_report))) {
     reportSuccesses++;
     countReportMovement();
     timedOut = false;
+    usbRetrying = false;
+    _reportPending = false;
+  } else {
+    _reportPending = true;
   }
-    startMillis = millis();
-  }
+}
+
+void LSUSBGamepad::service(void)
+{
+  if (_reportPending && isReady()) send();
 }
 
 void LSUSBGamepad::end(void)
@@ -493,7 +475,7 @@ void LSUSBGamepad::end(void)
   _report.buttons = 0;
   _report.xAxis = 128;
   _report.yAxis = 128;
-  GamepadReport(&_report, sizeof(_report));
+  send();
 }
 
 void LSUSBGamepad::wakeup(void)
@@ -505,33 +487,11 @@ void LSUSBGamepad::wakeup(void)
 
 void LSUSBGamepad::write(void)
 {
-  wakeup();
-
-  // Never block on HID readiness — see send().
-  reportAttempts++;
-  if (!isReady()) {
-    usbRetrying = true;
-    if (USBDevice.mounted()) timedOut = true;
-    return;
-  }
-  if (GamepadReport(&_report, sizeof(_report))) {
-    reportSuccesses++;
-    countReportMovement();
-    timedOut = false;
-  }
+  send();
 }
 
 void LSUSBGamepad::write(void *report)
 {
-  wakeup();
-
-  // Never block on HID readiness — see send().
-  reportAttempts++;
-  if (!isReady()) {
-    usbRetrying = true;
-    if (USBDevice.mounted()) timedOut = true;
-    return;
-  }
   if (report) {
     memcpy(&_report, report, sizeof(_report));
   } else {
@@ -541,11 +501,7 @@ void LSUSBGamepad::write(void *report)
     _report.xAxis = 128;
     _report.yAxis = 128;
   }
-  if (GamepadReport(&_report, sizeof(_report))) {
-    reportSuccesses++;
-    countReportMovement();
-    timedOut = false;
-  }
+  send();
 }
 
 // Movement accounting for an accepted report (the mouse counts this inside

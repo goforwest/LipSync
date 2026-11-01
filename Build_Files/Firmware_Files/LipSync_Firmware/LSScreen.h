@@ -116,7 +116,6 @@ public:
   void begin();
   void update();
   void clear();
-  void show();
 
   void setupDisplay();
   void splashScreen();
@@ -214,7 +213,6 @@ private:
 
   LSTimer<void> _screenStateTimer;  // Timer with a callback function
   int _screenStateTimerId = -1;     // Timer ID for screen (-1 = none pending; read by the USB-error-page splash-clear cancel)
-  int _screenTimeoutTimerId;        // Timer ID to trigger next screen based on time
   unsigned long _inputFrozenUntil = 0;  // While millis() is before this, menu input is frozen (a scheduled page transition owns the menu)
   int _transitionTimerId = -1;           // Pending scheduled page transition (LSTimer id), -1 = none
   bool _usbErrorPageShown = false;       // The no-USB page has been drawn for the current error episode
@@ -234,7 +232,6 @@ private:
   bool _menuTimeoutEnabled = true;
   int _currentMenu = 0;
   int _prevMenu = -1; // keep track of previous menu
-  int _prevSelection = -1; // Keep track of previous menu selection
   int _currentSelection = 0;
   int _selectedLine;
   int _cursorPos;
@@ -253,7 +250,6 @@ private:
   int _scrollSpeedLevel;
   int _accelLevel;
   int _lightBrightLevel;
-  bool _soundOn = true;
   int _soundMode;
 
   bool _scrollOn = false;
@@ -293,11 +289,9 @@ private:
   void changeMode();
   void cursorSpeedMenu();
   void scrollSpeedMenu();
-  void bluetoothMenu();
   void moreMenu();
   void fullCalibrationPage();
   void fullCalibrationConfirmPage();
-  void centerReset();
   void soundMenu();
   void lightBrightMenu();
   void sipPuffThreshMenu();
@@ -1150,16 +1144,11 @@ void LSScreen::selectMenuItem() {
 
     case SOUND_MENU:
       switch (_currentSelection) {
-        case 0:  // Toggle sound mode
-          if (_soundMode == CONF_SOUND_MODE_OFF) {
-            buzzerSoundOn();
-            _soundMode = CONF_SOUND_MODE_BASIC;
-            setSoundMode(false, false, _soundMode);  // TODO: change menu to add Advanced Sound to menu
-          } else {
-            buzzerSoundOff();
-            _soundMode = CONF_SOUND_MODE_OFF;
-            setSoundMode(false, false, _soundMode);
-          }
+        case 0:  // Toggle sound on/off (the All tier remains selectable through Connect)
+          _soundMode = getSoundMode(false, false);
+          _soundMode = (_soundMode == CONF_SOUND_MODE_OFF) ? CONF_SOUND_MODE_BASIC : CONF_SOUND_MODE_OFF;
+          setSoundMode(true, false, _soundMode);
+          _soundMode = getSoundMode(false, false);  // Keep the label truthful if persistence refused
           soundMenu();
           break;
         case 1:  // Back
@@ -1173,7 +1162,7 @@ void LSScreen::selectMenuItem() {
         case 0:  // Increase
           _lightBrightLevel = getLightBrightnessLevel(false, false);
           _lightBrightLevel++;
-          setLightBrightnessLevel(false, false, _lightBrightLevel);                         
+          setLightBrightnessLevel(true, false, _lightBrightLevel);
           _lightBrightLevel = getLightBrightnessLevel(false, false);
           _lightBrightMenuText[0] = "Lights: " + String(_lightBrightLevel) + " ";
           _display.setCursor(0, 0);
@@ -1183,7 +1172,7 @@ void LSScreen::selectMenuItem() {
         case 1:  // Decrease
           _lightBrightLevel = getLightBrightnessLevel(false, false);
           _lightBrightLevel--;
-          setLightBrightnessLevel(false, false, _lightBrightLevel);                    
+          setLightBrightnessLevel(true, false, _lightBrightLevel);
           _lightBrightLevel = getLightBrightnessLevel(false, false);
           _lightBrightMenuText[0] = "Lights: " + String(_lightBrightLevel) + " ";
           _display.setCursor(0, 0);
@@ -1324,7 +1313,7 @@ void LSScreen::selectMenuItem() {
       switch (_currentSelection) {
         case 0: {  // Increase
           _sipPressThresh = getSipPressureThreshold(false, false);
-          setSipPressureThreshold(false, false, pressThresholdLevelUp(_sipPressThresh));
+          setSipPressureThreshold(true, false, pressThresholdLevelUp(_sipPressThresh));
           _sipPressThresh = getSipPressureThreshold(false, false);
           _adjustSipThreshMenuText[0] =
             "Sip: L" + String(pressThresholdLevelFor(_sipPressThresh)) + " " + String(_sipPressThresh) + " ";
@@ -1335,7 +1324,7 @@ void LSScreen::selectMenuItem() {
         }
         case 1: {  // Decrease
           _sipPressThresh = getSipPressureThreshold(false, false);
-          setSipPressureThreshold(false, false, pressThresholdLevelDown(_sipPressThresh));
+          setSipPressureThreshold(true, false, pressThresholdLevelDown(_sipPressThresh));
           _sipPressThresh = getSipPressureThreshold(false, false);
           _adjustSipThreshMenuText[0] =
             "Sip: L" + String(pressThresholdLevelFor(_sipPressThresh)) + " " + String(_sipPressThresh) + " ";
@@ -1356,7 +1345,7 @@ void LSScreen::selectMenuItem() {
       switch (_currentSelection) {
         case 0: {  // Increase
           _puffPressThresh = getPuffPressureThreshold(false, false);
-          setPuffPressureThreshold(false, false, pressThresholdLevelUp(_puffPressThresh));
+          setPuffPressureThreshold(true, false, pressThresholdLevelUp(_puffPressThresh));
           _puffPressThresh = getPuffPressureThreshold(false, false);
           _adjustPuffThreshMenuText[0] =
             "Puff: L" + String(pressThresholdLevelFor(_puffPressThresh)) + " " + String(_puffPressThresh) + " ";
@@ -1367,7 +1356,7 @@ void LSScreen::selectMenuItem() {
         }
         case 1: {  // Decrease
           _puffPressThresh = getPuffPressureThreshold(false, false);
-          setPuffPressureThreshold(false, false, pressThresholdLevelDown(_puffPressThresh));
+          setPuffPressureThreshold(true, false, pressThresholdLevelDown(_puffPressThresh));
           _puffPressThresh = getPuffPressureThreshold(false, false);
           _adjustPuffThreshMenuText[0] =
             "Puff: L" + String(pressThresholdLevelFor(_puffPressThresh)) + " " + String(_puffPressThresh) + " ";
@@ -2288,7 +2277,7 @@ void LSScreen::calibrationAbortedPage(void) {
 //*********************************//
 void LSScreen::soundMenu(void) {
   _currentMenu = SOUND_MENU;
-
+  _soundMode = getSoundMode(false, false);
   if (_soundMode != CONF_SOUND_MODE_OFF) {
     _soundMenuText[1] = "ON";
     _soundMenuText[2] = "Turn off";

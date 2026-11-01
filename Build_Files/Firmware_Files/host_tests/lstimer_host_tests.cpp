@@ -40,7 +40,8 @@
 //  11. (4.5.7) Callbacks may mutate the pool MID-RUN: a self-rearming
 //      RUN_ONCE (the usbCheckConnection pattern) re-registers even on a
 //      FULL pool; a callback may delete another timer; a nested run() on
-//      the same pool cannot double-fire a RUNONLY slot.
+//      the same pool cannot double-fire either a RUNONLY or final RUNANDDEL
+//      slot.
 //  12. (4.5.7) numRuns SATURATES at 65535 instead of wrapping, so a
 //      maxNumRuns of 65535 actually terminates.
 //  13. (4.5.7) A pool constructed at millis()==0 (the real boot region)
@@ -79,6 +80,8 @@ class SerialShim {
     void print(unsigned int v) { (void)v; }
     void println(const char* s) { (void)s; }
     void println(int v) { (void)v; }
+    int availableForWrite() { return 256; }
+    size_t write(const uint8_t* data, size_t len) { (void)data; return len; }
 };
 static SerialShim Serial;
 
@@ -570,6 +573,25 @@ static void test_nested_run_cannot_double_fire() {
   s_nestedPool = nullptr;
 }
 
+static LSTimer<void>* s_nestedFinalPool = nullptr;
+static int s_nestedFinalFires = 0;
+static void nestedFinalCb() {
+  s_nestedFinalFires++;
+  s_nestedFinalPool->run();  // A zero-delay RUNANDDEL slot is still live until this callback returns
+}
+
+static void test_nested_run_cannot_double_fire_final_callback() {
+  LSTimer<void> pool;
+  s_nestedFinalPool = &pool;
+  s_nestedFinalFires = 0;
+  int id = pool.setTimeout(0, nestedFinalCb);
+  CHECK(id >= 0);
+  pool.run();
+  CHECK_EQ(s_nestedFinalFires, 1);
+  CHECK_EQ(pool.getNumTimers(), 0);
+  s_nestedFinalPool = nullptr;
+}
+
 // (4.5.7 review) numRuns saturates at MAX_INT instead of wrapping to 1, so
 // a maxNumRuns of 65535 terminates (the old wrap silently made it
 // RUN_FOREVER).
@@ -623,6 +645,7 @@ int main() {
   test_final_callback_sees_full_numruns();
   test_callback_may_delete_another_timer_mid_run();
   test_nested_run_cannot_double_fire();
+  test_nested_run_cannot_double_fire_final_callback();
   test_numruns_saturation_terminates_max_count();
   test_pool_constructed_at_millis_zero();
 

@@ -31,9 +31,9 @@ jobs:
           rm -f Build_Files/Firmware_Files/LipSync_Firmware.zip
           cd Build_Files/Firmware_Files
           # Include every source needed by the pinned build. Packaging only
-          # the sketch silently dropped the bounded Wire fork, the Bluefruit
-          # fault capture, and XENSIV—the resulting download did not reproduce
-          # CI or the release binary.
+          # the sketch silently dropped the bounded Wire/pressure forks, the
+          # Bluefruit fault capture, and XENSIV—the resulting download did not
+          # reproduce CI or the release binary.
           zip -r -X LipSync_Firmware.zip LipSync_Firmware Libraries \
             -x '*/.DS_Store'
 

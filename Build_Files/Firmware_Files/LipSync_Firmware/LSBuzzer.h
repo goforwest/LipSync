@@ -124,8 +124,6 @@ class LSBuzzer {
     void playErrorSound();
     void playErrorCue();
     void playShutdownSound();
-    void enable();
-    void disable();
     void setSoundModeLevel(int inputSoundMode);
     void calibCornerTone();
     void calibCenterTone();
@@ -174,6 +172,7 @@ void LSBuzzer::begin(){
   pinMode(CONF_BUZZER_PIN, OUTPUT);
   // Read sound mode level from memory
   _soundModeLevel = getSoundMode(false, false);
+  _buzzerOn = (_soundModeLevel != CONF_SOUND_MODE_OFF);
 }
 
 //*********************************//
@@ -236,32 +235,6 @@ void LSBuzzer::clear(){
 }
 
 //*********************************//
-// Function   : enable
-// 
-// Description: Enable sounds feedback
-// 
-// Arguments :  void
-// 
-// Return     : void
-//*********************************//
-void LSBuzzer::enable(){
-  _buzzerOn = true;
-}
-
-//*********************************//
-// Function   : disable
-// 
-// Description: Disable sound feedback
-// 
-// Arguments :  void
-// 
-// Return     : void
-//*********************************//
-void LSBuzzer::disable(){
-  _buzzerOn = false;
-}
-
-//*********************************//
 // Function   : setSoundModeLevel
 // 
 // Description: Set sound level
@@ -272,7 +245,11 @@ void LSBuzzer::disable(){
 //*********************************//
 void LSBuzzer::setSoundModeLevel(int inputSoundMode){
   _soundModeLevel = inputSoundMode;
-  if (_soundModeLevel == CONF_SOUND_MODE_OFF) clear();
+  // The persisted mode is authoritative. The old separate latch stayed false
+  // after the Hub turned sound off, so a later valid SM=1/2 from Connect
+  // changed the setting but could not make any sound until another Hub visit.
+  _buzzerOn = (_soundModeLevel != CONF_SOUND_MODE_OFF);
+  if (!_buzzerOn) clear();
 }
 
 //*********************************//

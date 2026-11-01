@@ -2,7 +2,7 @@
 
 The LipSync is a mouth-operated sip-and-puff joystick that can emulate a mouse, wireless Bluetooth mouse, or gamepad. It enables people with disabilities that limit their mobility to control a computer, gaming console, smart phone, or tablet.
 
-The most recent hardware design, LipSync 4.1, is made up of the LipSync Joystick and LipSync Hub. The Joystick is the primary user interface, and contains a low-force Hall-Effect joystick and sip and puff sensors. The Hub has a display that provides a graphical interface for independently adjusting settings, as well as it provides the connection to the host device and up to three external assistive switches with 3.5 mm jacks. The current firmware release is 4.6.4.
+The most recent hardware design, LipSync 4.1, is made up of the LipSync Joystick and LipSync Hub. The Joystick is the primary user interface, and contains a low-force Hall-Effect joystick and sip and puff sensors. The Hub has a display that provides a graphical interface for independently adjusting settings, as well as it provides the connection to the host device and up to three external assistive switches with 3.5 mm jacks. The current firmware release is 4.6.5.
 
 The device is comprised of off-the-shelf electronics and hardware, a custom PCB and 3D printed parts. The overall cost of materials (including materials required in bulk) for a single build is about $325 (plus shipping). In larger quantities, the cost of materials is closer to $175.
 
@@ -79,7 +79,7 @@ As open source assistive technology, you are welcomed and encouraged to improve 
 ### Build Files
  - [3D Printing Files](/Build_Files/3D_Printing_Files/)
  - [PCB Files](/Build_Files/PCB_Build_Files/)
- - [Firmware Files](/Build_Files/Firmware_Files) — firmware 4.6.4 source, pinned vendored libraries, host tests, and the complete source ZIP
+ - [Firmware Files](/Build_Files/Firmware_Files) — firmware 4.6.5 source, pinned vendored libraries, host tests, and the complete source ZIP
 
 
 ## License

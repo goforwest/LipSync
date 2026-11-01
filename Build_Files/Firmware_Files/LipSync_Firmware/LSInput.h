@@ -66,9 +66,11 @@ LSInput::LSInput(int* inputPinArray, int inputNumber)
     _inputNumber = 0;
   }
   
-  // Set the input mode for each of the pins to an INPUT_PULLUP
+  // Copy pin identities only. These objects have static storage duration, so
+  // their constructors run before Arduino's runtime/variant initialization;
+  // touching GPIO with pinMode() here is platform-order dependent. begin()
+  // owns all hardware access once setup() is running.
   for (int i = 0; i < _inputNumber; i++){
-    pinMode(inputPinArray[i], INPUT_PULLUP);
     _inputPinArray[i] = inputPinArray[i];
   }
 
@@ -83,6 +85,9 @@ LSInput::~LSInput()
 }
 
 void LSInput::begin() {
+  for (int i = 0; i < _inputNumber; i++) {
+    pinMode(_inputPinArray[i], INPUT_PULLUP);
+  }
   clear();  
 }
 
@@ -90,8 +95,10 @@ void LSInput::clear() {
 
   inputStateStruct initialInputState = {INPUT_MAIN_STATE_NONE, INPUT_SEC_STATE_WAITING, 0};
 
+  inputBuffer.clear();
   inputBuffer.pushElement(initialInputState);
 
+  if (inputStateTimerId >= 0) inputStateTimer.deleteTimer(inputStateTimerId);
   inputStateTimerId = inputStateTimer.startTimer();
 }
 
@@ -108,6 +115,7 @@ void LSInput::update() {
   }
   
   inputPrevState = inputBuffer.getLastElement();
+  const unsigned long currentElapsed = inputStateTimer.elapsedTime(inputStateTimerId);
   
 
   // inputAllState = inputState[0] + 2 * inputState[1] + 4 * inputState[2];
@@ -117,16 +125,16 @@ void LSInput::update() {
   if((inputAllState == inputPrevState.mainState // current button states are the same as previous
       && inputPrevState.secondaryState != INPUT_SEC_STATE_RELEASED)) { // and last state was not a release
     
-    inputCurrState = {inputAllState, inputPrevState.secondaryState, inputStateTimer.elapsedTime(inputStateTimerId)};
+    inputCurrState = {inputAllState, inputPrevState.secondaryState, currentElapsed};
 
     inputBuffer.updateLastElement(inputCurrState);  // add state to buffer
 
   } // prev: press x,started  current : press y and elapsed time < reaction time in ms   (120 ms debounce?)
   else if(inputAllState != INPUT_MAIN_STATE_NONE                      // Something is currently pressed
           && inputPrevState.secondaryState == INPUT_SEC_STATE_STARTED // AND previous state was input start
-          && inputPrevState.elapsedTime < INPUT_REACTION_TIME){       // AND time elapsed is less than (debounce?) threshold
+          && currentElapsed < INPUT_REACTION_TIME){                  // AND live time elapsed is less than debounce threshold
 
-    inputCurrState = {inputAllState, inputPrevState.secondaryState, inputStateTimer.elapsedTime(inputStateTimerId)};
+    inputCurrState = {inputAllState, inputPrevState.secondaryState, currentElapsed};
 
     inputBuffer.updateLastElement(inputCurrState);  // add state to buffer
   } 
@@ -139,10 +147,14 @@ void LSInput::update() {
         inputCurrState = {inputAllState, INPUT_SEC_STATE_STARTED, 0};
         
       } // prev: press x,started  current : none  OR prev: press x,started  current : press y and elapsed time >= 150
-      else if(inputPrevState.secondaryState == INPUT_SEC_STATE_STARTED 
-           && inputPrevState.elapsedTime >= INPUT_REACTION_TIME) {
+      else if(inputPrevState.secondaryState == INPUT_SEC_STATE_STARTED
+           && currentElapsed >= INPUT_REACTION_TIME) {
         
-        inputCurrState = {inputPrevState.mainState, INPUT_SEC_STATE_RELEASED, inputPrevState.elapsedTime};
+        // Classify against the stopwatch NOW, not the previous poll's cached
+        // elapsed value. At a 20 ms poll the old check made a configured
+        // 20 ms minimum effectively ~40 ms and discarded legitimate short
+        // Hub-button presses (upstream #39).
+        inputCurrState = {inputPrevState.mainState, INPUT_SEC_STATE_RELEASED, currentElapsed};
       } // prev: press x,started  current : none or press y, elapsed < reaction time
       // (4.5.7 review — the fall-through that became a latch): a press
       // visible for less than one reaction window used to match NO branch

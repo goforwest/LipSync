@@ -23,6 +23,7 @@
 #include <ArduinoJson.h>
 #include <Adafruit_LittleFS.h>
 #include <InternalFileSystem.h>
+#include "LSApiDeclarations.h"
 
 using namespace Adafruit_LittleFS_Namespace;
 
@@ -310,11 +311,12 @@ bool LSMemory::writeAll(String fileString, String jsonString){
       // Name the reason on serial: a refused settings write must never read
       // as a flash failure — it is a deliberate downgrade guard, and the
       // line tells the maker/support tech which knob moved.
-      Serial.print("ERROR: settings file budget refused (");
-      Serial.print((int)strlen(jsonChar));
-      Serial.print(" > ");
-      Serial.print(CONF_SETTINGS_FILE_BUDGET);
-      Serial.println(" bytes) — firmware 4.1.0's 512-byte reader would truncate it");
+      String errorLine = "ERROR: settings file budget refused (";
+      errorLine += String((int)strlen(jsonChar));
+      errorLine += " > ";
+      errorLine += String(CONF_SETTINGS_FILE_BUDGET);
+      errorLine += " bytes) — firmware 4.1.0's 512-byte reader would truncate it";
+      serialTxEnqueueLine(errorLine);
       return false;
     }
 
@@ -419,14 +421,16 @@ JsonObject LSMemory::readObject(String fileString){
     static bool reportedDeserializeFailure = false;
     if (!reportedDeserializeFailure) {
       reportedDeserializeFailure = true;
-      Serial.print("ERROR: deserializeJson() failed (reported once per boot): ");
-      Serial.println(deserializationError.f_str());
+      String errorLine = "ERROR: deserializeJson() failed (reported once per boot): ";
+      errorLine += deserializationError.f_str();
+      serialTxEnqueueLine(errorLine);
     }
   } else if (doc.isNull() || !doc.is<JsonObject>()) {
     static bool reportedInvalidType = false;
     if (!reportedInvalidType) {
       reportedInvalidType = true;
-      Serial.println(F("ERROR: settings file is not a JSON object (reported once per boot)"));
+      static const char typeError[] = "ERROR: settings file is not a JSON object (reported once per boot)";
+      serialTxEnqueueLine(typeError, sizeof(typeError) - 1);
     }
     _lastReadOk = false;
   }
@@ -528,20 +532,22 @@ bool LSMemory::writeObject(String fileString, String key, JsonObject obj){
     // loss). obj.isNull() catches the null-document case directly; the
     // "null"/empty string checks are belt-and-braces.
     if (obj.isNull() || jsonString == "null" || strlen(jsonChar) == 0) {
-      Serial.print("ERROR: settings write refused for key ");
-      Serial.print(key);
-      Serial.println(" — the settings file did not parse (it will be re-seeded at the next boot)");
+      String errorLine = "ERROR: settings write refused for key ";
+      errorLine += key;
+      errorLine += " — the settings file did not parse (it will be re-seeded at the next boot)";
+      serialTxEnqueueLine(errorLine);
       return false;
     }
 
     if (strlen(jsonChar) > CONF_SETTINGS_FILE_BUDGET) {
-      Serial.print("ERROR: settings file budget refused for key ");
-      Serial.print(key);
-      Serial.print(" (");
-      Serial.print((int)strlen(jsonChar));
-      Serial.print(" > ");
-      Serial.print(CONF_SETTINGS_FILE_BUDGET);
-      Serial.println(" bytes) — firmware 4.1.0's 512-byte reader would truncate it");
+      String errorLine = "ERROR: settings file budget refused for key ";
+      errorLine += key;
+      errorLine += " (";
+      errorLine += String((int)strlen(jsonChar));
+      errorLine += " > ";
+      errorLine += String(CONF_SETTINGS_FILE_BUDGET);
+      errorLine += " bytes) — firmware 4.1.0's 512-byte reader would truncate it";
+      serialTxEnqueueLine(errorLine);
       return false;
     }
 
@@ -637,7 +643,14 @@ bool LSMemory::writeString(String fileString, String key, String value){
 //*********************************//
 bool LSMemory::writePoint(String fileString, String key, pointFloatType value){
   JsonObject obj = readObject(fileString);
+  // Replace, do not append (4.6.5 review): the seeded defaults already store
+  // CA1–CA4 as two-element arrays, and JsonDocument::to<JsonArray>() returns
+  // the EXISTING array untouched, so add() appended a third/fourth value on
+  // every recalibration. readPoint() reads [0]/[1], so the newest calibration
+  // was never seen, and the file grew by two numbers per calibration until
+  // the budget guard refused writes (silently pinning the old values).
   JsonArray point = obj[key].to<JsonArray>();
+  point.clear();
   point.add(value.x);
   point.add(value.y);
   return writeObject(fileString,key,obj);

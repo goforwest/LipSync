@@ -97,7 +97,6 @@ public:
   void setLedBrightnessLevel(int ledBrightnessLevel);
   void setLedColor(int ledNumber, int ledColorNumber, int ledBrightness);
   void setInputStateLeds(int windowCount, int colorNumber, int ledBrightness);
-  void show();
   void setLightModeLevel(int lightModeLevel);
   int getLightModeLevel();
 

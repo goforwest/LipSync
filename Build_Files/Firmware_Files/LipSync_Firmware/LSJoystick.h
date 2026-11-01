@@ -77,7 +77,7 @@
 class LSJoystick {
   public:
     LSJoystick();                                                         // Constructor
-    void begin();
+    bool begin();
     void clear();   
     int getMagnetXDirection();                                            // Get the X direction of the magnet.
     void setMagnetXDirection(int magnetXDirection);                       // Set or update the magnet X direction variable.
@@ -110,6 +110,7 @@ class LSJoystick {
     pointIntType getXYOut();                                              // Get the output x and y values.
     int mapRoundInt(int input, int inputStart, int inputEnd, int outputStart, int outputEnd);       // Custom map function that rounds the results instead of truncating
     bool isPollBackedOff();                                             // True while the slow-bus backoff is engaged (the joystick poll measured its own update crawling — see update())
+    bool isBegun() const { return _begun; }                             // Driver initialization completed (false on sensor-skipped safe boots)
 
     // Pipeline diagnostics (bench 2026-10-16, cursor-dead-on-4.5.0 hunt).
     // Dumps every internal the input→output pipeline depends on, so one
@@ -144,11 +145,9 @@ class LSJoystick {
     pointIntType processOutputResponse(pointIntType inputPoint);          // Process the output (Including linearizeOutput methods and speed control)
     int mapFloatInt(float input, float inputStart, float inputEnd, int outputStart, int outputEnd); // Custom map function to map float to int.
     float mapIntToFloat(int input, int inputStart, int inputEnd, int outputStart, int outputEnd);    // Custom map function that takes integers and outputs a float
-    pointFloatType absPoint(pointFloatType inputPoint);                   // Get the absolute value of the point.
     float magnitudePoint(pointFloatType inputPoint);                      // Magnitude of a point from er (0,0)
     float magnitudePoint(pointIntType inputPoint);                        // Magnitude of a point from er (0,0)
     float magnitudePoint(pointFloatType inputPoint, pointFloatType offsetPoint); // Magnitude of a point from offset center point / Compensation point
-    pointFloatType pointFloatFromMagnitudeAngle(float inputMagnitude, float inputPointAngle);
     pointIntType pointIntFromMagnitudeAngle(float inputMagnitude, float inputPointAngle);
     int sgn(float val);                                                   // Get the sign of the value.
     pointFloatType _magnetInputCalibration[JOY_CALIBR_ARRAY_SIZE];        // Array of calibration points.
@@ -235,7 +234,7 @@ LSJoystick::LSJoystick() {
 // 
 // Return     : void
 //*********************************//
-void LSJoystick::begin() {
+bool LSJoystick::begin() {
 
   _inputRadius = 0.0;                                                  // Initialize _inputRadius
   _skipInputChange = false;                                            // Initialize _skipInputChange
@@ -263,13 +262,17 @@ void LSJoystick::begin() {
   // merge: raw-value parity with JV, calibration feel, magnet-direction
   // latch, flaky-bus backoff, and the battery budget of a continuously
   // measuring sensor (µA power-down vs ~mA master-controlled).
-  _Tlv493dSensor.begin(false, false, false, false);
+  _begun = _Tlv493dSensor.begin(false, false, false, false);
+  // Open the read gate BEFORE setMagnetDirection() takes its five Z samples.
+  // The previous end-of-function assignment meant readMagneticField()
+  // rejected every boot-orientation sample by construction, so Z always
+  // latched FAULT and relied on movement-time self-healing.
   setMagnetDirection(JOY_DIRECTION_DEFAULT, JOY_DIRECTION_DEFAULT);      // Set default magnet direction.
   setInnerDeadzone(JOY_OUTPUT_DEADZONE_STATUS, JOY_OUTPUT_DEADZONE_FACTOR);   // Set default deadzone status and deadzone factor.
   setOuterDeadzone(JOY_OUTPUT_DEADZONE_STATUS, 1.0 - JOY_OUTPUT_DEADZONE_FACTOR);   // Set default deadzone status and deadzone factor.
   setOutputRange(JOY_OUTPUT_RANGE_LEVEL);                               // Set default output range level or speed level.
   clear();                                                              // Clear calibration array and _joystickOutputBuffer.
-  _begun = true;                                                        // Sensor handle initialized — opens the readMagneticField() gate
+  return _begun;
 }
 
 //*********************************//
@@ -1274,19 +1277,6 @@ float LSJoystick::mapIntToFloat(int input, int inputStart, int inputEnd, int out
 }
 
 //*********************************//
-// Function   : absPoint 
-// 
-// Description: The absolute value of float point
-// 
-// Arguments :  inputPoint  : pointFloatType : float input point
-// 
-// Return     : output point : pointFloatType : absolute value of float input point
-//*********************************//
-pointFloatType LSJoystick::absPoint(pointFloatType inputPoint){
-  return {abs(inputPoint.x), abs(inputPoint.y)};
-}
-
-//*********************************//
 // Function   : magnitudePoint 
 // 
 // Description: The magnitude of float point from center point (0,0)
@@ -1354,24 +1344,6 @@ pointIntType LSJoystick::pointIntFromMagnitudeAngle(float inputMagnitude, float 
   pointIntType outputPoint= {0,0};
   outputPoint.x = round(inputMagnitude * cos(inputPointAngle));   
   outputPoint.y = round(inputMagnitude * sin(inputPointAngle)); 
-  return outputPoint;
-}
-
-
-//*********************************//
-// Function   : pointFloatFromMagnitudeAngle 
-// 
-// Description: Returns a float point based on magnitude and angle
-// 
-// Arguments :  inputMagnitude : float : Magnitude
-//              inputPointAngle : float : Angle of point
-// 
-// Return     : outputPoint : pointFloatType : (x,y) point
-//*********************************//
-pointFloatType LSJoystick::pointFloatFromMagnitudeAngle(float inputMagnitude, float inputPointAngle) {
-  pointFloatType outputPoint= {0,0};
-  outputPoint.x = inputMagnitude * cos(inputPointAngle);   
-  outputPoint.y = inputMagnitude * sin(inputPointAngle); 
   return outputPoint;
 }
 

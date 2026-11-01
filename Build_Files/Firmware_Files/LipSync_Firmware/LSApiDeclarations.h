@@ -51,31 +51,38 @@ void getVersionNumber(bool responseEnabled, bool apiEnabled, String optionalPara
 void getDeviceID(bool responseEnabled, bool apiEnabled);
 void getDeviceID(bool responseEnabled, bool apiEnabled, String optionalParameter);
 int getOperatingMode(bool responseEnabled, bool apiEnabled);
+void getOperatingMode(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void setOperatingMode(bool responseEnabled, bool apiEnabled, int inputOperatingMode);
 void setOperatingMode(bool responseEnabled, bool apiEnabled, String optionalParameter);
 int getCommunicationMode(bool responseEnabled, bool apiEnabled);
+void getCommunicationMode(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void setCommunicationMode(bool responseEnabled, bool apiEnabled, int inputCommunicationMode);
 void setCommunicationMode(bool responseEnabled, bool apiEnabled, String optionalParameter);
 bool storeModePair(int operatingMode, int communicationMode);  // Atomic menu-mode persistence; caller resets once
 void setModePreset(bool responseEnabled, bool apiEnabled, int inputPreset);
 void setModePreset(bool responseEnabled, bool apiEnabled, String optionalParameter);
 int getSoundMode(bool responseEnabled, bool apiEnabled);
+void getSoundMode(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void setSoundMode(bool responseEnabled, bool apiEnabled, int inputSoundMode);
 void setSoundMode(bool responseEnabled, bool apiEnabled, String optionalParameter);
 int getLightMode(bool responseEnabled, bool apiEnabled);
+void getLightMode(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void setLightMode(bool responseEnabled, bool apiEnabled, int inputLightMode);
 void setLightMode(bool responseEnabled, bool apiEnabled, String optionalParameter);
 
 // Cursor, scroll and acceleration
 int getCursorSpeed(bool responseEnabled, bool apiEnabled);
+void getCursorSpeed(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void setCursorSpeed(bool responseEnabled, bool apiEnabled, int inputSpeedLevel);
 void setCursorSpeed(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void increaseCursorSpeed(bool responseEnabled, bool apiEnabled);
 void decreaseCursorSpeed(bool responseEnabled, bool apiEnabled);
 int getScrollLevel(bool responseEnabled, bool apiEnabled);
+void getScrollLevel(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void setScrollLevel(bool responseEnabled, bool apiEnabled, int inputScrollLevel);
 void setScrollLevel(bool responseEnabled, bool apiEnabled, String optionalParameter);
 int getJoystickAcceleration(bool responseEnabled, bool apiEnabled);
+void getJoystickAcceleration(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void setJoystickAcceleration(bool responseEnabled, bool apiEnabled, int inputAccelerationLevel);
 void setJoystickAcceleration(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void increaseJoystickAcceleration(bool responseEnabled, bool apiEnabled);
@@ -111,14 +118,17 @@ void getBusHealth(bool responseEnabled, bool apiEnabled, String optionalParamete
 
 // Sip & puff thresholds
 float getSipPressureThreshold(bool responseEnabled, bool apiEnabled);
+void getSipPressureThreshold(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void setSipPressureThreshold(bool responseEnabled, bool apiEnabled, float inputSipThreshold);
 void setSipPressureThreshold(bool responseEnabled, bool apiEnabled, String optionalParameter);
 float getPuffPressureThreshold(bool responseEnabled, bool apiEnabled);
+void getPuffPressureThreshold(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void setPuffPressureThreshold(bool responseEnabled, bool apiEnabled, float inputPuffThreshold);
 void setPuffPressureThreshold(bool responseEnabled, bool apiEnabled, String optionalParameter);
 
 // Feedback levels
 int getLightBrightnessLevel(bool responseEnabled, bool apiEnabled);
+void getLightBrightnessLevel(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void setLightBrightnessLevel(bool responseEnabled, bool apiEnabled, int inputLightLevel);
 void setLightBrightnessLevel(bool responseEnabled, bool apiEnabled, String optionalParameter);
 
@@ -190,6 +200,7 @@ void controlHubMenu(bool responseEnabled, bool apiEnabled, String optionalParame
 void getHubMenuState(bool responseEnabled, bool apiEnabled);
 void getHubMenuState(bool responseEnabled, bool apiEnabled, String optionalParameter);
 int getDebugMode(bool responseEnabled, bool apiEnabled);
+void getDebugMode(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void setDebugMode(bool responseEnabled, bool apiEnabled, int inputDebugMode);
 void setDebugMode(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void exportSettings(bool responseEnabled, bool apiEnabled);
@@ -225,18 +236,19 @@ void printResponseIntArray(bool responseEnabled,
                            char responseParameterDelimiter,
                            int responseParameter[]);
 void serialTxService();  // Non-blocking CDC response queue; called from loop()
+bool serialTxEnqueueLine(const char* line, size_t length);
+bool serialTxEnqueueLine(const String &line);
 
 // ---- Cross-tab free functions (defined in LipSync_Firmware.ino) ----
 
 // Device lifecycle
 void softwareReset();
+void releaseOutputAction();
 void setDebugState(int inputDebugMode);
 void readyToUse();
 void errorScreen();
 
-// Buzzer mode helpers called by the Hub menu (LSScreen.h)
-void buzzerSoundOn();
-void buzzerSoundOff();
+// Buzzer feedback helper called by the Hub menu (LSScreen.h)
 void buzzerErrorCue();
 
 // Input restriction machinery (roadmap item 11): boot-time load of the four

@@ -125,7 +125,7 @@ static void bluefruit_blinky_cb( TimerHandle_t xTimer )
 //    the assertion line. A compact summary is written only when the CDC FIFO
 //    can accept it without waiting; fault handling must never block on USB.
 //  - The asserting PC's 8 KB flash page goes into GPREGRET as 0xC0|page —
-//    the same encoding the app's HardFault capture uses (values 0xC0-0xCF
+//    the same encoding the app's HardFault capture uses (values 0xC0-0xFF
 //    collide with none of the bootloader's DFU magics). The next boot
 //    prints it as fp=0x<page-base>. The SD lives at 0x0000-0x26000, so an
 //    fp below 0x26000 names the SOFTDEVICE's own assertion page; app flash
@@ -136,7 +136,7 @@ static void nrf_error_cb(uint32_t id, uint32_t pc, uint32_t info)
 {
   // The app's capture contract (LipSync_Firmware.ino, 4.5.23): the fault
   // page lands in GPREGRET, the next boot reports fp=.
-  NRF_POWER->GPREGRET = 0xC0UL | ((pc >> 13) & 0x0FUL);
+  NRF_POWER->GPREGRET = 0xC0UL | ((pc >> 13) & 0x3FUL);
 
   uint32_t assertLine = 0;
   if ( id == NRF_FAULT_ID_SD_ASSERT && info != 0)

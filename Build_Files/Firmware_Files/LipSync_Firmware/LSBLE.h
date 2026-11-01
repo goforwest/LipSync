@@ -25,7 +25,7 @@
 
 BLEDis bledis;
 BLEHidAdafruit blehid;
-bool needsInitialization = true;
+volatile bool needsInitialization = true;  // Written by the BLE init task, read by the loop task
 
 class LSBLEMouse {
 
@@ -152,7 +152,7 @@ void initializeBluefruit(const char* s) {
   g_bleProbeStep = 12;  // the wire's build-shape marker: 12 = direct begin
   if (!Bluefruit.begin()) {
     g_bleInitStage = 1;
-    Serial.println("BOOT: BLE FAILED at SoftDevice enable");
+    if (USB_DEBUG) { Serial.println("BOOT: BLE FAILED at SoftDevice enable"); }
     g_bleVerdictDirty = true;
     return;
   }
@@ -180,7 +180,7 @@ void initializeBluefruit(const char* s) {
     if (disRc != NRF_SUCCESS) {
       g_bleInitStage = 2;
       g_bleInitRc = disRc;
-      Serial.println("BOOT: BLE FAILED at DIS begin");
+      if (USB_DEBUG) { Serial.println("BOOT: BLE FAILED at DIS begin"); }
       g_bleVerdictDirty = true;
       return;
     }
@@ -190,7 +190,7 @@ void initializeBluefruit(const char* s) {
     if (hidRc != NRF_SUCCESS) {
       g_bleInitStage = 3;
       g_bleInitRc = hidRc;
-      Serial.println("BOOT: BLE FAILED at HID begin");
+      if (USB_DEBUG) { Serial.println("BOOT: BLE FAILED at HID begin"); }
       g_bleVerdictDirty = true;
       return;
     }
@@ -214,7 +214,7 @@ void initializeBluefruit(const char* s) {
   Bluefruit.Advertising.setFastTimeout(30);      // number of seconds in fast mode
   if (!Bluefruit.Advertising.start(0)) {         // 0 = Don't stop advertising after n seconds
     g_bleInitStage = 4;
-    Serial.println("BOOT: BLE FAILED at advertising start");
+    if (USB_DEBUG) { Serial.println("BOOT: BLE FAILED at advertising start"); }
     g_bleVerdictDirty = true;
     return;
   }
@@ -285,10 +285,12 @@ void LSBLEMouse::pan(int8_t pan)
 
 void LSBLEMouse::service(void)
 {
-  if (!_clickPending && !_buttonStatePending) return;
+  if (!_clickPending && !_buttonStatePending && _buttons == 0) return;
   if (needsInitialization || !Bluefruit.connected()) {
     // A disconnect releases HID state at the host. Do not replay a stale
-    // pre-disconnect click when a different host reconnects later.
+    // pre-disconnect click OR a settled drag when a different host reconnects
+    // later. This check must precede the "nothing pending" fast return: a
+    // successfully-sent drag has _buttons set but no pending flag.
     _buttons = 0;
     _buttonStatePending = false;
     _clickPending = false;
@@ -296,6 +298,7 @@ void LSBLEMouse::service(void)
     _clickButton = 0;
     return;
   }
+  if (!_clickPending && !_buttonStatePending) return;  // Settled nonzero button state; nothing to transmit while connected
 
   if (_clickPending) {
     if (!_clickPressedSent) {
