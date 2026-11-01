@@ -14,7 +14,7 @@ Older versions of the LipSync are now obsolete. Documentation and design files a
 
 The existing LipSync Interface Cable options in the BOM are not in stock. We are working on sourcing suitable alternatives.
 
-Last updated: 2026-Oct-29
+Last updated: 2026-Nov-01
 
 <img src="Photos/LipSync-4.jpg" width="500" alt="A green 3D-printed LipSync joystick with a pink sip-and-puff tube is mounted on an adjustable black arm. In front of it sits the LipSync Hub, a black and green control box with a small display screen, labeled buttons ('NEXT' and 'SEL'), indicator lights, and a USB cable connected at the bottom. Both devices are placed on a light wooden surface against a plain light gray wall.">
 

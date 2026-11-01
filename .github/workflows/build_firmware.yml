@@ -41,6 +41,45 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify tracked source ZIP matches the tagged tree
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import sys
+          import zipfile
+
+          root = Path('Build_Files/Firmware_Files')
+          archive = root / 'LipSync_Firmware.zip'
+          expected = {
+              path.relative_to(root).as_posix(): path
+              for folder in ('LipSync_Firmware', 'Libraries')
+              for path in (root / folder).rglob('*')
+              if path.is_file() and path.name != '.DS_Store'
+          }
+          problems = []
+          try:
+              with zipfile.ZipFile(archive) as source_zip:
+                  file_names = [name for name in source_zip.namelist() if not name.endswith('/')]
+                  actual = set(file_names)
+                  for name in sorted({name for name in file_names if file_names.count(name) > 1}):
+                      problems.append(f'duplicate in source ZIP: {name}')
+                  for name, path in expected.items():
+                      if name not in actual:
+                          problems.append(f'missing from source ZIP: {name}')
+                      elif source_zip.read(name) != path.read_bytes():
+                          problems.append(f'stale in source ZIP: {name}')
+                  for name in sorted(actual - expected.keys()):
+                      problems.append(f'extra in source ZIP: {name}')
+          except (FileNotFoundError, zipfile.BadZipFile) as error:
+              problems.append(f'cannot read {archive}: {error}')
+
+          if problems:
+              print('\n'.join(problems), file=sys.stderr)
+              print('Run the Compress Firmware Files workflow and tag its resulting commit.', file=sys.stderr)
+              raise SystemExit(1)
+          print(f'Source ZIP matches all {len(expected)} sketch/library files.')
+          PY
+
       - name: Set up arduino-cli
         uses: arduino/setup-arduino-cli@v2
         with:
@@ -112,6 +151,7 @@ jobs:
           mkdir -p build
           arduino-cli compile \
             --fqbn "$FQBN" \
+            --warnings all \
             --build-path build \
             --libraries Build_Files/Firmware_Files/Libraries \
             Build_Files/Firmware_Files/LipSync_Firmware

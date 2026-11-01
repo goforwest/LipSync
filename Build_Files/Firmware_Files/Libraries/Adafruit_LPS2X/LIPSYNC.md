@@ -11,9 +11,10 @@ caller that repeats them without a deadline.
 LipSync’s patch bounds both waits at 100 ms and makes `reset()` return `bool`;
 the LPS22/LPS25 initializers propagate a timeout as `begin() == false`. Normal
 sensors clear reset in milliseconds, so successful behavior is unchanged.
-The firmware additionally bypasses upstream `getEvent()` for live ambient
-pressure because that path ignores BusIO failures and decodes an uninitialized
-buffer; see `LSPressure::readAmbientPressure()`.
+The firmware additionally bypasses upstream `getEvent()` for live pressure
+because that path ignores BusIO failures and decodes an uninitialized buffer.
+Both pressure sensors use `LSPressure::readFreshPressure()`, an exact-length
+STATUS + 24-bit output transaction that also requires a fresh P_DA conversion.
 
 All other source is version 2.0.6. Re-vendor and reapply this bounded patch
 when changing the pinned dependency.

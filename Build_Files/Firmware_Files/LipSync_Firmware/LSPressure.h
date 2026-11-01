@@ -28,7 +28,14 @@
 #include "LSPressureOffsetFilter.h"
 
 #define LPS22_I2CADDR 0x5C      // Modified LPS22 address
-#define LIPSYNC_LPS22_PRESS_OUT_XL 0x28 // First byte of the 24-bit pressure output
+#define LIPSYNC_PRESS_STATUS 0x27       // P_DA + T_DA status byte on both pressure sensors
+#define LIPSYNC_PRESS_STATUS_P_DA 0x01  // A fresh pressure conversion is available
+
+enum PressureReadResult : uint8_t {
+  PRESS_READ_FAILED = 0,
+  PRESS_READ_STALE,
+  PRESS_READ_FRESH
+};
 
 #define PRESS_BUFF_SIZE 5       // The size of pressure Buffer
 #define PRESS_SAP_BUFF_SIZE 12  // The size of sip and puff state buffer 
@@ -50,6 +57,7 @@
 #define PRESS_SAP_ACTION_TIMEOUT 60000  // Reset timer
 
 #define PRESS_BAD_READ_LIMIT 3         // Consecutive invalid readings before the sensors are marked unhealthy
+#define PRESS_STALE_TIMEOUT_MS 500      // No complete fresh pair for this long means conversion has stalled
 #define PRESS_REPROBE_INTERVAL_MS 2000  // Spacing between sensor re-probes while unhealthy (keeps a dead
                                         // or flaky sensor from stalling the main loop on every poll)
 #define PRESS_PROBE_GOOD_LIMIT 2        // Consecutive valid re-probes before the sensors are marked healthy again
@@ -115,6 +123,7 @@ class LSPressure {
       unsigned long _lastProbeMs;                         // Timestamp of the last unhealthy-mode re-probe
       uint8_t _badReadCount;                              // Consecutive invalid readings while healthy
       uint8_t _goodProbeCount;                            // Consecutive valid re-probes while unhealthy
+      unsigned long _lastFreshPairMs;                     // Fresh-conversion liveness (P_DA on both sensors)
       bool _offsetUpdateRunning;                          // Offset measurement in progress (stepped by updatePressure())
       bool _offsetBaselineValid;                          // A complete stable baseline exists; later refreshes must remain neutral relative to it
       bool _offsetRequiredBeforeSensing;                  // Boot/recovery must complete a safe baseline before sip/puff can resume
@@ -123,7 +132,7 @@ class LSPressure {
       LSPressureEngageFilter _engageFilter{PRESS_SAP_ENGAGE_SAMPLES}; // New holds require consecutive same-direction samples
       unsigned long _sapEngageElapsedBiasMs;              // Time already spent in the consecutive-sample qualifier, included in hold-window timing
       void markSensorsUnhealthy();                        // Disable sip and puff and stop reading I2C until a re-probe succeeds
-      bool readAmbientPressure(float* pressureHpa);       // Verified 3-byte LPS22 read (the upstream getEvent path ignores I2C failures)
+      PressureReadResult readFreshPressure(uint8_t address, float* pressureHpa); // Exact status + 24-bit pressure read shared by both sensors
 };
 
 
@@ -152,6 +161,7 @@ LSPressure::LSPressure()
   _lastProbeMs = 0;
   _badReadCount = 0;
   _goodProbeCount = 0;
+  _lastFreshPairMs = 0;
   _offsetUpdateRunning = false;
   _offsetBaselineValid = false;
   _offsetRequiredBeforeSensing = true;
@@ -215,7 +225,8 @@ void LSPressure::begin()
                         // 15 s when a sensor misbehaved; until it completes, the offset is 0 and
                         // sip and puff stay inert.
   _begun = true;         // Drivers are now safe (i2c_dev allocated even on a failed begin_I2C) —
-                        // sets the gate update() checks before any driver I/O
+                         // sets the gate update() checks before any driver I/O
+  _lastFreshPairMs = millis();
 }
 
 //*********************************//
@@ -430,19 +441,22 @@ void LSPressure::updatePressure()
   if (!_sensorsHealthy) {
     if (nowMs - _lastProbeMs < PRESS_REPROBE_INTERVAL_MS) return;
     _lastProbeMs = nowMs;
-    float probeAbs = _lps35hw.readPressure();
+    float probeAbs = 0.0f;
     float probeAmbient = 0.0f;
-    bool probeAmbientOk = readAmbientPressure(&probeAmbient);
+    PressureReadResult probeAbsResult = readFreshPressure(LPS35HW_I2CADDR_DEFAULT, &probeAbs);
+    PressureReadResult probeAmbientResult = readFreshPressure(LPS22_I2CADDR, &probeAmbient);
     // Plausibility range, not just "> 0" (4.5.7 review): both sensors read
     // absolute ~1013 hPa — a garbage-positive pair (the flaky-ACK failure
     // mode the bench has recorded on unseated cables) passed the old test
     // as "valid" and could fire phantom sip/puff events.
-    if (probeAbs > CONF_PRESS_ABS_PLAUSIBLE_MIN && probeAbs < CONF_PRESS_ABS_PLAUSIBLE_MAX
-        && probeAmbientOk && probeAmbient > CONF_PRESS_ABS_PLAUSIBLE_MIN && probeAmbient < CONF_PRESS_ABS_PLAUSIBLE_MAX) {
+    if (probeAbsResult == PRESS_READ_FRESH && probeAmbientResult == PRESS_READ_FRESH
+        && probeAbs > CONF_PRESS_ABS_PLAUSIBLE_MIN && probeAbs < CONF_PRESS_ABS_PLAUSIBLE_MAX
+        && probeAmbient > CONF_PRESS_ABS_PLAUSIBLE_MIN && probeAmbient < CONF_PRESS_ABS_PLAUSIBLE_MAX) {
       if (++_goodProbeCount >= PRESS_PROBE_GOOD_LIMIT) {
         _sensorsHealthy = true;
         _goodProbeCount = 0;
         _badReadCount = 0;
+        _lastFreshPairMs = nowMs;
         _offsetRequiredBeforeSensing = true;
         startOffsetUpdate();  // Offsets drift while the sensors were down — re-measure
       }
@@ -452,23 +466,37 @@ void LSPressure::updatePressure()
     return;
   }
 
-  _sapPressureAbs = _lps35hw.readPressure();        // Update mouthpiece pressure value
-
-  // If pressure mode is differential
-  float tempAmbientPressure = 0.00;
-  bool ambientReadingValid = (_pressureMode != PRESS_MODE_DIFF);
-  if(_pressureMode == PRESS_MODE_DIFF) {
-    bool ambientReadOk = readAmbientPressure(&tempAmbientPressure);
-
-    if(ambientReadOk && tempAmbientPressure > CONF_PRESS_ABS_PLAUSIBLE_MIN && tempAmbientPressure < CONF_PRESS_ABS_PLAUSIBLE_MAX) { // If this poll's ambient pressure is plausible, update it
-      _ambientPressure = tempAmbientPressure;
-      ambientReadingValid = true;
-    }
+  float tempSapPressureAbs = 0.0f;
+  float tempAmbientPressure = 0.0f;
+  PressureReadResult sapRead = readFreshPressure(LPS35HW_I2CADDR_DEFAULT, &tempSapPressureAbs);
+  PressureReadResult ambientRead = PRESS_READ_FRESH;
+  if (_pressureMode == PRESS_MODE_DIFF) {
+    ambientRead = readFreshPressure(LPS22_I2CADDR, &tempAmbientPressure);
+  } else {
+    tempAmbientPressure = tempSapPressureAbs;
   }
 
-  // Make sure pressure readings are valid (plausibility range — see the re-probe above)
-  bool validReading = (_sapPressureAbs > CONF_PRESS_ABS_PLAUSIBLE_MIN && _sapPressureAbs < CONF_PRESS_ABS_PLAUSIBLE_MAX
-                       && ambientReadingValid);
+  // A cooperative timer that is catching up can invoke two nominal 50 ms
+  // pressure ticks only a millisecond apart. Reading output registers alone
+  // would count the SAME 25 Hz conversion twice and let one transient satisfy
+  // the two-sample engagement qualifier. The P_DA status bit is cleared by
+  // the complete output read, so only two distinct sensor conversions can be
+  // accepted as two samples. A merely-stale read is not a sensor-health
+  // failure; failed/short transactions and implausible fresh data still are.
+  const bool pairFresh = (sapRead == PRESS_READ_FRESH && ambientRead == PRESS_READ_FRESH);
+  const bool transactionFailed = (sapRead == PRESS_READ_FAILED || ambientRead == PRESS_READ_FAILED);
+  const bool pairPlausible = pairFresh
+                          && tempSapPressureAbs > CONF_PRESS_ABS_PLAUSIBLE_MIN
+                          && tempSapPressureAbs < CONF_PRESS_ABS_PLAUSIBLE_MAX
+                          && tempAmbientPressure > CONF_PRESS_ABS_PLAUSIBLE_MIN
+                          && tempAmbientPressure < CONF_PRESS_ABS_PLAUSIBLE_MAX;
+  const bool validReading = pairPlausible;
+  const bool invalidFreshReading = pairFresh && !pairPlausible;
+  if (validReading) {
+    _sapPressureAbs = tempSapPressureAbs;
+    _ambientPressure = tempAmbientPressure;
+    _lastFreshPairMs = nowMs;
+  }
 
   // Stepped offset measurement: this tick's reading IS the sample, so the old
   // 5-read blocking re-measure (up to 15 s of frozen main loop on a bad
@@ -509,36 +537,44 @@ void LSPressure::updatePressure()
     _sapPressure = _sapPressureAbs - _ambientPressure - _offsetPressure;              // Calculate the pressure difference 
     _pressureBuffer.pushElement({_sapPressureAbs, _ambientPressure, _sapPressure});   // Push new pressure values to pressure buffer 
     _currentSampleValid = true;
-  } else if (++_badReadCount >= PRESS_BAD_READ_LIMIT) {
+  } else if ((transactionFailed || invalidFreshReading) && ++_badReadCount >= PRESS_BAD_READ_LIMIT) {
     markSensorsUnhealthy();  // A few consecutive bad readings — stop reading I2C and re-probe slowly
+  } else if (!transactionFailed && !pairFresh && nowMs - _lastFreshPairMs >= PRESS_STALE_TIMEOUT_MS) {
+    // P_DA normally arrives every 40 ms at 25 Hz. A catch-up pass a
+    // millisecond after a valid sample is harmlessly stale; half a second
+    // without one complete pair means a converter has stopped advancing even
+    // though its address still ACKs. Cancel any held input and enter the same
+    // bounded re-probe path as a failed transaction.
+    markSensorsUnhealthy();
   }
 }
 
-// Adafruit_LPS2X::getEvent() cannot report an I2C failure: it always returns
-// true, its private _read() ignores both BusIO read booleans, and it decodes
-// an uninitialized local buffer after a failed/short transfer. Some resulting
-// random 24-bit values fall inside our broad absolute-pressure plausibility
-// band and can look like a fresh opposite-direction sample. Read exactly the
-// pressure register here through the vendored bounded Wire and validate every
-// stage before exposing a value.
-bool LSPressure::readAmbientPressure(float* pressureHpa)
+// The upstream pressure helpers cannot report a complete I2C verdict: LPS2X
+// ignores its BusIO read booleans, while LPS35HW's scalar register read maps a
+// failure onto an ordinary number. Read each sensor through the same bounded,
+// exact-length Wire path. Starting at STATUS also proves P_DA before exposing
+// the following 24-bit output and prevents one conversion from being consumed
+// twice by timer catch-up passes.
+PressureReadResult LSPressure::readFreshPressure(uint8_t address, float* pressureHpa)
 {
-  if (!_begun || pressureHpa == nullptr) return false;
+  if (!_begun || pressureHpa == nullptr) return PRESS_READ_FAILED;
 
-  Wire.beginTransmission(LPS22_I2CADDR);
-  Wire.write((uint8_t)LIPSYNC_LPS22_PRESS_OUT_XL);
-  if (Wire.endTransmission(false) != 0) return false;
+  Wire.beginTransmission(address);
+  Wire.write((uint8_t)LIPSYNC_PRESS_STATUS);
+  if (Wire.endTransmission(false) != 0) return PRESS_READ_FAILED;
 
-  const uint8_t expected = 3;
-  uint8_t received = Wire.requestFrom((uint8_t)LPS22_I2CADDR, expected, (uint8_t)true);
-  if (received != expected || Wire.available() < expected) return false;
+  const uint8_t expected = 4;
+  uint8_t received = Wire.requestFrom(address, expected, (uint8_t)true);
+  if (received != expected || Wire.available() < expected) return PRESS_READ_FAILED;
 
+  const uint8_t status = (uint8_t)Wire.read();
   uint32_t raw = (uint32_t)(uint8_t)Wire.read();
   raw |= (uint32_t)(uint8_t)Wire.read() << 8;
   raw |= (uint32_t)(uint8_t)Wire.read() << 16;
+  if ((status & LIPSYNC_PRESS_STATUS_P_DA) == 0) return PRESS_READ_STALE;
   if (raw & 0x00800000UL) raw |= 0xFF000000UL;
   *pressureHpa = (float)((int32_t)raw) / 4096.0f;
-  return isfinite(*pressureHpa);
+  return isfinite(*pressureHpa) ? PRESS_READ_FRESH : PRESS_READ_FAILED;
 }
 
 //*********************************//

@@ -1,0 +1,6 @@
+# Generated firmware images are release artifacts, not reviewable source text.
+# In particular, arduino-cli emits Intel HEX with CRLF records; treating it as
+# text creates 20k-line diffs and false trailing-whitespace failures.
+*.hex binary
+*.uf2 binary
+*.zip binary
