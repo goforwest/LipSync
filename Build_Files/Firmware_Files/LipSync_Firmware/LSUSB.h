@@ -467,6 +467,23 @@ void LSUSBGamepad::send(void)
 
 void LSUSBGamepad::service(void)
 {
+  // 4.6.6: mirror the mouse's unmount cleanup (LSUSBMouse::service). A
+  // pending coalesced report that survives a disconnect used to be
+  // transmitted to the RE-ENUMERATED host on the next mounted-and-ready
+  // service pass — before usbCheckConnection's begin()/end() cleanup tick
+  // lands (≥ g_usbConnectDelay away) — so the new host could see a button go
+  // down with no user input. Bounded to ≤150 ms by the per-button release
+  // timers, but it is the gamepad half of the "disconnect clears queued
+  // buttons" invariant.
+  if (!USBDevice.mounted()) {
+    if (_reportPending) {
+      _report.buttons = 0;
+      _report.xAxis = 128;
+      _report.yAxis = 128;
+      _reportPending = false;
+    }
+    return;
+  }
   if (_reportPending && isReady()) send();
 }
 

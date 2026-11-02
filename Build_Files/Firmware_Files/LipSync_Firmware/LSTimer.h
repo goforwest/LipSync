@@ -116,6 +116,7 @@ class LSTimer {
     unsigned long elapsedTime(int timerId);                                       // Time elapsed for specificed timer
     int deleteTimer(int timerId);                                                 // Destroy the specified timer
     void restartTimer(int timerId);                                               // Restart the specified timer
+    void anchorAllToNow(void);                                                    // 4.6.6: re-anchor every active slot to now (one full interval until next fire) — clears the catch-up burst after a long loop stall
     boolean isEnabled(int timerId);                                               // Returns true if the specified timer is enabled
     void enable(int timerId);                                                     // Enables the specified timer
     void disable(int timerId);                                                    // Disables the specified timer
@@ -356,7 +357,13 @@ int LSTimer<T>::setupTimer(unsigned long interval, unsigned long startDelay, boo
     timer[freeTimerIndex].callback = f;
     timer[freeTimerIndex].param = p;
     timer[freeTimerIndex].hasParam = h;
-    timer[freeTimerIndex].maxNumRuns = n;
+    // 4.6.6: clamp a finite maxNumRuns to the counter's saturation ceiling.
+    // numRuns saturates at MAX_INT (65535) so the >= comparison can never
+    // fire for a requested maxNumRuns above 65535 — the registration would
+    // silently become RUN_FOREVER, the exact wrap bug the saturation comment
+    // documents. Clamping at the source keeps the count honest: a caller
+    // asking for 100000 runs gets 65535 and stops.
+    timer[freeTimerIndex].maxNumRuns = (n != RUN_FOREVER && n > (unsigned int)MAX_INT) ? (unsigned int)MAX_INT : n;
     timer[freeTimerIndex].numRuns = 0;
     timer[freeTimerIndex].enabled = true;
     timer[freeTimerIndex].startDelayTime = startDelay;
@@ -683,6 +690,38 @@ int LSTimer<T>::deleteTimer(int timerId) {
         numTimers--;
     }
     return 0;
+}
+
+
+//*********************************//
+// Function   : anchorAllToNow
+//
+// Description: Re-anchor every ACTIVE (registered) slot to now, so its next
+//              fire is one full interval away. 4.6.6: after a long deliberate
+//              loop stall the idealized trigger anchor
+//              (previousTime += interval, the header's own TODO) makes every
+//              missed interval come due at once — run() then repays the debt
+//              one fire per loop pass, i.e. a multi-second burst of
+//              back-to-back 20 ms polls (joystick I2C, pressure, input,
+//              screen) the instant the stall ends. The self-test's
+//              testDelay() stalls the loop 14-19 s without pumping the pool;
+//              the caller anchors the pools at the test's exit so normal
+//              operation resumes on a clean cadence instead of a burst.
+//              Disabled slots are left alone (their enable-time semantics
+//              keep their own anchor contract).
+//
+// Arguments :  void
+//
+// Return     : void
+//*********************************//
+template<typename T>
+void LSTimer<T>::anchorAllToNow(void) {
+    const unsigned long now = millis();
+    for (int i = 0; i < MAX_TIMERS; i++) {
+        if (timer[i].callback != NULL || stopwatch[i]) {
+            timer[i].previousTime = now;
+        }
+    }
 }
 
 

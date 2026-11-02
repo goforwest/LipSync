@@ -100,6 +100,13 @@ class LSPressure {
     pressureStruct getAllPressure();                    // Get the latest pressure values
     inputStateStruct getState();                        // Get the latest sip and puff state
     bool isSensorsHealthy();                            // True while both pressure sensors return valid readings (false = gated: re-probing slowly, sip/puff cannot fire)
+    bool takeHoldCancelPending();                       // Take-and-clear: a sensor fault interrupted an ACTIVE sip/puff hold.
+                                                        // The fault path settles the state machine to idle WITHOUT emitting a
+                                                        // RELEASED (no phantom action), so the consumer must end the engaged
+                                                        // drag/scroll latch itself — the only code that releases a hold keys on
+                                                        // RELEASED, and a latch that never sees it strands the held mouse button
+                                                        // and blocks every later action dispatch (canOutputAction=false) until
+                                                        // recovery. Call once per pressureLoop pass.
 
   private: 
       Adafruit_LPS35HW _lps35hw = Adafruit_LPS35HW();     // Create an object of Adafruit_LPS35HW class for Sip and Puff pressure
@@ -131,6 +138,7 @@ class LSPressure {
       bool _currentSampleValid;                           // This poll produced a fresh plausible pressure pair (never count stale buffer data as another engagement sample)
       LSPressureEngageFilter _engageFilter{PRESS_SAP_ENGAGE_SAMPLES}; // New holds require consecutive same-direction samples
       unsigned long _sapEngageElapsedBiasMs;              // Time already spent in the consecutive-sample qualifier, included in hold-window timing
+      bool _holdCancelPending;                            // Set when a fault settles an ACTIVE hold to idle (see takeHoldCancelPending)
       void markSensorsUnhealthy();                        // Disable sip and puff and stop reading I2C until a re-probe succeeds
       PressureReadResult readFreshPressure(uint8_t address, float* pressureHpa); // Exact status + 24-bit pressure read shared by both sensors
 };
@@ -167,6 +175,7 @@ LSPressure::LSPressure()
   _offsetRequiredBeforeSensing = true;
   _currentSampleValid = false;
   _sapEngageElapsedBiasMs = 0;
+  _holdCancelPending = false;
 }
 
 //*********************************//
@@ -284,6 +293,17 @@ int LSPressure::getPressureMode()
 //*********************************//
 void LSPressure::setPressureMode(int mode)
 {
+  // 4.6.6: refuse PRESS_MODE_ABS. The ABS math (updatePressure: ambient :=
+  // the mouthpiece reading, difference = rawDifference - 0) algebraically
+  // zeroes _sapPressure — with ABS active, NO sip or puff could ever cross
+  // any threshold: a fully silent input device. No shipped caller selects
+  // ABS (begin() passes DIFF and there is no API endpoint or menu path), so
+  // this is a dead-code landmine rather than a live defect — but the setter
+  // is public, and one future caller away from disabling every input.
+  // Refuse loudly (counted as a no-op) instead of storing a poison value.
+  if (mode == PRESS_MODE_ABS) {
+    return;  // ABS is not wired — see updatePressure's ABS branch comment
+  }
   _pressureMode = mode;
 }
 
@@ -658,6 +678,16 @@ void LSPressure::updateState()  //  TODO 2025-Feb-22 This code should be abstrac
     _sapBuffer.pushElement(_sapCurrState);
     _sapEngageElapsedBiasMs = 0;
     _sapStateTimer.restartTimer(_sapStateTimerId);
+    // 4.6.6: the suppression above is only half of the fault contract. The
+    // engaged DRAG/SCROLL hold (left button down, canOutputAction=false,
+    // scroll poll swapped in) is released ONLY by a RELEASED event, and this
+    // path by construction never emits one — so the latch used to survive
+    // the fault: held mouse button, every later action dispatch dead, and
+    // the only escapes a hub-button press or a full post-recovery re-puff.
+    // Flag the consumer (pressureLoop -> cancelSapOutputHold) to end the
+    // hold the same way the hold-release branch does — LED default + latch
+    // release, still with NO action-bearing event on the wire.
+    _holdCancelPending = true;
     return;
   }
 
@@ -832,6 +862,26 @@ inputStateStruct LSPressure::getState()
 bool LSPressure::isSensorsHealthy()
 {
   return _sensorsHealthy && !_offsetRequiredBeforeSensing;
+}
+
+
+//*********************************//
+// Function   : takeHoldCancelPending
+//
+// Description: Take-and-clear the fault-interrupted-hold flag (see the
+//              declaration). The consumer MUST end the engaged hold when
+//              this returns true — the fault path suppresses the RELEASED
+//              event the hold-release logic keys on.
+//
+// Arguments :  void
+//
+// Return     : bool : true exactly once per fault-interrupted hold
+//*********************************//
+bool LSPressure::takeHoldCancelPending()
+{
+  const bool pending = _holdCancelPending;
+  _holdCancelPending = false;
+  return pending;
 }
 
 

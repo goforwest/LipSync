@@ -57,7 +57,7 @@ class LSMemory {
     int readInt(String fileString, String key);
     float readFloat(String fileString, String key);
     String readString(String fileString, String key);
-    pointFloatType readPoint(String fileString, String key);
+    bool readPoint(String fileString, String key, pointFloatType &out);  // Reads a [x,y] point; returns false (out untouched) on any read/parse failure — never an implicit {0,0}
     bool writeObject(String fileString, String key, JsonObject obj);
     bool writeInt(String fileString, String key, int value);
     bool writeFloat(String fileString, String key, float value);
@@ -119,6 +119,8 @@ void LSMemory::initialize(String fileString, String jsonString) {
   // compiled default, so one bad write heals at the next boot instead of
   // bricking every future one.
   bool fileHealthy = false;
+  bool fileExistedOverBudget = false;  // 4.6.6: a parseable file over the budget is destroyed — name it (see below)
+  uint32_t fileOverBudgetSize = 0;
   if (file.open(fileName, FILE_O_READ))
   {
     const uint32_t fileSize = file.size();
@@ -143,9 +145,27 @@ void LSMemory::initialize(String fileString, String jsonString) {
                   (fileSize < sizeof(buffer)) &&
                   (readlen == fileSize) &&
                   !err && !doc.isNull() && doc.is<JsonObject>();
+    if (!fileHealthy && fileSize > CONF_SETTINGS_FILE_BUDGET) {
+      fileExistedOverBudget = true;
+      fileOverBudgetSize = fileSize;
+    }
   }
   if (fileHealthy) {
     return;  // Nothing to do — the stored settings parse
+  }
+  // 4.6.6: a file whose ONLY failure is the size budget (parseable, 481-511
+  // bytes — e.g. written by a build without the write-side guard) used to be
+  // destroyed and re-seeded in total silence: calibration corners and the
+  // caregiver restrictions (SD/MA/LK/CF) vanished with no wire trace at all.
+  // The destroy itself stays (4.1.0 would truncate the tail off exactly such
+  // a file on its next write — the cliff this budget exists for), but the
+  // loss is now named on the wire.
+  if (fileExistedOverBudget) {
+    Serial.print("ERROR: settings file (");
+    Serial.print((int)fileOverBudgetSize);
+    Serial.print(" bytes) is parseable but exceeds the ");
+    Serial.print(CONF_SETTINGS_FILE_BUDGET);
+    Serial.println("-byte downgrade budget — replacing it with the compiled defaults");
   }
 
   // Seed (or re-seed) the compiled default. It must fit the budget by
@@ -493,10 +513,30 @@ String LSMemory::readString(String fileString, String key){
 // Arguments :  fileString : String : the name of the file
 //              key : String : the key of the desired Json value
 // 
-// Return     : value : point : The returned value corresponding to the key.
-pointFloatType LSMemory::readPoint(String fileString, String key){
+// Return     : bool : true when a real, finite [x,y] pair was read; false on
+//              any failure (out untouched — the caller falls back to live
+//              state). See the 4.6.6 note in the implementation.
+//*********************************//
+bool LSMemory::readPoint(String fileString, String key, pointFloatType &out){
   JsonObject obj = readObject(fileString);
-  return {obj[key][0], obj[key][1]};
+  // 4.6.6: a failed read (open failure, size guard, parse failure) used to
+  // silently convert to {0,0} — indexing a null JsonObject yields 0 — and
+  // the one live consumer applied that verbatim through setInputMax +
+  // setMinimumRadius + reprocessLastReading: a mid-session settings read
+  // failure reset every calibration corner to the origin, on the wire AND in
+  // the live cursor math, including inside abortJoystickCalibration's
+  // reload-to-persisted path. Report validity instead; `out` is untouched on
+  // failure so the caller can fall back to live state.
+  if (!isLastReadOk()) return false;
+  JsonVariant storedValue = obj[key];
+  if (storedValue.isNull() || !storedValue.is<JsonArray>()) return false;
+  JsonArray corner = storedValue.as<JsonArray>();
+  if (corner.size() < 2) return false;
+  const float x = corner[0].as<float>();
+  const float y = corner[1].as<float>();
+  if (isnan(x) || isnan(y)) return false;
+  out = {x, y};
+  return true;
 }
 
 

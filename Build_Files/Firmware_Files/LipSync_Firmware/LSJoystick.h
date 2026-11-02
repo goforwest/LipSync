@@ -99,6 +99,7 @@ class LSJoystick {
     void resetInputCenterBuffer();                                        // Start a fresh center-measurement sample window.
     void updateInputCenterBuffer();                                       // Push new center compensation point to joystickCenter
     pointFloatType getInputMax(int quad);                                 // Get the updated maximum input reading from the selected corner of joystick using the input quadrant. (Calibration purposes)
+    pointFloatType getStoredInputMax(int quad);                           // 4.6.6: PURE accessor for the stored corner — no sensor I/O, no max-accumulate (getInputMax reads the sensor); safe on never-begun objects
     void setInputMax(int quad, pointFloatType point);                     // Set the maximum input reading for each corner of joystick using the input quadrant. 
     void zeroInputMax(int quad);                                          // Zero the maximum input reading for each corner of joystick using the input quadrant. 
     void update();                                                        // Update the joystick reading to get new input from the magnetic sensor and calculate the output.
@@ -223,6 +224,37 @@ LSJoystick::LSJoystick() {
   _joystickInputBuffer.begin(JOY_INPUT_BUFF_SIZE);                   // Initialize _joystickInputBuffer
   _joystickOutputBuffer.begin(JOY_OUTPUT_BUFF_SIZE);                 // Initialize _joystickOutputBuffer
   _joystickCenterBuffer.begin(JOY_CENTER_BUFF_SIZE);                 // Initialize _joystickCenterBuffer
+  // 4.6.6: belt-and-braces scalar initialization. begin() initializes all of
+  // these too, but begin() is SKIPPED on a sensorless safe boot — and the
+  // serial API is not filtered by safe mode, so the CA,0/EX getters (which
+  // have no sensor gate on the read side) could previously read uninitialized
+  // globals: garbage on the wire and garbage pushed through
+  // setMinimumRadius/reprocessLastReading into the output buffers. The
+  // defaults below are exactly the begin()-entry state (neutral calibration,
+  // DEFAULT magnet polarity, deadzones off, range level 0) so every ungated
+  // read is honest.
+  for (int calibIndex = 0; calibIndex < JOY_CALIBR_ARRAY_SIZE; calibIndex++) {
+    _magnetInputCalibration[calibIndex] = {0.0f, 0.0f};
+  }
+  _rawPoint = {0.0f, 0.0f};
+  _inputPoint = {0, 0};
+  _outputPoint = {0, 0};
+  _joystickXDirection = JOY_DIRECTION_DEFAULT;
+  _joystickYDirection = JOY_DIRECTION_DEFAULT;
+  _magnetZDirection = JOY_DIRECTION_DEFAULT;
+  _magnetXDirection = JOY_DIRECTION_DEFAULT;
+  _magnetYDirection = JOY_DIRECTION_DEFAULT;
+  _innerDeadzoneEnabled = false;
+  _outerDeadzoneEnabled = false;
+  _innerDeadzoneFactor = 0.0f;
+  _innerDeadzoneValue = 0;
+  _outerDeadzoneFactor = 0.0f;
+  _outerDeadzoneValue = JOY_INPUT_XY_MAX;
+  _rangeLevel = 0;
+  _rangeValue = 0;
+  _inputRadius = 0.0;
+  _skipInputChange = false;
+  _operatingMode = CONF_OPERATING_MODE_DEFAULT;
 }
 
 //*********************************//
@@ -699,6 +731,28 @@ void LSJoystick::updateInputCenterBuffer() {
 // 
 // Return     : max point : pointFloatType : The max point
 //*********************************//
+//*********************************//
+// Function   : getStoredInputMax
+//
+// Description: 4.6.6 PURE accessor for a stored calibration corner. Unlike
+//              getInputMax (which performs a sensor read and max-accumulates
+//              against the stored slot), this touches no driver and mutates
+//              nothing — the getter-path twin for CA,0/EX reads, including on
+//              never-begun (sensorless safe) boots where the ctor defaults
+//              make the answer honest zeros instead of uninitialized memory.
+//
+// Arguments :  quad : int : input quadrant
+//
+// Return     : point : pointFloatType : the stored corner (zeros when out of range)
+//*********************************//
+pointFloatType LSJoystick::getStoredInputMax(int quad) {
+  if (quad < 0 || quad >= JOY_CALIBR_ARRAY_SIZE) {
+    return pointFloatType{0.0f, 0.0f};
+  }
+  return _magnetInputCalibration[quad];
+}
+
+
 pointFloatType LSJoystick::getInputMax(int quad) {
   // Single XENSIV read replaces the old updateData()+getY()+getX() trio.
   // A failed read is NOT a corner sample: {0,0} would replace a real held

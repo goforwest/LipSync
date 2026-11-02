@@ -185,22 +185,39 @@ void LSBuzzer::begin(){
 // Return     : void
 //*********************************//
 void LSBuzzer::update(){
-  // Fire queued notes whose time has come (called from the main loop)
-  for (uint8_t i = 0; i < _noteQueueLen; ) {
+  // Fire queued notes whose time has come (called from the main loop).
+  // 4.6.6: fire AT MOST ONE entry per pass. The old loop drained every due
+  // entry in a single pass, so a >=250 ms loop stall (screen flush, timer
+  // catch-up) made it fire a tone and its trailing silence back-to-back —
+  // the last call won and the note was cut to zero length. One per pass
+  // preserves each note's audible length under catch-up, and a late-fired
+  // tone pushes any due trailing silence past its real finish so the
+  // noTone release cannot silence a note that has just started.
+  uint8_t dueIndex = _noteQueueLen;
+  for (uint8_t i = 0; i < _noteQueueLen; i++) {
     if ((long)(millis() - _noteQueue[i].fireAtMs) >= 0) {
-      if (_noteQueue[i].frequency == 0) {
-        noTone(CONF_BUZZER_PIN);
-      } else {
-        tone(CONF_BUZZER_PIN, _noteQueue[i].frequency, _noteQueue[i].duration);
-      }
-      for (uint8_t j = i; j < _noteQueueLen - 1; j++) {
-        _noteQueue[j] = _noteQueue[j + 1];
-      }
-      _noteQueueLen--;
-    } else {
-      i++;
+      dueIndex = i;  // first due entry in queue order (queueNote appends; shipped callers schedule in increasing order)
+      break;
     }
   }
+  if (dueIndex == _noteQueueLen) return;
+  if (_noteQueue[dueIndex].frequency != 0) {
+    // A tone fired LATE (after a stall) must still sound for its duration:
+    // reschedule due silences behind it past the tone's actual finish.
+    const unsigned long toneDoneAtMs = millis() + _noteQueue[dueIndex].duration;
+    for (uint8_t j = dueIndex + 1; j < _noteQueueLen; j++) {
+      if (_noteQueue[j].frequency == 0 && (long)(_noteQueue[j].fireAtMs - toneDoneAtMs) < 0) {
+        _noteQueue[j].fireAtMs = toneDoneAtMs;
+      }
+    }
+    tone(CONF_BUZZER_PIN, _noteQueue[dueIndex].frequency, _noteQueue[dueIndex].duration);
+  } else {
+    noTone(CONF_BUZZER_PIN);
+  }
+  for (uint8_t j = dueIndex; j < _noteQueueLen - 1; j++) {
+    _noteQueue[j] = _noteQueue[j + 1];
+  }
+  _noteQueueLen--;
 }
 
 //*********************************//

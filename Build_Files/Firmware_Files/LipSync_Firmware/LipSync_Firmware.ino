@@ -109,6 +109,7 @@ LSTimer<ledStateStruct> ledStateTimer;
 
 int usbConnectTimerId[1] = {-1};
 LSTimer<int> usbConnectTimer;
+static void usbConnectRearm(unsigned long delayMs);  // 4.6.6: delete-before-arm one-shot re-arm — defined before usbCheckConnection; called from setup() (no Arduino auto-prototype reliance, the 4.3.0 discipline)
 
 unsigned int g_usbConnectDelay = CONF_USB_HID_INIT_DELAY;
 unsigned long g_usbNotReadySinceMs = 0;  // When the current HID-not-ready stretch began; 0 = none in progress
@@ -184,7 +185,18 @@ volatile uint32_t g_witnessSecondsUnfed = 0;
 // Both now route through the SD-aware helper: the SVC path with the stack
 // up, the raw write when it is down.
 uint8_t readTrailByte()            { return (lipsyncRetentionGet(1) >> 5) & 0x07; }
-void writeTrailByte(uint8_t step)  { lipsyncRetentionUpdate(1, 0xE0, (uint8_t)((step & 0x07) << 5)); }
+void writeTrailByte(uint8_t step)  {
+  // 4.6.6: inside the Bluefruit.begin() window the SD is already enabled but
+  // g_softDeviceEnabled cannot be true yet (raising it early would send SD
+  // SVCs into the core's FreeRTOS SVC trampoline with the SD down — worse
+  // than the fault). The loop task runs time-sliced with the 16 KB init
+  // task, so a pt=4 (LED action) or pt=7 (serial dispatch) stamp landing in
+  // that window would take the RAW GPREGRET path with the SD up — the exact
+  // APP_MEMACC death 4.5.27 eliminated. Stamps are pure forensics: skip the
+  // write for the sub-second window; every post-init path stamps normally.
+  if (lipsyncRetentionUnsafe()) return;
+  lipsyncRetentionUpdate(1, 0xE0, (uint8_t)((step & 0x07) << 5));
+}
 
 // WITNESS v8 — THE HANG WITNESS (bench 2026-10-23): this round proved the
 // freeze ends in a WATCHDOG reset that WIPES GPREGRET2 (every freeze
@@ -246,7 +258,16 @@ extern "C" void TIMER3_IRQHandler(void) {
   // watchdogLoop()'s reset. 4 consecutive un-fed seconds = the loop stalled
   // past 3 s with interrupts alive.
   if (!g_shutdownInProgress && g_watchdogArmed && ++g_witnessSecondsUnfed >= 4) {
-    lipsyncRetentionUpdate(1, 0x1C, (uint8_t)(CONF_RETENTION_MARKER_HANG << 2));  // SD-aware marker write; trail bits preserved
+    // 4.6.6: inside the Bluefruit.begin() window neither retention path is
+    // safe (see lipsyncRetentionUnsafe) — skip the marker write; the reset
+    // itself (SREQ) still fires and the DOG/watchdog successor boots still
+    // settle the streak. A witness fire during the init window requires a
+    // >3 s loop stall while begin() runs, which the init task's separate
+    // stack and priority make effectively unreachable — this gate is
+    // belt-and-braces so the marker can never be the MEMACC trigger.
+    if (!lipsyncRetentionUnsafe()) {
+      lipsyncRetentionUpdate(1, 0x1C, (uint8_t)(CONF_RETENTION_MARKER_HANG << 2));  // SD-aware marker write; trail bits preserved
+    }
     NVIC_SystemReset();  // SREQ — retention survives; the next boot reports pt=/pm=
   }
 }
@@ -372,6 +393,7 @@ extern "C" __attribute__((naked)) void HardFault_Handler(void) {
 volatile int g_bleInitStage = 0;                 // 4.5.11: init-task progress/failure stage (see LSApiDeclarations.h)
 volatile int8_t g_bleSdWasEnabled = -1;          // 4.5.13: the init task's SD probe: -1 = not probed yet, 0 = the SoftDevice was down (normal), 1 = it was ALREADY enabled when the app started (bootloader leftover — see LSBLE.h)
 volatile bool g_softDeviceEnabled = false;      // 4.5.27: THE SoftDevice is up (set right after Bluefruit.begin() succeeds) — every retention-register access routes through the SD SVCs while this is true; see LSApiDeclarations.h          // 4.5.13: the init task's SD probe: -1 = not probed yet, 0 = the SoftDevice was down (normal), 1 = it was ALREADY enabled when the app started (bootloader leftover — see LSBLE.h)
+volatile bool g_bleInitWindow = false;          // 4.6.6: the BLE init task raises this for the duration of Bluefruit.begin() — see lipsyncRetentionUnsafe() in LSApiDeclarations.h
 volatile uint8_t g_bleProbeStep = 0;             // 4.5.14: the begin()-mirror probe's first failing call (0 = not run/non-BLE, 1..10 = that call failed, 11 = all passed) — see LSBLE.h
 volatile uint32_t g_bleProbeCode = 0;            // 4.5.14: the failing call's SoftDevice error code (0 = none)
 volatile uint32_t g_bleProbeNeed = 0;           // 4.5.14: sd_ble_enable's required app RAM base (on NO_MEM, the smoking gun vs 0x20006000)
@@ -553,6 +575,19 @@ static void bleInitTaskBody(void* arg) {
 void setup() {
   g_loopTaskHandle = xTaskGetCurrentTaskHandle();  // 4.5.26: the loop task runs setup — capture its handle for the stack high-water print
   initGlobals();  //  Intialize global variables to default values
+  // 4.6.6: seed the SD-up flag from the chip itself BEFORE the first
+  // retention access. checkResetReason() below writes through the SD-aware
+  // helper, and on the bootloader-leftover-SD boot (the sd=1 case the 4.5.13
+  // guard exists for) initializeBluefruit never runs on a USB-only boot —
+  // the flag would stay false for the whole session and every stamp would
+  // take the raw GPREGRET path with the SD up. sd_softdevice_is_enabled is
+  // the MBR-serviced SVC that is legal in every state (LSBLE.h probes it the
+  // same way); from setup's thread mode it is the canonical context.
+  {
+    uint8_t sdUpAtEntry = 0;
+    (void) sd_softdevice_is_enabled(&sdUpAtEntry);
+    g_softDeviceEnabled = (sdUpAtEntry != 0);
+  }
   checkResetReason();  //  Check reason for reset and reset the reset-reason register
 
   // Witness v7: capture what the DEAD boot last stamped (survives the reset
@@ -785,7 +820,7 @@ void setup() {
   pollTimer.disable(pollTimerId[CONF_TIMER_USB]); // TODO 2025-Feb-21 Disable usbConnectionLoop until implemented
   // If USB is not connected, try to reconnect
   if (g_comMode == CONF_COM_MODE_USB) {
-    usbConnectTimerId[0] = usbConnectTimer.setTimeout(g_usbConnectDelay, usbCheckConnection);  // Call usbCheckConnection function when g_usbConnectDelay reached
+    usbConnectRearm(g_usbConnectDelay);  // 4.6.6: delete-before-arm (first arm — the id holder starts at -1)
   }
 
 
@@ -1730,6 +1765,28 @@ void usbConnectionLoop() {
 
 
 //***USB CHECK CONNECTION FUNCTION***//
+// Function   : usbConnectRearm
+//
+// Description: 4.6.6: the one-shot re-arm with delete-before-arm. Overwriting
+//              usbConnectTimerId[0] while a predecessor one-shot is still
+//              pending ORPHANED it — a direct call into usbCheckConnection
+//              (the mouse busy-latch path can invoke it while a timer-fired
+//              check is mid-episode) then left two pending one-shots that
+//              each re-arm on fire, so the population stabilizes at 2: the
+//              effective retry cadence doubles and g_usbConnectDelay grows
+//              twice per period, defeating the documented 10 s backoff cap.
+//              The id holder starts at -1 and deleteTimer(-1) is a no-op, so
+//              delete-first is safe on every path including the first arm.
+//
+// Parameters : delayMs : unsigned long : delay before the next check
+//
+// Return     : void
+//****************************************//
+static void usbConnectRearm(unsigned long delayMs) {
+  if (usbConnectTimerId[0] >= 0) usbConnectTimer.deleteTimer(usbConnectTimerId[0]);
+  usbConnectTimerId[0] = usbConnectTimer.setTimeout(delayMs, usbCheckConnection);
+}
+
 // Function   : usbCheckConnection
 //
 // Description: This function checks if the USB connection is attempting to retry mounting, not ready, or timed out
@@ -1822,7 +1879,15 @@ void usbCheckConnection(void) {
         }
         screen.restartPage();
         delay(500);  // Bounded: drain the serial line and let the framebuffer push complete (bounded by Wire)
-        lipsyncRetentionUpdate(1, 0x1C, (uint8_t)(CONF_RETENTION_MARKER_USB_RECOVERY << 2));
+        // 4.6.6: skip the marker inside the Bluefruit.begin() window (neither
+        // retention path is safe there — see lipsyncRetentionUnsafe). The
+        // restart itself still fires; the only cost is the next boot treating
+        // the reset as unattributed instead of USB-recovery, and a USB
+        // recovery episode cannot even run on a BLE boot before its deferred
+        // USB attach — this gate is symmetry with the other diagnostic writes.
+        if (!lipsyncRetentionUnsafe()) {
+          lipsyncRetentionUpdate(1, 0x1C, (uint8_t)(CONF_RETENTION_MARKER_USB_RECOVERY << 2));
+        }
         NVIC_SystemReset();
       }
     }
@@ -1837,8 +1902,7 @@ void usbCheckConnection(void) {
   // still completing a healthy enumeration. Persistent outages re-enter the
   // normal ladder on that timeout.
   if (usbEpisodeJustStarted) {
-    if (usbConnectTimerId[0] >= 0) usbConnectTimer.deleteTimer(usbConnectTimerId[0]);
-    usbConnectTimerId[0] = usbConnectTimer.setTimeout(CONF_USB_HID_INIT_DELAY, usbCheckConnection);
+    usbConnectRearm(CONF_USB_HID_INIT_DELAY);  // 4.6.6: delete-before-arm (was the one site that already deleted first)
     return;
   }
 
@@ -1877,14 +1941,14 @@ void usbCheckConnection(void) {
       g_usbConnectDelay = (nextDelay > 10000U) ? 10000U : nextDelay;
     }
 
-    usbConnectTimerId[0] = usbConnectTimer.setTimeout(g_usbConnectDelay, usbCheckConnection);  // Keep retrying connection until USB connection is made
+    usbConnectRearm(g_usbConnectDelay);  // 4.6.6: delete-before-arm — keep retrying connection until USB connection is made
 
   } else if (((g_operatingMode == CONF_OPERATING_MODE_MOUSE) && (g_comMode == CONF_COM_MODE_USB) && (!usbmouse.isReady()))  // in usb mouse mode and usb mouse is not ready
       || ((g_operatingMode == CONF_OPERATING_MODE_GAMEPAD) && !gamepad.isReady())){                                         // in usb gamepad mode and usb gamepad is not ready
 
     screen.drawUsbErrorPageOnce();
 
-    usbConnectTimerId[0] = usbConnectTimer.setTimeout(g_usbConnectDelay, usbCheckConnection);  // Keep retrying connection until USB connection is made
+    usbConnectRearm(g_usbConnectDelay);  // 4.6.6: delete-before-arm — keep retrying connection until USB connection is made
 
 
   } else if (usbmouse.timedOut && !usbmouse.isReady()) {
@@ -1894,7 +1958,7 @@ void usbCheckConnection(void) {
     // the latch themselves) falls through to the healthy branch instead of
     // parking here forever.
     screen.drawUsbErrorPageOnce();
-    usbConnectTimerId[0] = usbConnectTimer.setTimeout(g_usbConnectDelay, usbCheckConnection);  // Keep retrying connection until USB connection is made
+    usbConnectRearm(g_usbConnectDelay);  // 4.6.6: delete-before-arm — keep retrying connection until USB connection is made
   } else {
     usbmouse.timedOut = false;  // Stale latch: the interface is ready, the episode is over
     usbmouse.consecutiveSkips = 0;  // 4.5.7 review: the skip counter must reset with the latch, or the first transient not-ready tick after recovery re-latches after ONE skip instead of three
@@ -1914,7 +1978,7 @@ void usbCheckConnection(void) {
     if (screen.resetUsbErrorPage()) {
       readyToUse();
     } else {
-      usbConnectTimerId[0] = usbConnectTimer.setTimeout(1000, usbCheckConnection);
+      usbConnectRearm(1000);  // 4.6.6: delete-before-arm
     }
   }
 }
@@ -2522,6 +2586,16 @@ void pressureLoop() {
   //if (USB_DEBUG) { Serial.println("USBDEBUG: pressureLoop()"); }
   ps.update();  // Request new pressure difference from sensor and push it to array
 
+  // A fault that interrupted an ACTIVE hold settled the state machine to
+  // idle without a RELEASED event — end the engaged drag/scroll latch here
+  // (4.6.6: the latch otherwise strands the held mouse button and blocks
+  // every later action dispatch until a hub-button press or a post-recovery
+  // re-puff). Must run before evaluateOutputAction: getState() below now
+  // reads the settled {NONE, WAITING}, which alone cannot release anything.
+  if (ps.takeHoldCancelPending()) {
+    cancelSapOutputHold();
+  }
+
   //pressureValues = ps.getAllPressure();  // Read the pressure object (can be last value from array, average or other algorithms)
 
   // Get the last state change
@@ -2551,6 +2625,30 @@ void releaseOutputAction() {
   outputAction = CONF_ACTION_NOTHING;
   canOutputAction = true;
   g_outputHoldInputClass = -1;
+}
+
+//***CANCEL OUTPUT HOLD FUNCTION***//
+// Function   : cancelSapOutputHold
+//
+// Description: Ends an engaged DRAG/SCROLL hold WITHOUT emitting an input
+//              event. This is the exact bookkeeping of evaluateOutputAction's
+//              hold-release branch (setLedDefault + releaseOutputAction),
+//              minus the action dispatch — for holds that ended without a
+//              RELEASED event: the sensor-fault path settles the pressure
+//              state machine to idle while a hold is ACTIVE (no phantom
+//              action may fire from a fault), so the latch would otherwise
+//              strand the held mouse button and block every later action
+//              (the release match keys on RELEASED, which the fault path
+//              never produces). The scroll-poll swap self-corrects on the
+//              next tick once outputAction is NOTHING.
+//
+// Parameters : void
+//
+// Return     : void
+//****************************************//
+void cancelSapOutputHold() {
+  setLedDefault();        // Set default led feedback (the hold's window color was showing)
+  releaseOutputAction();  // Release the drag button / clear the hold latch
 }
 
 //***EVALUATE OUTPUT ACTION FUNCTION***//
@@ -2604,7 +2702,14 @@ void evaluateOutputAction(inputStateStruct actionState, unsigned long actionMaxE
   // exactly the 20 ms I2C-against-degraded-hardware traffic safe mode
   // exists to avoid. Safe-mode action columns never resolve to
   // SCROLL/DRAG, so there is nothing for the swap to do there.
-  if(g_joystickSensorConnected && !g_safeModeEnabled){
+  // 4.6.6: also gated on joystick debug mode. setDebugState(DM=1) disables
+  // the joystick and scroll polls so the debug stream is the only consumer,
+  // but this swap (inputLoop runs it every 20 ms with outputAction ==
+  // NOTHING) re-enabled the joystick poll within one tick — the debug
+  // contract silently didn't hold and the sensor was double-polled. The
+  // debug-mode poll state is setDebugState's business; DM=0/DM=2..5 restore
+  // it there.
+  if(g_joystickSensorConnected && !g_safeModeEnabled && g_debugMode != CONF_DEBUG_MODE_JOYSTICK){
     if (outputAction == CONF_ACTION_SCROLL) {
       pollTimer.enable(pollTimerId[CONF_TIMER_SCROLL]);
       pollTimer.disable(pollTimerId[CONF_TIMER_JOYSTICK]);

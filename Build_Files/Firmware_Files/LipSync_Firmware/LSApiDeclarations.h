@@ -244,6 +244,7 @@ bool serialTxEnqueueLine(const String &line);
 // Device lifecycle
 void softwareReset();
 void releaseOutputAction();
+void cancelSapOutputHold();  // 4.6.6: ends an engaged DRAG/SCROLL hold without emitting an input event (fault-interrupted holds)
 void setDebugState(int inputDebugMode);
 void readyToUse();
 void errorScreen();
@@ -328,6 +329,20 @@ extern bool g_bootReportWorthy;
 // the machinery entirely. All retention access now routes through the
 // sanctioned SVCs when the SoftDevice is up.
 extern volatile bool g_softDeviceEnabled;  // set true right after Bluefruit.begin() succeeds (the SD is up from that instant until reset); read by the ISR paths — do NOT probe sd_softdevice_is_enabled() from an ISR, that is itself an SVC
+// 4.6.6: true ONLY while the BLE init task is inside Bluefruit.begin(). The
+// SD is enabled INSIDE that call, so between sd_softdevice_enable running
+// and the flag above being raisable, neither retention path is safe: the
+// SVC path would issue SD-function SVCs with the SD down (the core's
+// SVC_Handler is FreeRTOS's context-switch trampoline — not a no-op) and
+// the raw path is an APP_MEMACC kill with the SD up. Diagnostic retention
+// writers (trail stamps, the witness marker, the streak clear) skip the
+// write for this sub-second window via lipsyncRetentionUnsafe(); must-run
+// writers (fault capture) are unaffected.
+extern volatile bool g_bleInitWindow;
+// True while a retention write must not touch the POWER registers at all.
+static inline bool lipsyncRetentionUnsafe() {
+  return g_bleInitWindow && !g_softDeviceEnabled;
+}
 #include <nrf_soc.h>  // sd_power_gpregret_get/set/clr — the sanctioned POWER-register access with the SD up
 static inline uint32_t lipsyncRetentionGet(uint32_t id) {
   if (g_softDeviceEnabled) {

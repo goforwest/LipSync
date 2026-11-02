@@ -74,6 +74,19 @@ void activateTest(int inputTest) {
       break;
 
   } // end switch inputTest
+  // 4.6.6: the test stalled the loop for many seconds without pumping the
+  // poll pools (testDelay deliberately feeds only the buzzer/serial/
+  // watchdog). The idealized timer anchors make every missed interval due at
+  // once — without this re-anchor, the moment the test ends, run() repays
+  // the debt one fire per loop pass: a multi-second burst of back-to-back
+  // 20 ms I2C/pressure/input/screen polls right as the user resumes input.
+  // Anchor to now so normal operation resumes on a clean one-interval
+  // cadence. (The watchdog-test case ends in its reset; anchoring first is
+  // harmless there.)
+  pollTimer.anchorAllToNow();
+  ledStateTimer.anchorAllToNow();
+  calibrationTimer.anchorAllToNow();
+  actionTimer.anchorAllToNow();
   g_shutdownInProgress = false;
   testLog("Test Complete");
 }

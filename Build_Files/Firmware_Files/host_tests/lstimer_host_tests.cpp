@@ -627,6 +627,43 @@ static void test_pool_constructed_at_millis_zero() {
   g_fakeMillis = 100;               // restore the shared clock
 }
 
+// (4.6.6) A maxNumRuns ABOVE the counter's 65535 saturation ceiling used to
+// silently become RUN_FOREVER (numRuns saturates at 65535, so the >=
+// comparison could never fire) — the registration is now clamped at the
+// source, so an over-large request terminates exactly at the ceiling.
+static void test_maxNumRuns_above_saturation_ceiling_clamps() {
+  resetCounters();
+  LSTimer<void> pool;
+  s_joystickTicks = 0;
+  int id = pool.setTimer(1, 0, 100000, joystickTickCb);  // far above 65535
+  CHECK(id >= 0);
+  pump(pool, 65540);
+  CHECK_EQ(s_joystickTicks, 65535);   // clamped to the ceiling, not RUN_FOREVER
+  CHECK_EQ(pool.getNumTimers(), 0);   // …and self-deletes at it
+}
+
+// (4.6.6) anchorAllToNow: after a long loop stall the idealized anchors make
+// every missed interval due at once (a multi-second catch-up burst). The
+// anchor call re-arms every active slot to one full interval from now, so
+// the next run() pass fires nothing.
+static void test_anchorAllToNow_clears_catchup_debt() {
+  resetCounters();
+  LSTimer<void> pool;
+  s_joystickTicks = 0;
+  int id = pool.setInterval(100, 0, joystickTickCb);
+  CHECK(id >= 0);
+  pump(pool, 1000);                 // ~10 fires on a normal cadence
+  const int ticksBefore = s_joystickTicks;
+  CHECK(ticksBefore >= 9);
+  g_fakeMillis += 5000;             // the long stall: the slot is ~50 intervals overdue
+  pool.anchorAllToNow();            // the post-stall re-anchor
+  pump(pool, 99);                   // within one interval of the anchor
+  CHECK_EQ(s_joystickTicks, ticksBefore);  // no burst fired
+  pump(pool, 1);                    // exactly one interval later
+  CHECK_EQ(s_joystickTicks, ticksBefore + 1);  // cadence resumes cleanly
+  pool.deleteTimer(id);
+}
+
 int main() {
   test_zero_delay_interval_never_fires_immediately();
   test_nonzero_start_delay_offsets_only_the_first_fire();
@@ -647,6 +684,8 @@ int main() {
   test_nested_run_cannot_double_fire();
   test_nested_run_cannot_double_fire_final_callback();
   test_numruns_saturation_terminates_max_count();
+  test_maxNumRuns_above_saturation_ceiling_clamps();
+  test_anchorAllToNow_clears_catchup_debt();
   test_pool_constructed_at_millis_zero();
 
   std::printf("%d checks, %d failures\n", g_checks, g_failures);

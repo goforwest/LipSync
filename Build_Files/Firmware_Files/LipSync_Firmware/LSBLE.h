@@ -15,6 +15,15 @@
   You should have received a copy of the GNU General Public License along with this program.
   If not, see <http://www.gnu.org/licenses/>
 */
+// 4.6.6: include guard. This header defines external-linkage objects
+// (bledis, blehid, needsInitialization) and the free initializeBluefruit()
+// — safe only because the Arduino build merges every tab into ONE
+// translation unit and this file is included exactly once. A second
+// inclusion (or any future .cpp consumer, e.g. the host-test pattern used
+// for LSTimer) would be an immediate multiple-definition break; every other
+// LS*.h already carries one.
+#ifndef LSBLE_H
+#define LSBLE_H
 #include <bluefruit.h>
 #include <nrf_sdm.h>
 
@@ -112,6 +121,10 @@ void initializeBluefruit(const char* s) {
   g_bleSdWasEnabled = (sdAlreadyEnabled != 0) ? 1 : 0;
   if (sdAlreadyEnabled) {
     (void) sd_softdevice_disable();  // MBR-serviced SVC: legal whether or not the SD is up
+    // 4.6.6: the SD is DOWN from this instant — drop the flag (setup seeded
+    // it true for this exact leftover case) so no retention write takes the
+    // SVC path into a disabled SoftDevice on the way to begin()'s re-enable.
+    g_softDeviceEnabled = false;
   }
   // 4.5.17 bench round 11: THE PRIORITY MODEL, CORRECTED BY THE BENCH. The
   // classic "app must use 4-7 with the SoftDevice" rule is WRONG for this
@@ -150,18 +163,39 @@ void initializeBluefruit(const char* s) {
   // with its own internal USE_TINYUSB pre/post_enable hooks, on the 16 KB
   // init task, with the stage checks and every guard this line has built.
   g_bleProbeStep = 12;  // the wire's build-shape marker: 12 = direct begin
+  // 4.6.6: begin() ENABLES the SoftDevice inside this call. The retention
+  // writers in the loop task (LED/serial trail stamps, the witness marker,
+  // the streak clear) must not touch the POWER registers until the SD-up
+  // flag can be raised — so the init window opens here and closes the
+  // moment begin() returns, on every path. (Raising the flag itself early
+  // is NOT an option: with the SD down the SVC path would hand SD-function
+  // SVCs to the core's FreeRTOS SVC trampoline.)
+  g_bleInitWindow = true;
   if (!Bluefruit.begin()) {
     g_bleInitStage = 1;
+    // begin() can fail at a LATER internal stage with the SoftDevice already
+    // enabled (the enable is only its first step). Re-probe instead of
+    // assuming: a raw retention write with the SD actually up is an
+    // APP_MEMACC kill. Order matters — the flag goes up FIRST, the window
+    // closes second, so no intermediate state lets a stamp take the raw
+    // path while the SD is up (flag true + window open → stamps skip;
+    // flag true + window closed → SVC path; both safe).
+    uint8_t sdUpAfterFail = 0;
+    (void) sd_softdevice_is_enabled(&sdUpAfterFail);
+    g_softDeviceEnabled = (sdUpAfterFail != 0);
+    g_bleInitWindow = false;
     if (USB_DEBUG) { Serial.println("BOOT: BLE FAILED at SoftDevice enable"); }
     g_bleVerdictDirty = true;
     return;
   }
-  if (USB_DEBUG) { Serial.println("BOOT: BLE stack up"); }
   // 4.5.27: THE SoftDevice is UP from this instant until the next reset —
   // every POWER-register access from here on MUST go through the SD SVCs
   // (see lipsyncRetentionUpdate in LSApiDeclarations.h; the Fable 5.1
   // consult pinned the entire BLE death saga on raw GPREGRET2 writes).
+  // 4.6.6 ordering: flag FIRST, window closed SECOND — see the failure path.
   g_softDeviceEnabled = true;
+  g_bleInitWindow = false;
+  if (USB_DEBUG) { Serial.println("BOOT: BLE stack up"); }
   Bluefruit.Periph.setConnInterval(9, 16);  // min = 9*1.25=11.25 ms, max = 16*1.25=20ms
   Bluefruit.setTxPower(4);                  // Check bluefruit.h for supported values
   Bluefruit.setName(s);
@@ -372,3 +406,5 @@ bool LSBLEMouse::isConnected(void) {
 //  never instantiated, and its keyboardReport carried delay(2) per
 //  report — the copy-paste-invitation class 4.5.4's LSUSBKeyboard
 //  removal set the precedent for)
+
+#endif  // LSBLE_H

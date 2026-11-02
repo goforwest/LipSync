@@ -160,8 +160,12 @@ void watchdogLoop(void) {
     // 4.5.27 (Fable 5.1 consult): THIS was the next scheduled death — the
     // 120 s streak-clear is a raw POWER write that runs on LIVE boots with
     // the SoftDevice up (the stamp fixes would only have moved the kill to
-    // t=120 s). SD-aware now.
-    lipsyncRetentionUpdate(1, 0x03, 0);  // clear only the counter bits (the trail bits 5-7 stay)
+    // t=120 s). SD-aware now. 4.6.6: inside the Bluefruit.begin() window
+    // neither path is safe — skip the clear (the next boot re-evaluates the
+    // streak anyway; a 120 s cadence loses nothing to a sub-second skip).
+    if (!lipsyncRetentionUnsafe()) {
+      lipsyncRetentionUpdate(1, 0x03, 0);  // clear only the counter bits (the trail bits 5-7 stay)
+    }
     watchdogBootCountCleared = true;
   }
 }

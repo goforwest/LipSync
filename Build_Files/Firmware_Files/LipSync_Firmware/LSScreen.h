@@ -467,8 +467,22 @@ void LSScreen::update() {
 // Return     : bool : true = input frozen
 //*********************************//
 bool LSScreen::inputIsFrozen() {
+  // 4.6.6: a deadline that has passed is CONSUMED on first observation. The
+  // old form left _inputFrozenUntil stale forever, and a stale timestamp
+  // re-enters the honored band once per millis() wrap (49.7 days): for the
+  // 15 s before (deadline mod 2^32), the unsigned subtraction wraps small
+  // and positive and the menu silently dropped every input — including
+  // acking serial CH presses while honoring nothing. With the consume, a
+  // deadline is only ever honored inside its real window: the first poll
+  // after expiry (≤ one 20 ms tick) clears it, decades before any wrap
+  // could resurrect it, and the factory value 0 is refused outright.
+  if (_inputFrozenUntil == 0) return false;
   long remaining = (long)(_inputFrozenUntil - millis());
-  return remaining > 0 && remaining <= (long)CONF_SCREEN_INPUT_FREEZE_MAX_MS;
+  if (remaining > 0) {
+    return remaining <= (long)CONF_SCREEN_INPUT_FREEZE_MAX_MS;
+  }
+  _inputFrozenUntil = 0;  // expired — never honored again
+  return false;
 }
 
 //*********************************//
@@ -1071,6 +1085,18 @@ void LSScreen::selectMenuItem() {
       }
       break;
     case CONFIRM_MODE_CHANGE:
+      // 4.6.6: re-check the mode lock HERE, not only at the Mode-menu row.
+      // The gate at the row leaves a TOCTOU hole: a user can be sitting on
+      // this confirm page when a caregiver enables LK from the app — the
+      // confirming select would then execute the locked mode change (persist
+      // + reset), exactly what the lock exists to prevent. Same refusal
+      // shape as the Mode-page gate: error cue, named locked page, and the
+      // scheduled transition returns to the Mode menu.
+      if (g_modeLocked) {
+        buzzerErrorCue();
+        modeLockedPage();
+        break;
+      }
       if (_currentSelection == 1) {
         _currentSelection = 0;
         modeMenu();

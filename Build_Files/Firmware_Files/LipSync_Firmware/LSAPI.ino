@@ -840,7 +840,15 @@ void setCursorSpeed(bool responseEnabled, bool apiEnabled, int inputSpeedLevel) 
     // success the next boot forgets.
     isValidSpeed = mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempCursorSpeedLevel);
     if (!isValidSpeed) {
-      tempCursorSpeedLevel = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+      // 4.6.6: fall back to the IN-FORCE level (the joystick's own live
+      // value), not a file readback. readInt yields 0 for an unreadable file
+      // (open/parse failure mid-session), which used to silently degrade the
+      // live cursor to the slowest setting for the rest of the boot while
+      // the endpoint answered FAIL,3 — breaking the setter's own "a refused
+      // store leaves the live value untouched" contract. With a healthy
+      // file the readback and the live value agree (every load/GET applies
+      // the stored level onto js), so the live value is at least as correct.
+      tempCursorSpeedLevel = js.getOutputRange();
     }
     if (!CONF_API_ENABLED && isValidSpeed) {
       tempCursorSpeedLevel = CONF_JOY_CURSOR_SPEED_LEVEL_DEFAULT;
@@ -848,8 +856,9 @@ void setCursorSpeed(bool responseEnabled, bool apiEnabled, int inputSpeedLevel) 
     performLedAction(ledCurrentState);
   }
   else {
-    // Invalid inputSpeedLevel
-    tempCursorSpeedLevel = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+    // Invalid inputSpeedLevel — answer the in-force value, not a readback
+    // that degenerates to 0 on an unreadable file (4.6.6, as above).
+    tempCursorSpeedLevel = js.getOutputRange();
     performLedAction(ledCurrentState);
     isValidSpeed = false;
   }
@@ -946,7 +955,11 @@ void setScrollLevel(bool responseEnabled, bool apiEnabled, int inputScrollLevel)
     // must read as a failed write, not a silent success.
     isValidLevel = mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempScrollLevel);
     if (!isValidLevel) {
-      tempScrollLevel = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+      // 4.6.6: fall back to the in-force level (g_scrollLevel), not a file
+      // readback that degenerates to 0 on an unreadable file — a refused
+      // store must leave the live scroll level untouched (the readback used
+      // to collapse the live scroll speed to the minimum for the boot).
+      tempScrollLevel = g_scrollLevel;
     }
     if (!CONF_API_ENABLED && isValidLevel) {
       tempScrollLevel = CONF_SCROLL_LEVEL_DEFAULT;
@@ -955,8 +968,8 @@ void setScrollLevel(bool responseEnabled, bool apiEnabled, int inputScrollLevel)
     g_scrollLevel = tempScrollLevel;
   }
   else {
-    // Invalid inputScrollLevel
-    tempScrollLevel = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+    // Invalid inputScrollLevel — answer the in-force value (4.6.6, as SS).
+    tempScrollLevel = g_scrollLevel;
     performLedAction(ledCurrentState);
     isValidLevel = false;
   }
@@ -1194,10 +1207,26 @@ void setJoystickInitialization(bool responseEnabled, bool apiEnabled, String opt
 //
 // Return     : void
 //*********************************//
+// 4.6.6: corner plausibility gate for reads (mirror of the full-calibration
+// convention, CONF_JOY_CALIB_CORNER_MIN = 3: a corner coordinate below 3 mT
+// is degenerate). A REAL corner has at least one axis at or beyond the min —
+// the compiled defaults are ±13 and measured corners land 13-30 mT out — so
+// {0,0} (what a failed read used to yield implicitly) and any NaN/garbage
+// fail this gate and the caller keeps the live stored corner instead.
+static bool isPlausibleStoredCorner(pointFloatType p) {
+  if (isnan(p.x) || isnan(p.y)) return false;
+  return (fabsf(p.x) >= CONF_JOY_CALIB_CORNER_MIN) || (fabsf(p.y) >= CONF_JOY_CALIB_CORNER_MIN);
+}
+
 void getJoystickCalibration(bool responseEnabled, bool apiEnabled) {
   String commandKey;
   pointFloatType calibrationPointArray[5];
-  calibrationPointArray[0] = js.getInputCenter();
+  // 4.6.6: sensorless gate. This getter is reachable on safe boots (the API
+  // table is not filtered by safe mode and the app's connect load sends
+  // CA,0) — every js mutation below, and getInputCenter itself, would touch
+  // the never-begun object's state. Answer stored/default values only.
+  const bool sensorless = !g_joystickSensorConnected || !js.isBegun();
+  calibrationPointArray[0] = sensorless ? pointFloatType{0.0f, 0.0f} : js.getInputCenter();
   // 4.5.7 review: while a full calibration is IN FLIGHT, this read must not
   // touch the live corner slots — getInputMax is a max-accumulator against
   // the stored slot, so a CA,0/EX read landing inside a corner's 2 s
@@ -1206,19 +1235,32 @@ void getJoystickCalibration(bool responseEnabled, bool apiEnabled) {
   // user told "calibrated" while the corner silently kept its
   // pre-calibration value). The read still answers the STORED values.
   bool calibrationInFlight = g_calibrationRunning;
+  // 4.6.6: a failed/implausible stored-corner read must never flow into
+  // setInputMax — readPoint now reports validity, and a slot that fails the
+  // gate falls back to the LIVE stored corner (no I/O) with the flag
+  // clearing the radius/reprocess pass: a settings read failure used to
+  // silently reset every corner to {0,0} live, including inside
+  // abortJoystickCalibration's reload-to-persisted path.
+  bool storedCornersUsable = true;
   for (int i = 1; i < 5; i++)
   {
     commandKey = "CA" + String(i);
-    calibrationPointArray[i] = mem.readPoint(CONF_SETTINGS_FILE, commandKey);
-    if (!calibrationInFlight) {
+    pointFloatType storedCorner = {0.0f, 0.0f};
+    if (mem.readPoint(CONF_SETTINGS_FILE, commandKey, storedCorner) && isPlausibleStoredCorner(storedCorner)) {
+      calibrationPointArray[i] = storedCorner;
+    } else {
+      calibrationPointArray[i] = js.getStoredInputMax(i);
+      storedCornersUsable = false;
+    }
+    if (!calibrationInFlight && !sensorless) {
       js.setInputMax(i, calibrationPointArray[i]);
     }
   }
-  if (!calibrationInFlight) {
+  if (!calibrationInFlight && !sensorless && storedCornersUsable) {
     js.setMinimumRadius();  // Update the minimum cursor operating radius
     js.reprocessLastReading();  // A stationary stick must reflect reloaded corners immediately
   }
-  printResponseFloatPointArray(responseEnabled, apiEnabled, true, 0, "CA,0", true, "", 5, ',', calibrationPointArray);
+  printResponseFloatPointArray(responseEnabled, apiEnabled, storedCornersUsable, storedCornersUsable ? 0 : 3, "CA,0", true, "", 5, ',', calibrationPointArray);
 
 }
 //***GET JOYSTICK CALIBRATION API FUNCTION***//
@@ -1995,14 +2037,17 @@ void setJoystickAcceleration(bool responseEnabled, bool apiEnabled, int inputAcc
     // LSMemory) reads back the stored level and reports FAIL,3.
     isValidAcceleration = mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempJoystickAccelerationLevel);
     if (!isValidAcceleration) {
-      tempJoystickAccelerationLevel = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+      // 4.6.6: fall back to the in-force level (the live `acceleration`
+      // global), not a file readback that degenerates to 0 on an unreadable
+      // file — a refused store must leave the live acceleration untouched.
+      tempJoystickAccelerationLevel = acceleration;
     } else if (!CONF_API_ENABLED) {
       tempJoystickAccelerationLevel = CONF_JOY_ACCELERATION_LEVEL_DEFAULT;
     }
   }
   else {
-    // Invalid inputAccelerationLevel
-    tempJoystickAccelerationLevel = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+    // Invalid inputAccelerationLevel — answer the in-force value (4.6.6).
+    tempJoystickAccelerationLevel = acceleration;
     isValidAcceleration = false;
   }
 
@@ -3687,6 +3732,19 @@ void doFactoryReset(bool responseEnabled, bool apiEnabled, String optionalParame
 // Return     : void
 //*********************************//
 void enterUpdateMode(bool responseEnabled, bool apiEnabled) {
+  // 4.6.6: inside the Bluefruit.begin() window the SD may already be enabled
+  // while g_softDeviceEnabled is still false — a raw GPREGRET write here
+  // (either the SVC bypass below or the core's enterSerialDfu path) would be
+  // an APP_MEMACC kill. The window closes the moment begin() returns
+  // (sub-second); UM arrives via serial, which cannot be served before the
+  // CDC stack is up long after the window in practice — wait it out bounded
+  // rather than faulting the boot.
+  {
+    const unsigned long umWaitDeadlineMs = millis() + 2000;
+    while (lipsyncRetentionUnsafe() && (long)(umWaitDeadlineMs - millis()) > 0) {
+      delay(10);
+    }
+  }
   // With the SoftDevice live, prepare the DFU retention magic through its
   // sanctioned SVCs before promising success. The old code ignored both
   // return values, acknowledged, and reset even if the magic was not stored
