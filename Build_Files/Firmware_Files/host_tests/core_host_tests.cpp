@@ -4,6 +4,7 @@
 #include <type_traits>
 
 #include "LSCircularBuffer.h"
+#include "LSHostSwitch.h"
 #include "LSPressureClassify.h"
 #include "LSPressureEngageFilter.h"
 #include "LSPressureOffsetFilter.h"
@@ -270,6 +271,139 @@ static void test_hard_band_classification_semantics() {
   CHECK(filter.qualify(HARD_SIP, false) == HARD_SIP);
 }
 
+// ---- Upstream #16: LSHostSwitch (multi-host switching decisions/rows) ----
+
+static lsHostSwitchState makeReadyState(int rowCount, int activeRow) {
+  lsHostSwitchState st = {};
+  st.bleInitialized = 1;
+  st.rowCount = rowCount;
+  st.activeRow = activeRow;
+  return st;
+}
+
+static void test_host_name_sanitization() {
+  char out[LSHOST_NAME_WIRE_MAX + 1];
+
+  lsHostSanitizeName("Hamoudi's MacBook Pro", out, sizeof(out));
+  CHECK(std::string(out) == "Hamoudi's MacBook Pro");  // printable ASCII passes through
+
+  lsHostSanitizeName("iPhone, John's:2/3", out, sizeof(out));
+  CHECK(std::string(out) == "iPhone_ John's_2_3");  // , : / each become '_'
+
+  lsHostSanitizeName("tab\there\x01", out, sizeof(out));
+  CHECK(std::string(out) == "tab_here_");  // control bytes become '_'
+
+  // Exact-cap truncation: 24 chars kept, the rest dropped, still NUL-terminated.
+  lsHostSanitizeName("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123", out, sizeof(out));
+  CHECK(std::string(out) == "ABCDEFGHIJKLMNOPQRSTUVWX");
+  CHECK(out[LSHOST_NAME_WIRE_MAX] == '\0');
+
+  out[0] = 'X';
+  lsHostSanitizeName((const char*)0, out, sizeof(out));
+  CHECK(out[0] == '\0');  // NULL name sanitizes to empty
+  lsHostSanitizeName("", out, sizeof(out));
+  CHECK(out[0] == '\0');
+}
+
+static void test_host_row_sort_is_deterministic() {
+  lsHostRow rows[4];
+  const char* macs[4] = {"112233445566", "001122334455", "aabbccddeeff", "090a0b0c0d0e"};
+  for (int i = 0; i < 4; i++) {
+    std::snprintf(rows[i].mac, sizeof(rows[i].mac), "%s", macs[i]);
+    std::snprintf(rows[i].name, sizeof(rows[i].name), "H%d", i);
+    rows[i].lastMacByte = 0;
+    rows[i].active = 0;
+  }
+  lsHostSortRows(rows, 4);
+  CHECK(std::string(rows[0].mac) == "001122334455");
+  CHECK(std::string(rows[1].mac) == "090a0b0c0d0e");
+  CHECK(std::string(rows[2].mac) == "112233445566");
+  CHECK(std::string(rows[3].mac) == "aabbccddeeff");
+
+  // Renumber-after-forget stability: removing a middle row keeps the
+  // relative order of the rest (the app's re-read contract, cross-checked).
+  lsHostRow three[3];
+  for (int i = 0, src = 0; i < 3; i++, src++) {
+    if (src == 1) src++;  // skip "090a0b0c0d0e"
+    three[i] = rows[src];
+  }
+  lsHostSortRows(three, 3);
+  CHECK(std::string(three[1].mac) == "112233445566");  // was row 3, now row 2
+}
+
+static void test_host_oled_label_and_overflow() {
+  lsHostRow row;
+  std::snprintf(row.mac, sizeof(row.mac), "AABBCCDDEEFF");
+  std::snprintf(row.name, sizeof(row.name), "Hamoudi's MacBook Pro");
+  row.lastMacByte = 0xFF;
+  row.active = 1;
+  char label[32];
+  lsHostOledLabel(&row, label, sizeof(label));
+  CHECK(std::string(label) == "Hamoudi's MacBook (FF)");  // 17 name chars + suffix
+
+  row.lastMacByte = 0x3F;
+  lsHostOledLabel(&row, label, sizeof(label));
+  CHECK(std::string(label) == "Hamoudi's MacBook (3F)");
+
+  std::snprintf(row.name, sizeof(row.name), "iPhone");  // short name: full + suffix
+  lsHostOledLabel(&row, label, sizeof(label));
+  CHECK(std::string(label) == "iPhone (3F)");
+
+  CHECK(lsHostHiddenCount(4) == 0);
+  CHECK(lsHostHiddenCount(5) == 1);
+  CHECK(lsHostHiddenCount(7) == 3);
+  CHECK(lsHostHiddenCount(0) == 0);
+}
+
+static void test_host_switch_decision_precedence() {
+  lsHostSwitchState st = makeReadyState(3, 1);
+
+  // The allow path: ready device, valid non-active row.
+  CHECK(lsHostSwitchDecision(&st, 2) == LSHOST_ALLOW);
+  CHECK(lsHostSwitchDecision(&st, 3) == LSHOST_ALLOW);
+
+  // Fixed precedence (deterministic refusal note): uninitialized wins over
+  // everything, then calibration, latch, frozen menu, range, already-active.
+  st.bleInitialized = 0;
+  st.calibrationRunning = 1;
+  st.latchHeld = 1;
+  st.menuInputFrozen = 1;
+  CHECK(lsHostSwitchDecision(&st, 2) == LSHOST_REFUSE_NOT_INITIALIZED);
+  st.bleInitialized = 1;
+  CHECK(lsHostSwitchDecision(&st, 2) == LSHOST_REFUSE_CALIBRATION);
+  st.calibrationRunning = 0;
+  CHECK(lsHostSwitchDecision(&st, 2) == LSHOST_REFUSE_LATCH);
+  st.latchHeld = 0;
+  CHECK(lsHostSwitchDecision(&st, 2) == LSHOST_REFUSE_FROZEN);
+  st.menuInputFrozen = 0;
+  CHECK(lsHostSwitchDecision(&st, 4) == LSHOST_REFUSE_RANGE);
+  CHECK(lsHostSwitchDecision(&st, 0) == LSHOST_REFUSE_RANGE);
+  CHECK(lsHostSwitchDecision(&st, 1) == LSHOST_REFUSE_ALREADY_ACTIVE);
+
+  // NULL state refuses (fail-safe direction: no flag can enable a radio call).
+  CHECK(lsHostSwitchDecision((const lsHostSwitchState*)0, 1) == LSHOST_REFUSE_NOT_INITIALIZED);
+}
+
+static void test_host_forget_decision_allows_active() {
+  lsHostSwitchState st = makeReadyState(3, 2);
+
+  CHECK(lsHostForgetDecision(&st, 1) == LSHOST_ALLOW);  // inactive host
+  CHECK(lsHostForgetDecision(&st, 2) == LSHOST_ALLOW);  // ACTIVE host: legal, disconnect first
+  CHECK(lsHostForgetDecision(&st, 0) == LSHOST_REFUSE_RANGE);
+  CHECK(lsHostForgetDecision(&st, 4) == LSHOST_REFUSE_RANGE);
+
+  st.calibrationRunning = 1;
+  CHECK(lsHostForgetDecision(&st, 1) == LSHOST_REFUSE_CALIBRATION);
+  st.calibrationRunning = 0;
+  st.bleInitialized = 0;
+  CHECK(lsHostForgetDecision(&st, 1) == LSHOST_REFUSE_NOT_INITIALIZED);
+
+  // A latch held does NOT refuse a forget (no radio touch for inactive rows).
+  st.bleInitialized = 1;
+  st.latchHeld = 1;
+  CHECK(lsHostForgetDecision(&st, 1) == LSHOST_ALLOW);
+}
+
 int main() {
   static_assert(!std::is_copy_constructible<LSCircularBuffer<int>>::value,
                 "owning circular buffers must not be shallow-copyable");
@@ -282,6 +416,11 @@ int main() {
   test_pressure_offset_only_accepts_stable_neutral_samples();
   test_serial_queue_never_truncates_an_inflight_line();
   test_hard_band_classification_semantics();
+  test_host_name_sanitization();
+  test_host_row_sort_is_deterministic();
+  test_host_oled_label_and_overflow();
+  test_host_switch_decision_precedence();
+  test_host_forget_decision_allows_active();
 
   std::printf("%d checks, %d failures\n", checks, failures);
   return failures == 0 ? 0 : 1;
