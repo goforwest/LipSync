@@ -62,6 +62,15 @@ _functionList getSipPressureThresholdFunction =   {"ST", "0", "0", &getSipPressu
 _functionList setSipPressureThresholdFunction =   {"ST", "1", "",  &setSipPressureThreshold};
 _functionList getPuffPressureThresholdFunction =  {"PT", "0", "0", &getPuffPressureThreshold};
 _functionList setPuffPressureThresholdFunction =  {"PT", "1", "",  &setPuffPressureThreshold};
+// Upstream #58: hard sip/puff band (four keys living in /settings2.dat).
+_functionList getHardSipPressureThresholdFunction =   {"HS", "0", "0", &getHardSipPressureThreshold};
+_functionList setHardSipPressureThresholdFunction =   {"HS", "1", "",  &setHardSipPressureThreshold};
+_functionList getHardPuffPressureThresholdFunction =  {"HP", "0", "0", &getHardPuffPressureThreshold};
+_functionList setHardPuffPressureThresholdFunction =  {"HP", "1", "",  &setHardPuffPressureThreshold};
+_functionList getHardSipActionFunction =              {"HA", "0", "0", &getHardSipAction};
+_functionList setHardSipActionFunction =              {"HA", "1", "",  &setHardSipAction};
+_functionList getHardPuffActionFunction =             {"HB", "0", "0", &getHardPuffAction};
+_functionList setHardPuffActionFunction =             {"HB", "1", "",  &setHardPuffAction};
 
 _functionList getSoundModeFunction =              {"SM", "0", "0", &getSoundMode};
 _functionList setSoundModeFunction =              {"SM", "1", "",  &setSoundMode};
@@ -143,6 +152,14 @@ _functionList apiFunction[] = { //Let compiler determine number of functions
   setSipPressureThresholdFunction,
   getPuffPressureThresholdFunction,
   setPuffPressureThresholdFunction,
+  getHardSipPressureThresholdFunction,
+  setHardSipPressureThresholdFunction,
+  getHardPuffPressureThresholdFunction,
+  setHardPuffPressureThresholdFunction,
+  getHardSipActionFunction,
+  setHardSipActionFunction,
+  getHardPuffActionFunction,
+  setHardPuffActionFunction,
   getJoystickAccelerationFunction,
   setJoystickAccelerationFunction,
   getSoundModeFunction,
@@ -360,12 +377,13 @@ void performCommand(String inputString) {
         inputCodeString == apiFunction[apiIndex].code) {
 
       // Matching Command String found
-      // Only the four analog settings accept a decimal point. Every other
+      // Only the six analog settings accept a decimal point. Every other
       // endpoint is integer-valued; accepting "1.9" and then calling toInt()
       // silently executed it as 1 instead of rejecting malformed input.
       bool floatParameter = (inputCodeString == "1") &&
                             (inputEndpointString == "IZ" || inputEndpointString == "OZ" ||
-                             inputEndpointString == "ST" || inputEndpointString == "PT");
+                             inputEndpointString == "ST" || inputEndpointString == "PT" ||
+                             inputEndpointString == "HS" || inputEndpointString == "HP");
       if (!isValidCommandParameter(inputParameterString) ||
           (!floatParameter && inputParameterString.indexOf('.') >= 0)) {
         printResponseInt(true, true, false, 2, inputString, false, 0);
@@ -1969,6 +1987,312 @@ void setPuffPressureThreshold(bool responseEnabled, bool apiEnabled, String opti
   setPuffPressureThreshold(responseEnabled, apiEnabled, optionalParameter.toFloat());
 }
 
+//***GET HARD SIP PRESSURE THRESHOLD FUNCTION***//
+// Function   : getHardSipPressureThreshold
+//
+// Description: Returns the hard sip threshold (upstream #58). The hard band
+//              is a second, higher-threshold band: a hold that STARTS beyond
+//              it fires its action with no hold-duration requirement. Values
+//              live in /settings2.dat. A fresh value is written at first read
+//              if missing or invalid. The hard threshold is constrained to
+//              be above the regular sip threshold plus CONF_PRESS_HARD_MARGIN_HPA.
+//
+// Parameters :  responseEnabled : bool : The serial print output is enabled if true.
+//               apiEnabled : bool : The API response is sent if true.
+//
+// Return     : float : the current hard sip threshold [hPa]
+//*********************************//
+float getHardSipPressureThreshold(bool responseEnabled, bool apiEnabled) {
+  String commandKey = "HS";
+  float tempHardSipThreshold;
+  tempHardSipThreshold = mem.readFloat(CONF_SETTINGS2_FILE, commandKey);
+
+  if (!isfinite(tempHardSipThreshold) ||
+      (tempHardSipThreshold < CONF_PRESS_MIN_THRESHOLD) ||
+      (tempHardSipThreshold >= CONF_PRESS_MAX_THRESHOLD)) {
+    tempHardSipThreshold = CONF_HARD_SIP_THRESHOLD;
+    mem.writeFloat(CONF_SETTINGS2_FILE, commandKey, tempHardSipThreshold);
+  }
+  ps.setHardSipThreshold(tempHardSipThreshold);
+  printResponseFloat(responseEnabled, apiEnabled, true, 0, "HS,0", true, tempHardSipThreshold);
+
+  return tempHardSipThreshold;
+}
+
+//***GET HARD SIP PRESSURE THRESHOLD API FUNCTION***//
+// Function   : getHardSipPressureThreshold (overload)
+//
+// Description: API entry point for HS,0 (returns the value without writing).
+//
+// Parameters :  responseEnabled, apiEnabled, optionalParameter
+//
+// Return     : void
+//*********************************//
+void getHardSipPressureThreshold(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 0) {
+    getHardSipPressureThreshold(responseEnabled, apiEnabled);
+  }
+}
+
+//***SET HARD SIP PRESSURE THRESHOLD FUNCTION***//
+// Function   : setHardSipPressureThreshold
+//
+// Description: Sets the hard sip threshold (upstream #58). In addition to the
+//              regular absolute range, the value must sit at least
+//              CONF_PRESS_HARD_MARGIN_HPA above the LIVE regular sip
+//              threshold — the hard band must stay a clearly distinct
+//              gesture, and the classifier's hard-sticky semantics rely on
+//              hard > regular. A value that violates the margin is refused
+//              (FAIL,3, nothing written); the boot-time heal for out-of-order
+//              STORED values lives in initSipAndPuff, not here — a serial SET
+//              must never silently rewrite what the host sent.
+//
+// Parameters :  responseEnabled : bool
+//               apiEnabled : bool
+//               inputHardSipThreshold : float : new hard sip threshold [hPa]
+//
+// Return     : void
+//*********************************//
+void setHardSipPressureThreshold(bool responseEnabled, bool apiEnabled, float inputHardSipThreshold) {
+  String commandKey = "HS";
+
+  float minHard = ps.getSipPressureThreshold() + CONF_PRESS_HARD_MARGIN_HPA;
+
+  if ((isfinite(inputHardSipThreshold) &&
+       inputHardSipThreshold >= CONF_PRESS_MIN_THRESHOLD &&
+       inputHardSipThreshold < CONF_PRESS_MAX_THRESHOLD &&
+       inputHardSipThreshold >= minHard)
+      && mem.writeFloat(CONF_SETTINGS2_FILE, commandKey, inputHardSipThreshold)) {
+    // A refused store (settings budget, LSMemory) reports FAIL,3 — same
+    // contract as the ST/PT setters.
+    ps.setHardSipThreshold(inputHardSipThreshold);
+    printResponseFloat(responseEnabled, apiEnabled, true, 0, "HS,1", true, inputHardSipThreshold);
+  }
+  else {
+    printResponseFloat(responseEnabled, apiEnabled, false, 3, "HS,1", true, inputHardSipThreshold);
+  }
+}
+
+//***SET HARD SIP PRESSURE THRESHOLD API FUNCTION***//
+// Function   : setHardSipPressureThreshold (overload)
+//
+// Description: API entry point for HS,1 (float parameter).
+//
+// Parameters :  responseEnabled, apiEnabled, optionalParameter
+//
+// Return     : void
+//*********************************//
+void setHardSipPressureThreshold(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  setHardSipPressureThreshold(responseEnabled, apiEnabled, optionalParameter.toFloat());
+}
+
+//***GET HARD PUFF PRESSURE THRESHOLD FUNCTION***//
+// Function   : getHardPuffPressureThreshold
+//
+// Description: Returns the hard puff threshold (upstream #58). The hard band
+//              is a second, higher-threshold band: a hold that STARTS beyond
+//              it fires its action with no hold-duration requirement. Values
+//              live in /settings2.dat. A fresh value is written at first read
+//              if missing or invalid. The hard threshold is constrained to
+//              be above the regular puff threshold plus
+//              CONF_PRESS_HARD_MARGIN_HPA (the setter enforces the margin;
+//              this getter enforces the absolute range).
+//
+// Parameters :  responseEnabled : bool : The serial print output is enabled if true.
+//               apiEnabled : bool : The API response is sent if true.
+//
+// Return     : float : the current hard puff threshold [hPa]
+//*********************************//
+float getHardPuffPressureThreshold(bool responseEnabled, bool apiEnabled) {
+  String commandKey = "HP";
+  float tempHardPuffThreshold;
+  tempHardPuffThreshold = mem.readFloat(CONF_SETTINGS2_FILE, commandKey);
+
+  if (!isfinite(tempHardPuffThreshold) ||
+      (tempHardPuffThreshold < CONF_PRESS_MIN_THRESHOLD) ||
+      (tempHardPuffThreshold >= CONF_PRESS_MAX_THRESHOLD)) {
+    tempHardPuffThreshold = CONF_HARD_PUFF_THRESHOLD;
+    mem.writeFloat(CONF_SETTINGS2_FILE, commandKey, tempHardPuffThreshold);
+  }
+  ps.setHardPuffThreshold(tempHardPuffThreshold);
+  printResponseFloat(responseEnabled, apiEnabled, true, 0, "HP,0", true, tempHardPuffThreshold);
+
+  return tempHardPuffThreshold;
+}
+
+//***GET HARD PUFF PRESSURE THRESHOLD API FUNCTION***//
+// Function   : getHardPuffPressureThreshold (overload)
+//
+// Description: API entry point for HP,0 (returns the value without writing).
+//
+// Parameters :  responseEnabled, apiEnabled, optionalParameter
+//
+// Return     : void
+//*********************************//
+void getHardPuffPressureThreshold(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 0) {
+    getHardPuffPressureThreshold(responseEnabled, apiEnabled);
+  }
+}
+
+//***SET HARD PUFF PRESSURE THRESHOLD FUNCTION***//
+// Function   : setHardPuffPressureThreshold
+//
+// Description: Sets the hard puff threshold (upstream #58). Mirror of the HS
+//              setter — see its comment for the margin rationale.
+//
+// Parameters :  responseEnabled : bool
+//               apiEnabled : bool
+//               inputHardPuffThreshold : float : new hard puff threshold [hPa]
+//
+// Return     : void
+//*********************************//
+void setHardPuffPressureThreshold(bool responseEnabled, bool apiEnabled, float inputHardPuffThreshold) {
+  String commandKey = "HP";
+
+  float minHard = ps.getPuffPressureThreshold() + CONF_PRESS_HARD_MARGIN_HPA;
+
+  if ((isfinite(inputHardPuffThreshold) &&
+       inputHardPuffThreshold >= CONF_PRESS_MIN_THRESHOLD &&
+       inputHardPuffThreshold < CONF_PRESS_MAX_THRESHOLD &&
+       inputHardPuffThreshold >= minHard)
+      && mem.writeFloat(CONF_SETTINGS2_FILE, commandKey, inputHardPuffThreshold)) {
+    ps.setHardPuffThreshold(inputHardPuffThreshold);
+    printResponseFloat(responseEnabled, apiEnabled, true, 0, "HP,1", true, inputHardPuffThreshold);
+  }
+  else {
+    printResponseFloat(responseEnabled, apiEnabled, false, 3, "HP,1", true, inputHardPuffThreshold);
+  }
+}
+
+//***SET HARD PUFF PRESSURE THRESHOLD API FUNCTION***//
+// Function   : setHardPuffPressureThreshold (overload)
+//
+// Description: API entry point for HP,1 (float parameter).
+//
+// Parameters :  responseEnabled, apiEnabled, optionalParameter
+//
+// Return     : void
+//*********************************//
+void setHardPuffPressureThreshold(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  setHardPuffPressureThreshold(responseEnabled, apiEnabled, optionalParameter.toFloat());
+}
+
+//***GET HARD SIP / PUFF ACTION FUNCTION***//
+// Function   : getHardSipAction / getHardPuffAction
+//
+// Description: Returns the hard-band mouse output action (upstream #58). HA =
+//              hard sip's mouse action, HB = hard puff's mouse action. Stored
+//              in /settings2.dat; the seed document carries the real compiled
+//              defaults (5 = SCROLL for hard sip, 4 = DRAG for hard puff), and
+//              a stored value outside the action-number range is healed back
+//              to the compiled default at read. CONF_ACTION_NOTHING (0) is a
+//              legal mapping, not a sentinel — with one accepted edge: a
+//              settings2 file that PARSES but lacks the HA/HB keys (a
+//              hand-edited one; the boot seed always writes them) reads back
+//              0, which is NOTHING — the hard band goes inert, same
+//              fail-safe direction as every other corrupt-settings case, and
+//              the first SET of HA/HB re-arms it.
+//
+// Parameters :  responseEnabled : bool
+//               apiEnabled : bool
+//               commandKey : const char* : "HA" or "HB"
+//
+// Return     : int : the current hard-band action index
+//*********************************//
+static int getHardAction(bool responseEnabled, bool apiEnabled, const char* commandKey, int compiledDefault) {
+  int tempHardAction;
+  tempHardAction = mem.readInt(CONF_SETTINGS2_FILE, commandKey);
+
+  if ((tempHardAction < 0) || (tempHardAction > 127)) {
+    tempHardAction = compiledDefault;
+    mem.writeInt(CONF_SETTINGS2_FILE, commandKey, tempHardAction);
+  }
+  String responseKey = String(commandKey) + ",0";
+  printResponseInt(responseEnabled, apiEnabled, true, 0, responseKey, true, tempHardAction);
+  return tempHardAction;
+}
+
+//***GET HARD SIP ACTION FUNCTION***//
+float getHardSipAction(bool responseEnabled, bool apiEnabled) {
+  return (float)getHardAction(responseEnabled, apiEnabled, "HA", CONF_ACTION_SCROLL);
+}
+
+//***GET HARD SIP ACTION API FUNCTION***//
+void getHardSipAction(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 0) {
+    getHardSipAction(responseEnabled, apiEnabled);
+  }
+}
+
+//***GET HARD PUFF ACTION FUNCTION***//
+float getHardPuffAction(bool responseEnabled, bool apiEnabled) {
+  return (float)getHardAction(responseEnabled, apiEnabled, "HB", CONF_ACTION_DRAG);
+}
+
+//***GET HARD PUFF ACTION API FUNCTION***//
+void getHardPuffAction(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 0) {
+    getHardPuffAction(responseEnabled, apiEnabled);
+  }
+}
+
+//***SET HARD SIP / PUFF ACTION FUNCTION***//
+// Function   : setHardSipAction / setHardPuffAction
+//
+// Description: Sets the hard-band mouse output action (upstream #58). The
+//              value is validated against the caregiver-safe switch-remap
+//              allowlist (roadmap item 11's guard — one hard gesture can
+//              never be remapped to erase settings or restart the device;
+//              mouse column, so drag/scroll — the compiled defaults — stay
+//              legal). On success the action is written to /settings2.dat
+//              and applied to the live SAP table by initSapActions() at the
+//              next boot.
+//
+// Parameters :  responseEnabled : bool
+//               apiEnabled : bool
+//               commandKey : const char* : "HA" or "HB"
+//               inputHardAction : int : new hard-band action index
+//               compiledDefault : int : default when stored value is absent/invalid
+//
+// Return     : void
+//*********************************//
+static void setHardAction(bool responseEnabled, bool apiEnabled, const char* commandKey, int inputHardAction, int compiledDefault) {
+  (void)compiledDefault;  // documented for the getter's heal path; the setter stores what it is given
+  String responseKey = String(commandKey) + ",1";
+  if (switchRemapAllowed(inputHardAction, false)) {
+    if (mem.writeInt(CONF_SETTINGS2_FILE, commandKey, inputHardAction)) {
+      printResponseInt(responseEnabled, apiEnabled, true, 0, responseKey, true, inputHardAction);
+    }
+    else {
+      printResponseInt(responseEnabled, apiEnabled, false, 3, responseKey, true, inputHardAction);
+    }
+  }
+  else {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, responseKey, true, inputHardAction);
+  }
+}
+
+//***SET HARD SIP ACTION FUNCTION***//
+void setHardSipAction(bool responseEnabled, bool apiEnabled, int inputHardSipAction) {
+  setHardAction(responseEnabled, apiEnabled, "HA", inputHardSipAction, CONF_ACTION_SCROLL);
+}
+
+//***SET HARD SIP ACTION API FUNCTION***//
+void setHardSipAction(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  setHardSipAction(responseEnabled, apiEnabled, optionalParameter.toInt());
+}
+
+//***SET HARD PUFF ACTION FUNCTION***//
+void setHardPuffAction(bool responseEnabled, bool apiEnabled, int inputHardPuffAction) {
+  setHardAction(responseEnabled, apiEnabled, "HB", inputHardPuffAction, CONF_ACTION_DRAG);
+}
+
+//***SET HARD PUFF ACTION API FUNCTION***//
+void setHardPuffAction(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  setHardPuffAction(responseEnabled, apiEnabled, optionalParameter.toInt());
+}
+
 //***GET JOYSTICK ACCELERATION FUNCTION***//
 // Function   : getJoystickAcceleration
 //
@@ -3479,6 +3803,12 @@ void exportSettings(bool responseEnabled, bool apiEnabled) {
   getScrollLevel(responseEnabled, apiEnabled);
   getSipPressureThreshold(responseEnabled, apiEnabled);
   getPuffPressureThreshold(responseEnabled, apiEnabled);
+  // Upstream #58: the hard-band keys live in /settings2.dat; the getters
+  // read their own file, so the replay stays a pure read.
+  getHardSipPressureThreshold(responseEnabled, apiEnabled);
+  getHardPuffPressureThreshold(responseEnabled, apiEnabled);
+  getHardSipAction(responseEnabled, apiEnabled);
+  getHardPuffAction(responseEnabled, apiEnabled);
   getJoystickAcceleration(responseEnabled, apiEnabled);
   getJoystickInnerDeadzone(responseEnabled, apiEnabled);
   getJoystickOuterDeadzone(responseEnabled, apiEnabled);

@@ -4,6 +4,7 @@
 #include <type_traits>
 
 #include "LSCircularBuffer.h"
+#include "LSPressureClassify.h"
 #include "LSPressureEngageFilter.h"
 #include "LSPressureOffsetFilter.h"
 #include "LSSerialTxQueue.h"
@@ -198,6 +199,77 @@ static void test_serial_queue_never_truncates_an_inflight_line() {
   CHECK(std::string(wire) == "1234567890\nnewest-response\n");
 }
 
+// Upstream #58: the hard sip/puff band classifier. Numeric states mirror
+// PRESS_SAP_MAIN_STATE_*; thresholds mirror the compiled defaults (regular
+// 3.0 hPa, hard 10.0 hPa, release fraction 0.7).
+static void test_hard_band_classification_semantics() {
+  constexpr int NONE = LSPRESSURE_CLASSIFY_NONE;
+  constexpr int SIP = LSPRESSURE_CLASSIFY_SIP;
+  constexpr int PUFF = LSPRESSURE_CLASSIFY_PUFF;
+  constexpr int HARD_SIP = LSPRESSURE_CLASSIFY_HARD_SIP;
+  constexpr int HARD_PUFF = LSPRESSURE_CLASSIFY_HARD_PUFF;
+  const int WAITING = 0;  // PRESS_SAP_SEC_STATE_WAITING's numeric value
+  const int STARTED = 1;  // PRESS_SAP_SEC_STATE_STARTED's numeric value
+
+  // Fresh entries: hard wins by magnitude, regular bands below the hard line.
+  CHECK(lipsyncClassifySapMainState(15.0f, 3.0f, 3.0f, 10.0f, 10.0f, NONE, WAITING, STARTED) == HARD_PUFF);
+  CHECK(lipsyncClassifySapMainState(-15.0f, 3.0f, 3.0f, 10.0f, 10.0f, NONE, WAITING, STARTED) == HARD_SIP);
+  CHECK(lipsyncClassifySapMainState(5.0f, 3.0f, 3.0f, 10.0f, 10.0f, NONE, WAITING, STARTED) == PUFF);
+  CHECK(lipsyncClassifySapMainState(-5.0f, 3.0f, 3.0f, 10.0f, 10.0f, NONE, WAITING, STARTED) == SIP);
+  CHECK(lipsyncClassifySapMainState(0.0f, 3.0f, 3.0f, 10.0f, 10.0f, NONE, WAITING, STARTED) == NONE);
+
+  // Boundary exactness: just OVER the hard threshold is hard (strict `>`,
+  // mirroring the original inline chain's comparisons); AT it is regular, and
+  // AT the regular threshold is nothing.
+  CHECK(lipsyncClassifySapMainState(10.1f, 3.0f, 3.0f, 10.0f, 10.0f, NONE, WAITING, STARTED) == HARD_PUFF);
+  CHECK(lipsyncClassifySapMainState(10.0f, 3.0f, 3.0f, 10.0f, 10.0f, NONE, WAITING, STARTED) == PUFF);
+  CHECK(lipsyncClassifySapMainState(9.9f, 3.0f, 3.0f, 10.0f, 10.0f, NONE, WAITING, STARTED) == PUFF);
+  CHECK(lipsyncClassifySapMainState(3.0f, 3.0f, 3.0f, 10.0f, 10.0f, NONE, WAITING, STARTED) == NONE);
+  CHECK(lipsyncClassifySapMainState(-10.1f, 3.0f, 3.0f, 10.0f, 10.0f, NONE, WAITING, STARTED) == HARD_SIP);
+  CHECK(lipsyncClassifySapMainState(-10.0f, 3.0f, 3.0f, 10.0f, 10.0f, NONE, WAITING, STARTED) == SIP);
+  CHECK(lipsyncClassifySapMainState(-9.9f, 3.0f, 3.0f, 10.0f, 10.0f, NONE, WAITING, STARTED) == SIP);
+
+  // Hard-sticky DOWN: a hold that STARTED hard stays hard while decaying
+  // through the regular band (8 hPa is below the 10 hPa hard line but above
+  // the 2.1 hPa release boundary) — decay must not convert it into a click.
+  CHECK(lipsyncClassifySapMainState(8.0f, 3.0f, 3.0f, 10.0f, 10.0f, HARD_PUFF, STARTED, STARTED) == HARD_PUFF);
+  CHECK(lipsyncClassifySapMainState(-8.0f, 3.0f, 3.0f, 10.0f, 10.0f, HARD_SIP, STARTED, STARTED) == HARD_SIP);
+  // Even a deeper-than-started re-dive stays the held class.
+  CHECK(lipsyncClassifySapMainState(20.0f, 3.0f, 3.0f, 10.0f, 10.0f, HARD_PUFF, STARTED, STARTED) == HARD_PUFF);
+
+  // No mid-hold UPGRADE: a regular hold pushed into the hard band stays
+  // regular (one gesture, one action — never click-then-hard).
+  CHECK(lipsyncClassifySapMainState(20.0f, 3.0f, 3.0f, 10.0f, 10.0f, PUFF, STARTED, STARTED) == PUFF);
+  CHECK(lipsyncClassifySapMainState(-20.0f, 3.0f, 3.0f, 10.0f, 10.0f, SIP, STARTED, STARTED) == SIP);
+
+  // Release hysteresis (the 4.5.7 semantics, subsumed by the continuation
+  // rules): held puff stays until the pressure falls through 0.7x the
+  // regular threshold (2.1 hPa here), then releases. The sip side mirrors it.
+  CHECK(lipsyncClassifySapMainState(2.2f, 3.0f, 3.0f, 10.0f, 10.0f, PUFF, STARTED, STARTED) == PUFF);
+  CHECK(lipsyncClassifySapMainState(2.0f, 3.0f, 3.0f, 10.0f, 10.0f, PUFF, STARTED, STARTED) == NONE);
+  CHECK(lipsyncClassifySapMainState(-2.2f, 3.0f, 3.0f, 10.0f, 10.0f, SIP, STARTED, STARTED) == SIP);
+  CHECK(lipsyncClassifySapMainState(-2.0f, 3.0f, 3.0f, 10.0f, 10.0f, SIP, STARTED, STARTED) == NONE);
+  // A hard hold releases on the same regular-boundary rule.
+  CHECK(lipsyncClassifySapMainState(2.0f, 3.0f, 3.0f, 10.0f, 10.0f, HARD_PUFF, STARTED, STARTED) == NONE);
+  CHECK(lipsyncClassifySapMainState(-2.0f, 3.0f, 3.0f, 10.0f, 10.0f, HARD_SIP, STARTED, STARTED) == NONE);
+
+  // Fail-safe: inverted or equal hard/regular thresholds make the hard band
+  // empty — hard states never classify, the regular band keeps working.
+  CHECK(lipsyncClassifySapMainState(15.0f, 3.0f, 3.0f, 2.0f, 2.0f, NONE, WAITING, STARTED) == PUFF);
+  CHECK(lipsyncClassifySapMainState(-15.0f, 3.0f, 3.0f, 2.0f, 2.0f, NONE, WAITING, STARTED) == SIP);
+  CHECK(lipsyncClassifySapMainState(15.0f, 3.0f, 3.0f, 3.0f, 3.0f, NONE, WAITING, STARTED) == PUFF);
+
+  // The engage filter integrates with hard states exactly as with regular
+  // ones: two consecutive identical fresh classifications to start.
+  LSPressureEngageFilter filter(2);
+  CHECK(filter.qualify(HARD_PUFF, false) == NONE);
+  CHECK(filter.qualify(HARD_PUFF, false) == HARD_PUFF);
+  CHECK(filter.qualify(PUFF, false) == NONE);   // State change restarts qualification
+  CHECK(filter.qualify(PUFF, false) == PUFF);   // (a decayed hard entry starts regular)
+  CHECK(filter.qualify(HARD_SIP, false) == NONE);
+  CHECK(filter.qualify(HARD_SIP, false) == HARD_SIP);
+}
+
 int main() {
   static_assert(!std::is_copy_constructible<LSCircularBuffer<int>>::value,
                 "owning circular buffers must not be shallow-copyable");
@@ -209,6 +281,7 @@ int main() {
   test_pressure_engagement_rejects_single_sample_spikes();
   test_pressure_offset_only_accepts_stable_neutral_samples();
   test_serial_queue_never_truncates_an_inflight_line();
+  test_hard_band_classification_semantics();
 
   std::printf("%d checks, %d failures\n", checks, failures);
   return failures == 0 ? 0 : 1;

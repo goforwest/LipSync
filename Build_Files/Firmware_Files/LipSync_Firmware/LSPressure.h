@@ -24,6 +24,7 @@
 #include <Adafruit_LPS2X.h>     // Ambient pressure sensor
 #include <Adafruit_Sensor.h>     // Generic sensor
 #include "LSApiDeclarations.h"
+#include "LSPressureClassify.h"
 #include "LSPressureEngageFilter.h"
 #include "LSPressureOffsetFilter.h"
 
@@ -92,6 +93,12 @@ class LSPressure {
                                                         // samples gathered one per update() tick, then averaged
     void setSipThreshold(float s);                      // Set sip threshold
     void setPuffThreshold(float p);                     // Set puff threshold
+    void setHardSipThreshold(float t);                  // Set hard sip threshold (upstream #58; validated at the API layer)
+    void setHardPuffThreshold(float t);                 // Set hard puff threshold (upstream #58)
+    float getHardSipThreshold();                        // Get hard sip threshold
+    float getHardPuffThreshold();                       // Get hard puff threshold
+    float getSipPressureThreshold();                    // Get regular sip threshold (for hard-band validation)
+    float getPuffPressureThreshold();                   // Get regular puff threshold (for hard-band validation)
     void updatePressure();                              // Update the pressure buffer with new readings 
     void updateState();                                 // Update the and puff buffer with new states 
     float getSapPressureAbs();                          // Get last main pressure from pressure buffer
@@ -124,6 +131,8 @@ class LSPressure {
       inputStateStruct _sapPrevState = {PRESS_SAP_MAIN_STATE_NONE, PRESS_SAP_SEC_STATE_WAITING, 0};
       float _sipThreshold = PRESS_SAP_DEFAULT_THRESHOLD;   // Sip Threshold
       float _puffThreshold = PRESS_SAP_DEFAULT_THRESHOLD;  // Puff Threshold
+      float _hardSipThreshold = CONF_HARD_SIP_THRESHOLD;   // Hard sip threshold (upstream #58) — must exceed _sipThreshold (API-enforced margin)
+      float _hardPuffThreshold = CONF_HARD_PUFF_THRESHOLD; // Hard puff threshold (upstream #58) — must exceed _puffThreshold (API-enforced margin)
       int _sapMainState = PRESS_SAP_MAIN_STATE_NONE;       // The value which represents the current main state (example: PRESS_SAP_MAIN_STATE_PUFF)
       bool _sensorsHealthy;                               // Both sensors return valid readings (false until begin() correlates it with the sensor-detection globals — see the constructor)
       bool _begun;                                        // begin() ran, so the Adafruit driver objects are safe to call. A never-begun LPSressure holds NULL i2c_dev pointers and ANY driver call faults (bench 2026-10-28: PV,0:0 on a missing-sensor boot HardFaulted inside Adafruit_I2CDevice::write_then_read — pm=2 pt=7 fp=0xE000, twice). Every driver I/O this class makes is behind this gate.
@@ -308,6 +317,39 @@ void LSPressure::setPressureMode(int mode)
 }
 
 //*********************************//
+// Function   : setHardSipThreshold / setHardPuffThreshold
+//
+// Description: Upstream #58: the hard band thresholds. The API layer
+//              validates hard >= regular + CONF_PRESS_HARD_MARGIN_HPA and
+//              heals out-of-order stored values at boot; this setter trusts
+//              its caller (an out-of-order pair makes the hard band empty
+//              in the classifier — fail-safe, the feature goes inert).
+//
+// Arguments :  t : float : the new hard threshold [hPa]
+//
+// Return     : void
+//*********************************//
+void LSPressure::setHardSipThreshold(float t)
+{
+  _hardSipThreshold = t;
+}
+
+void LSPressure::setHardPuffThreshold(float t)
+{
+  _hardPuffThreshold = t;
+}
+
+float LSPressure::getHardSipThreshold()
+{
+  return _hardSipThreshold;
+}
+
+float LSPressure::getHardPuffThreshold()
+{
+  return _hardPuffThreshold;
+}
+
+//*********************************//
 // Function   : startOffsetUpdate 
 // 
 // Description: Begin a stepped offset-pressure measurement. Five valid
@@ -415,6 +457,24 @@ void LSPressure::setSipThreshold(float s)
 void LSPressure::setPuffThreshold(float p)
 {
   _puffThreshold = p;
+}
+
+//*********************************//
+// Function   : getSipPressureThreshold / getPuffPressureThreshold
+//
+// Description: Accessors for the current regular thresholds (needed so the
+//              hard-threshold setter can validate hard >= regular + margin).
+//
+// Return     : float : the current threshold [hPa]
+//*********************************//
+float LSPressure::getSipPressureThreshold()
+{
+  return _sipThreshold;
+}
+
+float LSPressure::getPuffPressureThreshold()
+{
+  return _puffThreshold;
 }
 
 //*********************************//
@@ -637,28 +697,19 @@ void LSPressure::updateState()  //  TODO 2025-Feb-22 This code should be abstrac
     if (_sapPrevState.secondaryState == PRESS_SAP_SEC_STATE_STARTED) {
       detectedMainState = _sapPrevState.mainState;
     }
-  } else if (pressureValue > _puffThreshold) {
-    detectedMainState = PRESS_SAP_MAIN_STATE_PUFF; // Puff detected
-  }
-  else if (pressureValue < -1 * _sipThreshold) {
-
-    detectedMainState = PRESS_SAP_MAIN_STATE_SIP; // Sip detected
-  }
-  else if (_sapPrevState.mainState == PRESS_SAP_MAIN_STATE_PUFF
-           && _sapPrevState.secondaryState == PRESS_SAP_SEC_STATE_STARTED
-           && pressureValue > _puffThreshold * CONF_PRESS_RELEASE_FRACTION) {
-    // Release hysteresis (4.5.7 review): the engage boundary used to be the
-    // release boundary, so sensor noise while holding near a threshold
-    // oscillated NONE<->PUFF and emitted a RELEASED (a phantom click, or a
-    // drag that ended on its own) per oscillation. A held puff stays a puff
-    // until the pressure falls back through CONF_PRESS_RELEASE_FRACTION of
-    // the engage threshold.
-    detectedMainState = PRESS_SAP_MAIN_STATE_PUFF;
-  }
-  else if (_sapPrevState.mainState == PRESS_SAP_MAIN_STATE_SIP
-           && _sapPrevState.secondaryState == PRESS_SAP_SEC_STATE_STARTED
-           && pressureValue < -1 * _sipThreshold * CONF_PRESS_RELEASE_FRACTION) {
-    detectedMainState = PRESS_SAP_MAIN_STATE_SIP;  // Same hysteresis, sip side
+  } else {
+    // Main-state classification (4.7.0 / upstream #58): the pure classifier
+    // in LSPressureClassify.h — fresh hard-band entry, hold continuation
+    // (class held for life: hard-sticky down, no mid-hold upgrade), then the
+    // fresh regular bands with the 4.5.7 release hysteresis subsumed by the
+    // continuation rules. The engage filter below still qualifies every NEW
+    // hold (two consecutive same-direction fresh samples), so a hard event
+    // means "started the gesture hard" with full phantom-click protection.
+    detectedMainState = lipsyncClassifySapMainState(
+        pressureValue, _sipThreshold, _puffThreshold,
+        _hardSipThreshold, _hardPuffThreshold,
+        _sapPrevState.mainState, _sapPrevState.secondaryState,
+        PRESS_SAP_SEC_STATE_STARTED);
   }
 
   const bool holdAlreadyActive = (_sapPrevState.secondaryState == PRESS_SAP_SEC_STATE_STARTED);

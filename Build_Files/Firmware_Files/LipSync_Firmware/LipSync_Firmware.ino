@@ -522,6 +522,14 @@ unsigned long g_inputWindowMaxMs = 0;    // WM — very-long boundary
 // behaves byte-for-byte like the compiled table.
 inputActionStruct g_switchActionTable[sizeof(switchActionProperty) / sizeof(inputActionStruct)];
 
+// Upstream #58: live SAP action table. initSapActions() (called from
+// initRestrictions, with the other input-related stored settings) seeds it
+// from the compiled sapActionProperty and overlays the hard-band action
+// overrides (HA/HB) — a settings file written by older firmware has no
+// HA/HB keys, so the live table stays byte-identical to the compiled table
+// (no behavioral change for existing users).
+inputActionStruct g_sapActionTable[sizeof(sapActionProperty) / sizeof(inputActionStruct)];
+
 // Timing Variables for Debugging
 unsigned long beginMillis;
 unsigned long beforeComOpMillis;
@@ -1507,7 +1515,12 @@ void initMemory() {
   
   // Open settings file (CONF_SETTINGS_FILE) from flash memory.
   // If not present, create file based on defaults in CONF_SETTINGS_JSON
-  mem.initialize(CONF_SETTINGS_FILE, CONF_SETTINGS_JSON);  
+  mem.initialize(CONF_SETTINGS_FILE, CONF_SETTINGS_JSON);
+  // Upstream #58: the second settings file (hard sip/puff keys HS/HP/HA/HB).
+  // Same seed-on-missing contract as the main file, its own budget (see
+  // LSMemory::budgetFor) — a file 4.1.0 never touches, so the main file's
+  // downgrade cliff is unaffected.
+  mem.initialize(CONF_SETTINGS2_FILE, CONF_SETTINGS2_JSON);
 }
 
 //***RESET MEMORY FUNCTION***//
@@ -1527,7 +1540,14 @@ bool resetMemory() {
   // followed initialization with ~22 read/modify/write cycles, multiplying
   // flash wear and exposing many intermediate states for no benefit—the next
   // boot reloads this document anyway.
-  return mem.writeAll(CONF_SETTINGS_FILE, CONF_SETTINGS_JSON);
+  bool mainOk = mem.writeAll(CONF_SETTINGS_FILE, CONF_SETTINGS_JSON);
+  // Upstream #58: the hard-band file gets the same treatment. Both files are
+  // re-seeded from compiled defaults, so FR also restores the hard sip/puff
+  // thresholds and actions (this is also what makes a downgrade-then-4.1.0-FR
+  // orphan harmless: the orphaned /settings2.dat would be re-adopted by the
+  // re-upgrade — but after an FR on our firmware the values are factory).
+  bool hardOk = mem.writeAll(CONF_SETTINGS2_FILE, CONF_SETTINGS2_JSON);
+  return mainOk && hardOk;
 }
 
 //***Read UID FUNCTION***//
@@ -2225,6 +2245,11 @@ void initRestrictions() {
   // External switch action remaps (#20) join the same stroke — the getters
   // apply any stored mapping onto the live table before the first tick.
   initSwitchActions();
+  // Upstream #58: the hard-band action overrides (HA/HB) are applied onto the
+  // live SAP table before the first input tick. A device without stored
+  // HA/HB (any settings file written by older firmware) keeps the compiled
+  // table byte-for-byte.
+  initSapActions();
 }
 
 //***SANITIZE INPUT WINDOWS FUNCTION***//
@@ -2295,6 +2320,30 @@ void initSwitchActions() {
   getSwitchAction(false, false, "GC");
 }
 
+//***INITIALIZE SAP ACTIONS FUNCTION***//
+// Function   : initSapActions
+//
+// Description: Seeds g_sapActionTable from the compiled sapActionProperty and
+//              overlays the hard-band action overrides (HA/HB from
+//              /settings2.dat) — upstream #58. Runs with the other
+//              input-related stored settings in initRestrictions(), so the
+//              live table is in force from the first input tick. A settings
+//              file written by older firmware has no HA/HB keys, so the live
+//              table stays byte-identical to the compiled table.
+//
+// Parameters : void
+//
+// Return     : void
+//*********************************//
+void initSapActions() {
+  if (USB_DEBUG) { Serial.println("USBDEBUG: initSapActions()"); }
+  // Self-contained seed: initRestrictions() runs BEFORE initSipAndPuff() in
+  // setup(), so this function cannot rely on anyone else having seeded the
+  // live table (and a later seed would wipe the overrides).
+  memcpy(g_sapActionTable, sapActionProperty, sizeof(sapActionProperty));
+  applyHardBandActionOverrides();
+}
+
 //***SWITCH REMAP HELPER FUNCTIONS***//
 // Function   : switchRemapAllowed / switchRemapApplyCell
 //
@@ -2337,6 +2386,30 @@ void switchRemapApplyCell(int jack, int window, bool gamepad, int actionNumber) 
     g_switchActionTable[row].gamepadOutputActionNumber = (uint8_t)actionNumber;
   } else {
     g_switchActionTable[row].mouseOutputActionNumber = (uint8_t)actionNumber;
+  }
+}
+
+// Upstream #58: apply the HA/HB hard-band action overrides into the live SAP
+// table. The stored value IS the effective value (no sentinel: the seed
+// document carries the real compiled defaults — 5 = SCROLL for hard sip,
+// 4 = DRAG for hard puff — and CONF_ACTION_NOTHING is a legal remap target,
+// so 0 must stay a real mapping). A stored value that fails the caregiver
+// allowlist falls back to the compiled row — the table already holds the
+// compiled values, so "no change" is the compiled default (same
+// defense-in-depth as the switch-remap load path).
+void applyHardBandActionOverrides() {
+  int hardSipRow = -1, hardPuffRow = -1;
+  for (int i = 0; i < (int)(sizeof(sapActionProperty) / sizeof(inputActionStruct)); i++) {
+    if (sapActionProperty[i].inputActionState == PRESS_SAP_MAIN_STATE_HARD_SIP) hardSipRow = i;
+    if (sapActionProperty[i].inputActionState == PRESS_SAP_MAIN_STATE_HARD_PUFF) hardPuffRow = i;
+  }
+  int ha = mem.readInt(CONF_SETTINGS2_FILE, "HA");
+  int hb = mem.readInt(CONF_SETTINGS2_FILE, "HB");
+  if (hardSipRow >= 0 && switchRemapAllowed(ha, false)) {
+    g_sapActionTable[hardSipRow].mouseOutputActionNumber = (uint8_t)ha;
+  }
+  if (hardPuffRow >= 0 && switchRemapAllowed(hb, false)) {
+    g_sapActionTable[hardPuffRow].mouseOutputActionNumber = (uint8_t)hb;
   }
 }
 
@@ -2547,6 +2620,23 @@ void initSipAndPuff() {
   ps.begin();                                                             // Begin sip and puff
   getSipPressureThreshold(false, false);                                  // Get sip  pressure thresholds stored in flash memory
   getPuffPressureThreshold(false, false);                                 // Get puff pressure thresholds stored in flash memory
+  // Upstream #58: the hard thresholds load after the regular ones (the heal
+  // below compares against them). Each getter range-checks its own value and
+  // applies it to ps; a stored hard value that sits below regular + margin
+  // (a hand-edited or foreign settings2) is healed up to the margin floor —
+  // the hard band must stay a clearly distinct gesture (LSPressure.h). A
+  // floor above CONF_PRESS_MAX_THRESHOLD leaves the live value untouched and
+  // the hard band simply inert (the classifier's fail-safe).
+  float storedHardSip = getHardSipPressureThreshold(false, false);
+  float storedHardPuff = getHardPuffPressureThreshold(false, false);
+  float sipFloor = ps.getSipPressureThreshold() + CONF_PRESS_HARD_MARGIN_HPA;
+  float puffFloor = ps.getPuffPressureThreshold() + CONF_PRESS_HARD_MARGIN_HPA;
+  if (storedHardSip < sipFloor) {
+    setHardSipPressureThreshold(false, false, sipFloor);
+  }
+  if (storedHardPuff < puffFloor) {
+    setHardPuffPressureThreshold(false, false, puffFloor);
+  }
   sapActionSize = sizeof(sapActionProperty) / sizeof(inputActionStruct);  // Size of total available sip and puff actions
   sapActionMaxTime = getActionMaxTime(sapActionSize, sapActionProperty);  // Maximum end action time
 }
@@ -2603,7 +2693,7 @@ void pressureLoop() {
 
   // Output action logic — INPUT_CLASS_SAP lets the restriction gates tell a
   // mouthpiece input from a button/switch one (roadmap item 11).
-  evaluateOutputAction(sapActionState, sapActionMaxTime, sapActionSize, sapActionProperty, INPUT_CLASS_SAP);
+  evaluateOutputAction(sapActionState, sapActionMaxTime, sapActionSize, g_sapActionTable, INPUT_CLASS_SAP);
 }
 
 //***RELEASE OUTPUT FUNCTION***//

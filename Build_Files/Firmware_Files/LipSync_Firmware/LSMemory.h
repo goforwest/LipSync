@@ -66,6 +66,16 @@ class LSMemory {
     bool isLastReadOk() { return _lastReadOk; }
   private:
     bool _lastReadOk = true;  // The most recent readObject deserialized a real document (4.5.7 review)
+
+    // 4.7.0 / upstream #58: per-file size budget. The main settings file's
+    // budget is the 4.1.0 downgrade cliff; /settings2.dat carries the
+    // new-format keys under its own (generous) budget. Every size check in
+    // this class routes through this so a second file can never be held to
+    // the main file's cliff (or vice versa).
+    static uint32_t budgetFor(String fileString) {
+      return (fileString == CONF_SETTINGS2_FILE) ? (uint32_t)CONF_SETTINGS2_FILE_BUDGET
+                                                 : (uint32_t)CONF_SETTINGS_FILE_BUDGET;
+    }
 };
 
 
@@ -141,11 +151,11 @@ void LSMemory::initialize(String fileString, String jsonString) {
     doc.clear();
     DeserializationError err = deserializeJson(doc, String(buffer));
     fileHealthy = (fileSize > 0) &&
-                  (fileSize <= CONF_SETTINGS_FILE_BUDGET) &&
+                  (fileSize <= budgetFor(fileString)) &&
                   (fileSize < sizeof(buffer)) &&
                   (readlen == fileSize) &&
                   !err && !doc.isNull() && doc.is<JsonObject>();
-    if (!fileHealthy && fileSize > CONF_SETTINGS_FILE_BUDGET) {
+    if (!fileHealthy && fileSize > budgetFor(fileString)) {
       fileExistedOverBudget = true;
       fileOverBudgetSize = fileSize;
     }
@@ -164,7 +174,7 @@ void LSMemory::initialize(String fileString, String jsonString) {
     Serial.print("ERROR: settings file (");
     Serial.print((int)fileOverBudgetSize);
     Serial.print(" bytes) is parseable but exceeds the ");
-    Serial.print(CONF_SETTINGS_FILE_BUDGET);
+    Serial.print(budgetFor(CONF_SETTINGS_FILE));
     Serial.println("-byte downgrade budget — replacing it with the compiled defaults");
   }
 
@@ -172,12 +182,13 @@ void LSMemory::initialize(String fileString, String jsonString) {
   // construction — if it ever does not, a new settings key grew the file
   // past the 4.1.0 downgrade cliff and the host-side size test should
   // have caught it first. Refuse the write rather than seeding every boot
-  // with a file the downgrade path would truncate.
-  if (jsonString.length() > CONF_SETTINGS_FILE_BUDGET) {
+  // with a file the downgrade path would truncate. Per-file budget: the
+  // main file's cliff, /settings2.dat's own budget.
+  if (jsonString.length() > budgetFor(fileString)) {
     Serial.print("ERROR: compiled default settings (");
     Serial.print((int)jsonString.length());
     Serial.print(" bytes) exceed the ");
-    Serial.print(CONF_SETTINGS_FILE_BUDGET);
+    Serial.print(budgetFor(fileString));
     Serial.println("-byte budget — refusing to initialize settings file");
     return;
   }
@@ -286,7 +297,7 @@ String LSMemory::readAll(String fileString){
     return "";
   }
   const uint32_t fileSize = file.size();
-  if (fileSize == 0 || fileSize > CONF_SETTINGS_FILE_BUDGET || fileSize >= BUFFER_SIZE) {
+  if (fileSize == 0 || fileSize > budgetFor(fileString) || fileSize >= BUFFER_SIZE) {
     file.close();
     return "";
   }
@@ -327,14 +338,14 @@ bool LSMemory::writeAll(String fileString, String jsonString){
 
     const size_t jsonLength = strlen(jsonChar);
     if (jsonLength == 0) return false;
-    if (jsonLength > CONF_SETTINGS_FILE_BUDGET) {
+    if (jsonLength > budgetFor(fileString)) {
       // Name the reason on serial: a refused settings write must never read
       // as a flash failure — it is a deliberate downgrade guard, and the
       // line tells the maker/support tech which knob moved.
       String errorLine = "ERROR: settings file budget refused (";
       errorLine += String((int)strlen(jsonChar));
       errorLine += " > ";
-      errorLine += String(CONF_SETTINGS_FILE_BUDGET);
+      errorLine += String(budgetFor(fileString));
       errorLine += " bytes) — firmware 4.1.0's 512-byte reader would truncate it";
       serialTxEnqueueLine(errorLine);
       return false;
@@ -406,7 +417,7 @@ JsonObject LSMemory::readObject(String fileString){
   }
   delay(1);
   const uint32_t fileSize = file.size();
-  if (fileSize == 0 || fileSize > CONF_SETTINGS_FILE_BUDGET || fileSize >= sizeof(jsonBuffer)) {
+  if (fileSize == 0 || fileSize > budgetFor(fileString) || fileSize >= sizeof(jsonBuffer)) {
     file.close();
     doc.clear();
     _lastReadOk = false;
@@ -579,13 +590,13 @@ bool LSMemory::writeObject(String fileString, String key, JsonObject obj){
       return false;
     }
 
-    if (strlen(jsonChar) > CONF_SETTINGS_FILE_BUDGET) {
+    if (strlen(jsonChar) > budgetFor(fileString)) {
       String errorLine = "ERROR: settings file budget refused for key ";
       errorLine += key;
       errorLine += " (";
       errorLine += String((int)strlen(jsonChar));
       errorLine += " > ";
-      errorLine += String(CONF_SETTINGS_FILE_BUDGET);
+      errorLine += String(budgetFor(fileString));
       errorLine += " bytes) — firmware 4.1.0's 512-byte reader would truncate it";
       serialTxEnqueueLine(errorLine);
       return false;

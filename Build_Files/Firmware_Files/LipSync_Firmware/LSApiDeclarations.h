@@ -67,6 +67,26 @@ void setSoundMode(bool responseEnabled, bool apiEnabled, int inputSoundMode);
 void setSoundMode(bool responseEnabled, bool apiEnabled, String optionalParameter);
 int getLightMode(bool responseEnabled, bool apiEnabled);
 void getLightMode(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void setLightBrightnessLevel(bool responseEnabled, bool apiEnabled);
+// Upstream #58: hard sip/puff band settings (live in /settings2.dat).
+float getHardSipPressureThreshold(bool responseEnabled, bool apiEnabled);
+void getHardSipPressureThreshold(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void setHardSipPressureThreshold(bool responseEnabled, bool apiEnabled, float inputHardSipThreshold);
+void setHardSipPressureThreshold(bool responseEnabled, bool apiEnabled, String optionalParameter);
+float getHardPuffPressureThreshold(bool responseEnabled, bool apiEnabled);
+void getHardPuffPressureThreshold(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void setHardPuffPressureThreshold(bool responseEnabled, bool apiEnabled, float inputHardPuffThreshold);
+void setHardPuffPressureThreshold(bool responseEnabled, bool apiEnabled, String optionalParameter);
+float getHardSipAction(bool responseEnabled, bool apiEnabled);
+void getHardSipAction(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void setHardSipAction(bool responseEnabled, bool apiEnabled, int inputHardSipAction);
+void setHardSipAction(bool responseEnabled, bool apiEnabled, String optionalParameter);
+float getHardPuffAction(bool responseEnabled, bool apiEnabled);
+void getHardPuffAction(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void setHardPuffAction(bool responseEnabled, bool apiEnabled, int inputHardPuffAction);
+void setHardPuffAction(bool responseEnabled, bool apiEnabled, String optionalParameter);
+int getLightMode(bool responseEnabled, bool apiEnabled);
+void getLightMode(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void setLightMode(bool responseEnabled, bool apiEnabled, int inputLightMode);
 void setLightMode(bool responseEnabled, bool apiEnabled, String optionalParameter);
 

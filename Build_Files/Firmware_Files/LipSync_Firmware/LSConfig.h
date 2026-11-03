@@ -29,8 +29,8 @@
 #define CONF_LIPSYNC_MODEL 1                // 1: Lipsync w/ Hub
 
 #define CONF_LIPSYNC_VERSION_MAJOR  4
-#define CONF_LIPSYNC_VERSION_MINOR  6
-#define CONF_LIPSYNC_VERSION_REV    6
+#define CONF_LIPSYNC_VERSION_MINOR  7
+#define CONF_LIPSYNC_VERSION_REV    0
 
 // 4.5.22 RESCUE-BUILD SWITCH (bench round 15): the device's settings
 // filesystem was left corrupted by the 4.5.20 race + the zombie phase's
@@ -215,6 +215,21 @@ const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + 
 // 5-digit timing window, 7-digit packed switch triples) while giving every
 // currently-shipped key set ~95 bytes of room.
 #define CONF_SETTINGS_FILE_BUDGET 480
+
+// 4.7.0 / upstream #58: the SECOND settings file. The main file's 480-byte
+// budget is the 4.1.0 downgrade cliff (that firmware reads it with a fixed
+// 512-byte buffer and truncates anything longer on its next write), and the
+// fully-populated document sits at ~463 B — hard sip/puff's four keys do not
+// fit. New-format keys therefore live in their OWN file with their OWN
+// budget: the main-file contract is untouched byte-for-byte (4.1.0
+// round-trips keep working exactly as guarded), 4.1.0 simply never touches
+// the second file, and a downgrade keeps the hard configuration for the
+// re-upgrade. Trade documented in the 4.7.0 CHANGES entry: a FACTORY RESET
+// performed ON 4.1.0 leaves /settings2.dat orphaned with the pre-reset hard
+// values (our reset clears both; 4.1.0 knows nothing of it).
+#define CONF_SETTINGS2_FILE    "/settings2.dat"
+#define CONF_SETTINGS2_FILE_BUDGET 256
+#define CONF_SETTINGS2_JSON    "{\"HS\":10.0,\"HP\":10.0,\"HA\":5,\"HB\":4}"
 
 // Input restriction settings (roadmap item 11) — every one defaults to 0 =
 // the unrestricted legacy behavior, so a settings file written by older
@@ -570,6 +585,14 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 #define CONF_PUFF_THRESHOLD 3.0                   // hPa
 #define CONF_PRESS_MIN_THRESHOLD 2.0              // hPa
 #define CONF_PRESS_MAX_THRESHOLD 150.0            // hPa
+// Upstream #58: hard band thresholds. The hard event must be clearly above
+// the regular band — the setters enforce hard >= regular + this margin, so
+// the hard band is always a meaningful, distinct gesture and the hard-sticky
+// classification (see LSPressure::updateState) can never make a regular puff
+// fire a hard action.
+#define CONF_PRESS_HARD_MARGIN_HPA 1.0            // hPa above the regular threshold
+#define CONF_HARD_SIP_THRESHOLD 10.0              // hPa (compiled default; coarse level 6 of the 10-level menu scale)
+#define CONF_HARD_PUFF_THRESHOLD 10.0             // hPa
 
 // Pressure plausibility range (4.5.7 review): both pressure sensors read
 // absolute ~1013 hPa; anything outside this band is garbage from a flaky
@@ -596,6 +619,13 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 #define PRESS_SAP_MAIN_STATE_NONE 0   // No action 
 #define PRESS_SAP_MAIN_STATE_SIP 1    // Sip action sapPressure < -sip threshold
 #define PRESS_SAP_MAIN_STATE_PUFF 2   // Puff action sapPressure > puff threshold
+// Upstream #58: the hard bands. A hold that STARTS beyond the hard threshold
+// is its own main state with its own action rows — instant access to the
+// long-window actions for users who cannot sustain a 1-3 s hold. Numeric
+// space is the SAP table's own (the button tables use INPUT_MAIN_STATE_*);
+// values 3/4 are free.
+#define PRESS_SAP_MAIN_STATE_HARD_SIP 3   // sapPressure < -hard sip threshold (implies sip band)
+#define PRESS_SAP_MAIN_STATE_HARD_PUFF 4  // sapPressure > hard puff threshold (implies puff band)
 
 // Inputs and related LED feedback settings
 #define CONF_INPUT_LED_DELAY 150          // Led blink time for input actions 
@@ -639,7 +669,21 @@ const inputActionStruct sapActionProperty[]{
   // Sip Actions
   { PRESS_SAP_MAIN_STATE_SIP,         CONF_ACTION_RIGHT_CLICK,  CONF_ACTION_B2_PRESS,   CONF_ACTION_NEXT_MENU_ITEM, CONF_ACTION_NEXT_MENU_ITEM,       0, 1000 },
   { PRESS_SAP_MAIN_STATE_SIP,         CONF_ACTION_SCROLL,       CONF_ACTION_B4_PRESS,   CONF_ACTION_NOTHING, CONF_ACTION_NOTHING,                  1000, 3000 },  
-  { PRESS_SAP_MAIN_STATE_SIP,         CONF_ACTION_MIDDLE_CLICK, CONF_ACTION_B5_PRESS,   CONF_ACTION_NOTHING, CONF_ACTION_NOTHING,                  3000, 8000 }
+  { PRESS_SAP_MAIN_STATE_SIP,         CONF_ACTION_MIDDLE_CLICK, CONF_ACTION_B5_PRESS,   CONF_ACTION_NOTHING, CONF_ACTION_NOTHING,                  3000, 8000 },
+  // Upstream #58: the hard rows. A hold that STARTS beyond the hard threshold
+  // fires its action on release with NO hold-duration requirement — instant
+  // access to the long-window actions for users who cannot sustain a 1-3 s
+  // hold. Compiled defaults mirror the long-window cells exactly (hard puff
+  // -> drag/B3, hard sip -> scroll/B4); HA/HB (settings2) remap the
+  // mouse/gamepad columns caregiver-side through the same allowlist as SA-GC.
+  // Window 0..60000: the end boundary deliberately does NOT reuse 8000 —
+  // effectiveWindowMs maps 8000 onto the user's stored max window, and a hard
+  // hold outlasting it (the core audience cannot necessarily release quickly)
+  // would fire nothing. 60000 is not a stored-window boundary, so it passes
+  // through unmapped: any hold up to a minute fires; a release beyond it is
+  // LED-only, same as today's beyond-max releases.
+  { PRESS_SAP_MAIN_STATE_HARD_PUFF,   CONF_ACTION_DRAG,         CONF_ACTION_B3_PRESS,   CONF_ACTION_NOTHING, CONF_ACTION_NOTHING,                      0, 60000 },
+  { PRESS_SAP_MAIN_STATE_HARD_SIP,    CONF_ACTION_SCROLL,       CONF_ACTION_B4_PRESS,   CONF_ACTION_NOTHING, CONF_ACTION_NOTHING,                      0, 60000 }
 };
 
 // Buttons built in to hub: S1 = Next, S2 = Select
