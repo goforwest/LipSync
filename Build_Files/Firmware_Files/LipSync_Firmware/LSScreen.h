@@ -71,6 +71,13 @@
 #define SIP_PUFF_MENU 54
 #define SIP_THRESH_MENU 541
 #define PUFF_THRESH_MENU 542
+// Upstream #58 (4.7.0): the hard sip/puff band's threshold pages, reachable
+// from the Sip & Puff submenu. The hard threshold must stay above the regular
+// one plus CONF_PRESS_HARD_MARGIN_HPA — the setter enforces it, the pages
+// clamp their steps to the floor, and healHardThresholds() keeps the pair in
+// order whenever a regular threshold moves.
+#define HARD_SIP_THRESH_MENU 543
+#define HARD_PUFF_THRESH_MENU 544
 #define FULL_CALIB_PAGE 55
 #define FULL_CALIB_CONFIRM_PAGE 551
 #define RESTART_PAGE 56
@@ -268,6 +275,8 @@ private:
 
   float _sipPressThresh;
   float _puffPressThresh;
+  float _hardSipPressThresh;   // upstream #58 (4.7.0)
+  float _hardPuffPressThresh;
   int _timingWindowSel = 0;  // Timing adjust page target: 0 = short (WS), 1 = long (WL), 2 = max (WM)
 
   unsigned long _lastActivityMillis;
@@ -297,6 +306,9 @@ private:
   void sipPuffThreshMenu();
   void adjustSipThreshMenu();
   void adjustPuffThreshMenu();
+  void adjustHardSipThreshMenu();   // upstream #58 (4.7.0)
+  void adjustHardPuffThreshMenu();
+  void healHardThresholds();        // keeps hard >= regular + margin across menu edits
   void accelMenu();
   void restrictionsMenu();
   void timingMenu();
@@ -319,9 +331,14 @@ private:
   String _lightBrightMenuText[4] = { "Lights: ", "Increase", "Decrease", "... Back" };
   String _scrollSpMenuText[4] = { "Speed: ", "Increase", "Decrease", "... Back" };
   String _accelMenuText[4] = { "Accel: ", "Increase", "Decrease", "... Back" };
-  String _sipPuffThreshMenuText[4] = { "Sip Threshold", "Puff Threshold", "Timing", "... Back" };
+  // Upstream #58 (4.7.0): the hard band's two rows sit between Timing and
+  // Back, so every pre-4.7.0 row keeps its index and the added rows append
+  // in front of Back.
+  String _sipPuffThreshMenuText[6] = { "Sip Threshold", "Puff Threshold", "Timing", "Hard Sip", "Hard Puff", "... Back" };
   String _adjustSipThreshMenuText[4] = { "Sip: ", "Increase", "Decrease", "... Back" };
   String _adjustPuffThreshMenuText[4] = { "Puff: ", "Increase", "Decrease", "... Back" };
+  String _adjustHardSipThreshMenuText[4] = { "Hard Sip: ", "Increase", "Decrease", "... Back" };
+  String _adjustHardPuffThreshMenuText[4] = { "Hard Puff: ", "Increase", "Decrease", "... Back" };
   // Input timing (roadmap item 15, upstream #62): the three window
   // boundaries, each adjusted on its own page in 250 ms steps.
   String _timingMenuText[4] = { "Short: ", "Long: ", "Max: ", "... Back" };
@@ -347,9 +364,11 @@ private:
   const int _lightBrightMenuLen = 3;
   const int _scrollSpMenuLen = 3;
   const int _accelMenuLen = 3;
-  const int _sipPuffThreshMenuLen = 4;
+  const int _sipPuffThreshMenuLen = 6;
   const int _adjustSipThreshMenuLen = 3;
   const int _adjustPuffThreshMenuLen = 3;
+  const int _adjustHardSipThreshMenuLen = 3;
+  const int _adjustHardPuffThreshMenuLen = 3;
   const int _restrictionsMenuLen = 5;
   const int _timingMenuLen = 4;
   const int _timingAdjustMenuLen = 3;
@@ -1254,7 +1273,13 @@ void LSScreen::selectMenuItem() {
         case 2:  // Timing (roadmap item 15, upstream #62)
           timingMenu();
           break;
-        case 3:
+        case 3:  // Hard Sip (upstream #58, 4.7.0)
+          adjustHardSipThreshMenu();
+          break;
+        case 4:  // Hard Puff
+          adjustHardPuffThreshMenu();
+          break;
+        case 5:
           _currentMenu = MORE_MENU;
           moreMenu();
           break;
@@ -1341,6 +1366,7 @@ void LSScreen::selectMenuItem() {
           _sipPressThresh = getSipPressureThreshold(false, false);
           setSipPressureThreshold(true, false, pressThresholdLevelUp(_sipPressThresh));
           _sipPressThresh = getSipPressureThreshold(false, false);
+          healHardThresholds();  // a raised sip floor may strand the hard pair
           _adjustSipThreshMenuText[0] =
             "Sip: L" + String(pressThresholdLevelFor(_sipPressThresh)) + " " + String(_sipPressThresh) + " ";
           _display.setCursor(0, 0);
@@ -1352,6 +1378,7 @@ void LSScreen::selectMenuItem() {
           _sipPressThresh = getSipPressureThreshold(false, false);
           setSipPressureThreshold(true, false, pressThresholdLevelDown(_sipPressThresh));
           _sipPressThresh = getSipPressureThreshold(false, false);
+          healHardThresholds();  // (a fall can only help, but keep one code path)
           _adjustSipThreshMenuText[0] =
             "Sip: L" + String(pressThresholdLevelFor(_sipPressThresh)) + " " + String(_sipPressThresh) + " ";
           _display.setCursor(0, 0);
@@ -1373,6 +1400,7 @@ void LSScreen::selectMenuItem() {
           _puffPressThresh = getPuffPressureThreshold(false, false);
           setPuffPressureThreshold(true, false, pressThresholdLevelUp(_puffPressThresh));
           _puffPressThresh = getPuffPressureThreshold(false, false);
+          healHardThresholds();  // a raised puff floor may strand the hard pair
           _adjustPuffThreshMenuText[0] =
             "Puff: L" + String(pressThresholdLevelFor(_puffPressThresh)) + " " + String(_puffPressThresh) + " ";
           _display.setCursor(0, 0);
@@ -1384,10 +1412,90 @@ void LSScreen::selectMenuItem() {
           _puffPressThresh = getPuffPressureThreshold(false, false);
           setPuffPressureThreshold(true, false, pressThresholdLevelDown(_puffPressThresh));
           _puffPressThresh = getPuffPressureThreshold(false, false);
+          healHardThresholds();  // (a fall can only help, but keep one code path)
           _adjustPuffThreshMenuText[0] =
             "Puff: L" + String(pressThresholdLevelFor(_puffPressThresh)) + " " + String(_puffPressThresh) + " ";
           _display.setCursor(0, 0);
           _display.print(_adjustPuffThreshMenuText[0]);
+          flushDisplay();
+          break;
+        }
+        case 2:  // Back
+          _currentMenu = SIP_PUFF_MENU;
+          sipPuffThreshMenu();
+          break;
+      }
+      break;
+
+    case HARD_SIP_THRESH_MENU:
+      // Hard sip threshold (upstream #58, 4.7.0): the same coarse level
+      // scale, but a step can never land below regular + margin — the
+      // setter would refuse the write, so Decrease clamps to the floor
+      // instead of stalling silently and the band always stays reachable.
+      switch (_currentSelection) {
+        case 0: {  // Increase
+          _hardSipPressThresh = getHardSipPressureThreshold(false, false);
+          float sipFloorUp = getSipPressureThreshold(false, false) + CONF_PRESS_HARD_MARGIN_HPA;
+          float sipNextUp = pressThresholdLevelUp(_hardSipPressThresh);
+          if (sipNextUp < sipFloorUp) sipNextUp = sipFloorUp;
+          setHardSipPressureThreshold(true, false, sipNextUp);
+          _hardSipPressThresh = getHardSipPressureThreshold(false, false);
+          _adjustHardSipThreshMenuText[0] =
+            "Hard Sip: L" + String(pressThresholdLevelFor(_hardSipPressThresh)) + " " + String(_hardSipPressThresh) + " ";
+          _display.setCursor(0, 0);
+          _display.print(_adjustHardSipThreshMenuText[0]);
+          flushDisplay();
+          break;
+        }
+        case 1: {  // Decrease
+          _hardSipPressThresh = getHardSipPressureThreshold(false, false);
+          float sipFloorDown = getSipPressureThreshold(false, false) + CONF_PRESS_HARD_MARGIN_HPA;
+          float sipNextDown = pressThresholdLevelDown(_hardSipPressThresh);
+          if (sipNextDown < sipFloorDown) sipNextDown = sipFloorDown;  // clamp at the margin floor
+          setHardSipPressureThreshold(true, false, sipNextDown);
+          _hardSipPressThresh = getHardSipPressureThreshold(false, false);
+          _adjustHardSipThreshMenuText[0] =
+            "Hard Sip: L" + String(pressThresholdLevelFor(_hardSipPressThresh)) + " " + String(_hardSipPressThresh) + " ";
+          _display.setCursor(0, 0);
+          _display.print(_adjustHardSipThreshMenuText[0]);
+          flushDisplay();
+          break;
+        }
+        case 2:  // Back
+          _currentMenu = SIP_PUFF_MENU;
+          sipPuffThreshMenu();
+          break;
+      }
+      break;
+
+    case HARD_PUFF_THRESH_MENU:
+      // Hard puff threshold: mirror of the hard sip page (upstream #58).
+      switch (_currentSelection) {
+        case 0: {  // Increase
+          _hardPuffPressThresh = getHardPuffPressureThreshold(false, false);
+          float puffFloorUp = getPuffPressureThreshold(false, false) + CONF_PRESS_HARD_MARGIN_HPA;
+          float puffNextUp = pressThresholdLevelUp(_hardPuffPressThresh);
+          if (puffNextUp < puffFloorUp) puffNextUp = puffFloorUp;
+          setHardPuffPressureThreshold(true, false, puffNextUp);
+          _hardPuffPressThresh = getHardPuffPressureThreshold(false, false);
+          _adjustHardPuffThreshMenuText[0] =
+            "Hard Puff: L" + String(pressThresholdLevelFor(_hardPuffPressThresh)) + " " + String(_hardPuffPressThresh) + " ";
+          _display.setCursor(0, 0);
+          _display.print(_adjustHardPuffThreshMenuText[0]);
+          flushDisplay();
+          break;
+        }
+        case 1: {  // Decrease
+          _hardPuffPressThresh = getHardPuffPressureThreshold(false, false);
+          float puffFloorDown = getPuffPressureThreshold(false, false) + CONF_PRESS_HARD_MARGIN_HPA;
+          float puffNextDown = pressThresholdLevelDown(_hardPuffPressThresh);
+          if (puffNextDown < puffFloorDown) puffNextDown = puffFloorDown;  // clamp at the margin floor
+          setHardPuffPressureThreshold(true, false, puffNextDown);
+          _hardPuffPressThresh = getHardPuffPressureThreshold(false, false);
+          _adjustHardPuffThreshMenuText[0] =
+            "Hard Puff: L" + String(pressThresholdLevelFor(_hardPuffPressThresh)) + " " + String(_hardPuffPressThresh) + " ";
+          _display.setCursor(0, 0);
+          _display.print(_adjustHardPuffThreshMenuText[0]);
           flushDisplay();
           break;
         }
@@ -2409,6 +2517,90 @@ void LSScreen::adjustPuffThreshMenu(void) {
 
   _currentMenuLength = _adjustPuffThreshMenuLen;
   _currentMenuText = _adjustPuffThreshMenuText;
+  _cursorStart = 1;
+  _currentSelection = 0;
+  _countMenuScroll = 0;
+
+  displayMenu();  //  Print items in current menu
+}
+
+//*********************************//
+// Function   : healHardThresholds
+//
+// Description: Keeps every hard threshold at or above its regular sibling
+//              plus CONF_PRESS_HARD_MARGIN_HPA (upstream #58). Runs when a
+//              regular threshold moves in the menu (a raised floor can
+//              strand the hard pair below it — the band would go inert via
+//              the classifier's fail-safe) and when a hard page opens (a
+//              value stranded by an app-side regular change heals before it
+//              is displayed). A heal writes through the same setters the
+//              pages use and emits the usual MANUAL line, so LipSync Connect
+//              re-syncs. Same rule as the boot heal in initSipAndPuff().
+//
+// Arguments :  void
+//
+// Return     : void
+//*********************************//
+void LSScreen::healHardThresholds(void) {
+  const float sipFloor = getSipPressureThreshold(false, false) + CONF_PRESS_HARD_MARGIN_HPA;
+  if (getHardSipPressureThreshold(false, false) < sipFloor) {
+    setHardSipPressureThreshold(true, false, sipFloor);
+  }
+  const float puffFloor = getPuffPressureThreshold(false, false) + CONF_PRESS_HARD_MARGIN_HPA;
+  if (getHardPuffPressureThreshold(false, false) < puffFloor) {
+    setHardPuffPressureThreshold(true, false, puffFloor);
+  }
+}
+
+//*********************************//
+// Function   : adjustHardSipThreshMenu
+//
+// Description: Format and display Hard Sip Threshold Adjustment Page
+//              (upstream #58, 4.7.0). The page heals a stranded hard value
+//              before displaying it, so what the OLED shows is what the
+//              band will actually fire at.
+//
+// Arguments :  void
+//
+// Return     : void
+//*********************************//
+void LSScreen::adjustHardSipThreshMenu(void) {
+  healHardThresholds();
+  _currentMenu = HARD_SIP_THRESH_MENU;
+  _hardSipPressThresh = getHardSipPressureThreshold(false, false);
+
+  _adjustHardSipThreshMenuText[0] =
+    "Hard Sip: L" + String(pressThresholdLevelFor(_hardSipPressThresh)) + " " + String(_hardSipPressThresh) + " ";
+
+  _currentMenuLength = _adjustHardSipThreshMenuLen;
+  _currentMenuText = _adjustHardSipThreshMenuText;
+  _cursorStart = 1;
+  _currentSelection = 0;
+  _countMenuScroll = 0;
+
+  displayMenu();  //  Print items in current menu
+}
+
+//*********************************//
+// Function   : adjustHardPuffThreshMenu
+//
+// Description: Format and display Hard Puff Threshold Adjustment Page
+//              (upstream #58, 4.7.0) — mirror of the hard sip page.
+//
+// Arguments :  void
+//
+// Return     : void
+//*********************************//
+void LSScreen::adjustHardPuffThreshMenu(void) {
+  healHardThresholds();
+  _currentMenu = HARD_PUFF_THRESH_MENU;
+  _hardPuffPressThresh = getHardPuffPressureThreshold(false, false);
+
+  _adjustHardPuffThreshMenuText[0] =
+    "Hard Puff: L" + String(pressThresholdLevelFor(_hardPuffPressThresh)) + " " + String(_hardPuffPressThresh) + " ";
+
+  _currentMenuLength = _adjustHardPuffThreshMenuLen;
+  _currentMenuText = _adjustHardPuffThreshMenuText;
   _cursorStart = 1;
   _currentSelection = 0;
   _countMenuScroll = 0;
