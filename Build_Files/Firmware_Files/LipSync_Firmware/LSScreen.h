@@ -154,6 +154,11 @@ public:
   // the page's _cursorStart offset for the text-array row.
   void fillMenuState(int out[3]);
 
+  // (4.5.7 review) wrap/stale-safe menu-input freeze check — public since
+  // upstream #16: the serial BT endpoints refuse while a scheduled transition
+  // or dwell page owns the menu, exactly like selectMenuItem/nextMenuItem do.
+  bool inputIsFrozen();
+
   // Two-way Hub remote (firmware side of the CH,5 push, LipSync_Connect's
   // protocol proposal now realized): report the live menu state on the wire
   // whenever it changes, so the app's remote mirror follows PHYSICAL
@@ -283,7 +288,7 @@ private:
 
   uint8_t _hardwareErrorCode = 0; 
 
-  bool inputIsFrozen();  // (4.5.7 review) wrap/stale-safe menu-input freeze check
+  // (4.5.7 review) wrap/stale-safe menu-input freeze check
   void displayMenu();
   void displayCursor();
   void scrollLongText();

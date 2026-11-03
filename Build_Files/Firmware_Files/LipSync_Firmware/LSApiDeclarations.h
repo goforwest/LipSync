@@ -37,6 +37,7 @@
 #define _LSAPIDECLARATIONS_H
 
 #include <WString.h>
+#include "LSHostSwitch.h"  // Upstream #16: the pure host-switch row model + decisions (no Arduino types)
 
 // ---- Serial settings API (defined in LSAPI.ino) ----
 // The two-argument cores and their String redefinitions that the dispatch
@@ -212,6 +213,26 @@ void setSwitchActionGC(bool responseEnabled, bool apiEnabled, String optionalPar
 void controlHubMenu(bool responseEnabled, bool apiEnabled, int inputMenuControl);
 void controlHubMenu(bool responseEnabled, bool apiEnabled, String optionalParameter);
 
+// ---- Multi-host Bluetooth switching (upstream #16, firmware 4.8.0+) ----
+// The pure decision layer is LSHostSwitch.h (included above); these are the
+// BLE-side helpers (defined in LSBLE.h — they read the vendored lib's bond
+// directory) and the BT endpoint shells (defined in LSAPI.ino). The bond
+// store itself is the library's /adafruit/bond_prph files — this feature adds
+// NO settings file and NO settings keys (design: docs/design/16-multi-host-ble.md).
+bool lsBleStackReady();  // !needsInitialization — every BT call site gates on this
+uint8_t lsHostEnumerate(lsHostRow* rows, uint8_t cap);  // MAC-sorted bond rows; returns total count
+bool lsHostActiveMac(char* out13);  // 12-hex bond address of the connected host, false when none/unbonded
+bool lsHostDisconnectCurrent();     // disconnect the connected host, true when nothing to do
+void lsHostEnsureAdvertising();     // (re)start open advertising if the set is not running
+bool lsHostForgetByMac(const char* mac12);  // remove one bond file (bond_remove_key)
+void lsHostPushState();             // MANUAL,0:BT,4/BT,5 pushes with change-detect (the CH,5 contract)
+void lsHostRefusalLine(String commandKey, int reason, int row);  // named ERROR line for a refusal
+void getBluetoothHost(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void switchBluetoothHost(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void forgetBluetoothHost(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void pairNewBluetoothHost(bool responseEnabled, bool apiEnabled);
+void pairNewBluetoothHost(bool responseEnabled, bool apiEnabled, String optionalParameter);
+
 // Live Hub-menu state read (CH,0:0, firmware 4.5.1+): [active, pageId, row]
 // from LSScreen::fillMenuState — the device-truth source the app's remote
 // re-syncs its mirror against after every press (refused selects and
@@ -255,6 +276,23 @@ void printResponseIntArray(bool responseEnabled,
                            int responseParameterSize,
                            char responseParameterDelimiter,
                            int responseParameter[]);
+// The scalar formatter, for callers outside LSAPI.ino (LSBLE.h's BT,4/BT,5
+// pushes — upstream #16; same canonical-formatter rule as the array twin above).
+void printResponseInt(bool responseEnabled,
+                      bool apiEnabled,
+                      bool responseStatus,
+                      int responseNumber,
+                      String responseCommand,
+                      bool responseParameterEnabled,
+                      int responseParameter);
+// The string-param formatter (BT,0:<i> row answers carry <i>:<name>:<state>).
+void printResponseString(bool responseEnabled,
+                         bool apiEnabled,
+                         bool responseStatus,
+                         int responseNumber,
+                         String responseCommand,
+                         bool responseParameterEnabled,
+                         String responseParameter);
 void serialTxService();  // Non-blocking CDC response queue; called from loop()
 bool serialTxEnqueueLine(const char* line, size_t length);
 bool serialTxEnqueueLine(const String &line);

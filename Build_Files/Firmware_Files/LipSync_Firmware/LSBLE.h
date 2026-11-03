@@ -407,4 +407,208 @@ bool LSBLEMouse::isConnected(void) {
 //  report — the copy-paste-invitation class 4.5.4's LSUSBKeyboard
 //  removal set the precedent for)
 
+/*****************************
+     MULTI-HOST BLUETOOTH SWITCHING (upstream #16, firmware 4.8.0+)
+ *****************************/
+
+// The host table IS the vendored lib's bond directory: one LittleFS file per
+// bonded peer under /adafruit/bond_prph/<12-hex-MAC>, holding the 80-byte
+// keyset AND the peer name captured at pair time (bonding.cpp bond_save_keys_
+// dfr). This section enumerates those files, disconnects/re-advertises for a
+// switch, removes single bonds, and pushes MANUAL,0:BT,4/BT,5 state lines to
+// the app with the CH,5 contract (MANUAL + seq 0 matches no command waiter).
+// No settings file, no settings keys — see docs/design/16-multi-host-ble.md.
+
+#include <Adafruit_LittleFS.h>
+#include <InternalFileSystem.h>
+#include "utility/bonding.h"  // BOND_DIR_PRPH + bond_remove_key (vendored lib, public header)
+
+using namespace Adafruit_LittleFS_Namespace;
+
+// Push change-detect state: 0xFF / -1 sentinels guarantee the first
+// transition after boot pushes (the app may have connected since).
+uint8_t g_btPushedHostCount = 0xFF;
+int g_btPushedActiveRow = -1;
+
+bool lsBleStackReady() {
+  return !needsInitialization;
+}
+
+// 12-hex bond address of the currently connected host into out13 (13 bytes).
+// A connected but NOT-bonded peer has no row (no bond file exists yet) — the
+// app sees BT,5:0 and the card shows "connected, not paired". False when the
+// stack is down, nothing is connected, or the peer is unbonded.
+bool lsHostActiveMac(char* out13) {
+  out13[0] = '\0';
+  if (needsInitialization) return false;
+  if (Bluefruit.connected() == 0) return false;
+  uint16_t hdl[1];
+  if (Bluefruit.getConnectedHandles(hdl, 1) == 0) return false;
+  BLEConnection* conn = Bluefruit.Connection(hdl[0]);
+  if (conn == NULL || !conn->bonded()) return false;
+  // getPeerAddr returns the BOND identity address for bonded connections
+  // (BLEConnection.cpp) — the same bytes the bond file is named by.
+  ble_gap_addr_t peer = conn->getPeerAddr();
+  sprintf(out13, "%02X%02X%02X%02X%02X%02X",
+          peer.addr[0], peer.addr[1], peer.addr[2],
+          peer.addr[3], peer.addr[4], peer.addr[5]);
+  return true;
+}
+
+// Enumerate the bond directory into MAC-sorted rows (the deterministic row
+// order the wire and the Hub page both use). Returns the TOTAL bond count;
+// fills at most cap rows — when more bonds exist than cap, the MAC-lowest
+// `cap` are kept (bounded top-K, so the listed rows are deterministic
+// regardless of filesystem order). Rows carry the sanitized wire name (the
+// lib caches the peer's GAP name in the file at pair time) and the active
+// flag. Local File handles throughout — the 4.5.20 lesson: the shared LSMemory
+// handle must never be touched from here.
+uint8_t lsHostEnumerate(lsHostRow* rows, uint8_t cap) {
+  if (rows == NULL || cap == 0) return 0;
+  char activeMac[LSHOST_MAC_CHARS + 1];
+  const bool haveActive = lsHostActiveMac(activeMac);
+
+  if (!InternalFS.exists(BOND_DIR_PRPH)) return 0;
+  File dirFile(BOND_DIR_PRPH, FILE_O_READ, InternalFS);
+  if (!dirFile) return 0;
+
+  uint8_t filled = 0;
+  uint8_t total = 0;
+  File f(InternalFS);
+  while ((f = dirFile.openNextFile(FILE_O_READ))) {
+    if (f.isDirectory()) { f.close(); continue; }
+
+    // The bond filename stem is the 12-hex MAC (bonding.cpp get_fname);
+    // take the basename defensively — name() has carried full paths in
+    // some Adafruit_LittleFS revisions.
+    const char* path = f.name();
+    const char* stem = path;
+    for (const char* p = path; *p != '\0'; p++) {
+      if (*p == '/') stem = p + 1;
+    }
+    bool macOk = true;
+    for (int i = 0; i < LSHOST_MAC_CHARS; i++) {
+      const char c = stem[i];
+      if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'))) { macOk = false; break; }
+    }
+    if (!macOk || stem[LSHOST_MAC_CHARS] != '\0') { f.close(); continue; }
+    total++;
+
+    lsHostRow row;
+    strncpy(row.mac, stem, LSHOST_MAC_CHARS);
+    row.mac[LSHOST_MAC_CHARS] = '\0';
+    row.active = (haveActive && strcmp(row.mac, activeMac) == 0) ? 1 : 0;
+    // Last MAC byte → the "(XX)" OLED discriminator.
+    char byteHi[3] = { stem[LSHOST_MAC_CHARS - 2], stem[LSHOST_MAC_CHARS - 1], '\0' };
+    row.lastMacByte = (int)strtoul(byteHi, NULL, 16);
+
+    // File layout (bonding.cpp): 1-byte length + 80-byte keyset, 1-byte
+    // length + name (NUL included), 1-byte length + CCCD. Read the name.
+    char rawName[CFG_MAX_DEVNAME_LEN + 1] = { 0 };
+    const int keyLen = f.read();
+    if (keyLen > 0) f.seek(keyLen + f.position());
+    const int nameLen = f.read();
+    if (nameLen > 0) {
+      const int toRead = (nameLen > CFG_MAX_DEVNAME_LEN) ? CFG_MAX_DEVNAME_LEN : nameLen;
+      f.read((uint8_t*)rawName, toRead);
+      rawName[CFG_MAX_DEVNAME_LEN] = '\0';
+    }
+    lsHostSanitizeName(rawName, row.name, sizeof(row.name));
+    if (row.name[0] == '\0') {
+      // Nameless bond (name read failed at pair time): fall back to the MAC
+      // the way the lib's saver does (bonding.cpp:119-123).
+      lsHostSanitizeName(row.mac, row.name, sizeof(row.name));
+    }
+    f.close();
+
+    if (filled < cap) {
+      rows[filled++] = row;
+    } else {
+      // Keep the cap MAC-lowest rows: replace the largest if this is smaller.
+      uint8_t worst = 0;
+      for (uint8_t i = 1; i < cap; i++) {
+        if (strcmp(rows[i].mac, rows[worst].mac) > 0) worst = i;
+      }
+      if (strcmp(row.mac, rows[worst].mac) < 0) rows[worst] = row;
+    }
+  }
+  dirFile.close();
+
+  lsHostSortRows(rows, filled);
+  return total;
+}
+
+bool lsHostDisconnectCurrent() {
+  if (needsInitialization) return false;
+  if (Bluefruit.connected() == 0) return true;  // nothing to do — honest success
+  uint16_t hdl[1];
+  if (Bluefruit.getConnectedHandles(hdl, 1) == 0) return true;
+  return Bluefruit.disconnect(hdl[0]);
+}
+
+void lsHostEnsureAdvertising() {
+  if (needsInitialization) return;
+  // restartOnDisconnect(true) re-advertises after a disconnect (BLEAdvertising
+  // event handler); this covers the paths that bypass a disconnect (pair-new,
+  // a set stopped for any other reason). Same forever-timeout as the boot path.
+  if (!Bluefruit.Advertising.isRunning()) {
+    Bluefruit.Advertising.start(0);
+  }
+}
+
+// Remove one bond file. The filename keying uses the 6 address BYTES only
+// (bonding.cpp get_fname ignores addr_type), so any type builds the right
+// name; the identity bytes come from the enumerated row.
+bool lsHostForgetByMac(const char* mac12) {
+  if (mac12 == NULL || strlen(mac12) != LSHOST_MAC_CHARS) return false;
+  ble_gap_addr_t id;
+  memset(&id, 0, sizeof(id));
+  id.addr_type = BLE_GAP_ADDR_TYPE_RANDOM_STATIC;
+  for (int i = 0; i < 6; i++) {
+    char byteStr[3] = { mac12[i * 2], mac12[i * 2 + 1], '\0' };
+    id.addr[i] = (uint8_t)strtoul(byteStr, NULL, 16);
+  }
+  bond_remove_key(BLE_GAP_ROLE_PERIPH, &id);
+  return true;
+}
+
+// The push half of the BT surface (the CH,5 pattern): whenever the host list
+// length or the active row changes, print MANUAL,0:BT,4:<count> /
+// MANUAL,0:BT,5:<activeRow> — MANUAL + seq 0 matches no command waiter
+// (LSScreen.h reportMenuState contract). Called from btFeedbackLoop's
+// connection-transition branch and after a BT,2 forget.
+void lsHostPushState() {
+  if (needsInitialization) return;
+  lsHostRow rows[LSHOST_ENUM_CAP];
+  const uint8_t count = lsHostEnumerate(rows, LSHOST_ENUM_CAP);
+  int activeRow = 0;
+  for (uint8_t i = 0; i < count && i < LSHOST_ENUM_CAP; i++) {
+    if (rows[i].active) { activeRow = i + 1; break; }
+  }
+  if (count != g_btPushedHostCount) {
+    g_btPushedHostCount = count;
+    printResponseInt(true, false, true, 0, "BT,4", true, count);
+  }
+  if (activeRow != g_btPushedActiveRow) {
+    g_btPushedActiveRow = activeRow;
+    printResponseInt(true, false, true, 0, "BT,5", true, activeRow);
+  }
+}
+
+// Named refusal line for the wire — a refused BT command must never read as
+// a flash failure (the budget-refusal precedent, LSMemory writeObject).
+void lsHostRefusalLine(String commandKey, int reason, int row) {
+  String line = "ERROR: " + commandKey + " refused (row " + String(row) + "): ";
+  switch (reason) {
+    case LSHOST_REFUSE_NOT_INITIALIZED: line += "the BLE stack is not initialized (USB-mode boot or init failure)"; break;
+    case LSHOST_REFUSE_CALIBRATION:     line += "calibration/center flow in flight"; break;
+    case LSHOST_REFUSE_LATCH:           line += "a drag/scroll hold is engaged — release it first"; break;
+    case LSHOST_REFUSE_FROZEN:          line += "a menu transition owns the display — retry in a moment"; break;
+    case LSHOST_REFUSE_RANGE:           line += "no such host row (re-read BT,0 after any forget)"; break;
+    case LSHOST_REFUSE_ALREADY_ACTIVE:  line += "this host is already the connected one"; break;
+    default:                            line += "unknown reason"; break;
+  }
+  serialTxEnqueueLine(line);
+}
+
 #endif  // LSBLE_H

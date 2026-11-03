@@ -111,6 +111,15 @@ _functionList setSwitchActionGCFunction =          {"GC", "1", "",  &setSwitchAc
 _functionList controlHubMenuFunction =            {"CH", "1", "",  &controlHubMenu};
 _functionList getHubMenuStateFunction =           {"CH", "0", "0", &getHubMenuState};
 
+// Upstream #16: multi-host Bluetooth switching (firmware 4.8.0+). BT,0 reads
+// the host table (0 = count, 1..n = row), BT,1 switches, BT,2 forgets one
+// bond, BT,3:1 ensures advertising for pair-new. The bond store is the
+// vendored lib's /adafruit/bond_prph files — no settings keys involved.
+_functionList getBluetoothHostFunction =          {"BT", "0", "",  &getBluetoothHost};
+_functionList switchBluetoothHostFunction =       {"BT", "1", "",  &switchBluetoothHost};
+_functionList forgetBluetoothHostFunction =       {"BT", "2", "",  &forgetBluetoothHost};
+_functionList pairNewBluetoothHostFunction =      {"BT", "3", "1", &pairNewBluetoothHost};
+
 _functionList getDebugModeFunction =              {"DM", "0", "0", &getDebugMode};
 _functionList setDebugModeFunction =              {"DM", "1", "",  &setDebugMode};
 _functionList getJoystickValueFunction =          {"JV", "0", "0", &getJoystickValue};
@@ -196,6 +205,10 @@ _functionList apiFunction[] = { //Let compiler determine number of functions
   setSwitchActionGCFunction,
   controlHubMenuFunction,
   getHubMenuStateFunction,
+  getBluetoothHostFunction,
+  switchBluetoothHostFunction,
+  forgetBluetoothHostFunction,
+  pairNewBluetoothHostFunction,
   getDebugModeFunction,
   setDebugModeFunction,
   exportSettingsFunction,
@@ -3645,6 +3658,205 @@ void getHubMenuState(bool responseEnabled, bool apiEnabled) {
 void getHubMenuState(bool responseEnabled, bool apiEnabled, String optionalParameter) {
   if (optionalParameter.length() == 1 && optionalParameter.toInt() == 0) {
     getHubMenuState(responseEnabled, apiEnabled);
+  }
+}
+
+// *********************************************************************************
+
+//***BLUETOOTH HOSTS (upstream #16, firmware 4.8.0+)***//
+// Function   : getBluetoothHost
+//
+// Description: The read half of multi-host switching. BT,0:0 answers the bond
+//              count; BT,0:<i> answers row i (1-based, MAC-sorted — the same
+//              order the Hub page shows) as
+//              "SUCCESS,0:BT,0:<i>:<name>:<state>" where state 1 = this host
+//              is the connected one. Names are sanitized by LSHostSwitch.h
+//              (',' ':' '/' and non-printables -> '_') so the delimited wire
+//              grammar can never be broken by a host's chosen Bluetooth name.
+//
+// Parameters :  responseEnabled / apiEnabled : the canonical response controls
+//               optionalParameter : "0" (count) or a 1-based row index
+//
+// Return     : void
+//*********************************//
+void getBluetoothHost(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  String commandKey = "BT,0";
+  if (needsInitialization) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, 0);
+    lsHostRefusalLine(commandKey, LSHOST_REFUSE_NOT_INITIALIZED, 0);
+    return;
+  }
+  lsHostRow rows[LSHOST_ENUM_CAP];
+  const uint8_t count = lsHostEnumerate(rows, LSHOST_ENUM_CAP);
+  const int row = optionalParameter.toInt();
+  if (row <= 0) {
+    printResponseInt(responseEnabled, apiEnabled, true, 0, commandKey, true, count);
+    return;
+  }
+  if (row > count || row > LSHOST_ENUM_CAP) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, row);
+    lsHostRefusalLine(commandKey, LSHOST_REFUSE_RANGE, row);
+    return;
+  }
+  String rowValue;
+  rowValue.reserve(strlen(rows[row - 1].name) + 10);
+  rowValue += row;
+  rowValue += ':';
+  rowValue += rows[row - 1].name;
+  rowValue += ':';
+  rowValue += rows[row - 1].active;
+  printResponseString(responseEnabled, apiEnabled, true, 0, commandKey, true, rowValue);
+}
+
+//***SWITCH BLUETOOTH HOST FUNCTION***//
+// Function   : switchBluetoothHost
+//
+// Description: BT,1:<i> — disconnect the current host and (re)advertise so
+//              host i reconnects (the Q4 sequence: disconnect, advertising
+//              restarts via restartOnDisconnect, target reconnects on its own
+//              schedule). NEVER resets the device and never touches OM/CM —
+//              the deliberate-reset mode-switch contract is untouched. The
+//              ack follows the ACTION (unlike MP's ack-then-reset, where the
+//              reset would eat the response): a failed disconnect must be
+//              able to answer FAIL,3. Connection/list pushes ride
+//              btFeedbackLoop's transition detection.
+//
+// Parameters :  responseEnabled / apiEnabled : the canonical response controls
+//               optionalParameter : the 1-based host row to switch to
+//
+// Return     : void
+//*********************************//
+void switchBluetoothHost(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  String commandKey = "BT,1";
+  if (needsInitialization) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, 0);
+    lsHostRefusalLine(commandKey, LSHOST_REFUSE_NOT_INITIALIZED, 0);
+    return;
+  }
+  lsHostRow rows[LSHOST_ENUM_CAP];
+  const uint8_t count = lsHostEnumerate(rows, LSHOST_ENUM_CAP);
+  int activeRow = 0;
+  for (uint8_t i = 0; i < count && i < LSHOST_ENUM_CAP; i++) {
+    if (rows[i].active) { activeRow = i + 1; break; }
+  }
+
+  // The pure decision layer owns every precondition (LSHostSwitch.h — the
+  // fixed precedence is what the refusal note names).
+  lsHostSwitchState st;
+  st.bleInitialized = 1;
+  st.calibrationRunning = (g_calibrationRunning || g_centerRunning) ? 1 : 0;
+  st.latchHeld = (outputAction == CONF_ACTION_DRAG || outputAction == CONF_ACTION_SCROLL) ? 1 : 0;
+  st.menuInputFrozen = screen.inputIsFrozen() ? 1 : 0;
+  st.rowCount = count;
+  st.activeRow = activeRow;
+  const int targetRow = optionalParameter.toInt();
+  const int decision = lsHostSwitchDecision(&st, targetRow);
+  if (decision != LSHOST_ALLOW) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, targetRow);
+    lsHostRefusalLine(commandKey, decision, targetRow);
+    return;
+  }
+
+  if (activeRow != 0 && !lsHostDisconnectCurrent()) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, targetRow);
+    serialTxEnqueueLine("ERROR: BT,1 — disconnecting the current host failed");
+    return;
+  }
+  lsHostEnsureAdvertising();  // belt-and-braces: the disconnect handler re-advertises on its own
+  printResponseInt(responseEnabled, apiEnabled, true, 0, commandKey, true, targetRow);
+}
+
+//***FORGET BLUETOOTH HOST FUNCTION***//
+// Function   : forgetBluetoothHost
+//
+// Description: BT,2:<i> — remove one bond file (the host's stored keys). The
+//              lib's reconnect path answers a missing LTK with a NULL
+//              sec_info reply, so a forgotten host that still holds keys
+//              re-pairs (Just Works) on its next connect — the asymmetry the
+//              guides must document (bench step B6). Forgetting the ACTIVE
+//              host disconnects it first. List change pushes BT,4 directly.
+//
+// Parameters :  responseEnabled / apiEnabled : the canonical response controls
+//               optionalParameter : the 1-based host row to forget
+//
+// Return     : void
+//*********************************//
+void forgetBluetoothHost(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  String commandKey = "BT,2";
+  if (needsInitialization) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, 0);
+    lsHostRefusalLine(commandKey, LSHOST_REFUSE_NOT_INITIALIZED, 0);
+    return;
+  }
+  lsHostRow rows[LSHOST_ENUM_CAP];
+  const uint8_t count = lsHostEnumerate(rows, LSHOST_ENUM_CAP);
+  int activeRow = 0;
+  for (uint8_t i = 0; i < count && i < LSHOST_ENUM_CAP; i++) {
+    if (rows[i].active) { activeRow = i + 1; break; }
+  }
+
+  lsHostSwitchState st;
+  st.bleInitialized = 1;
+  st.calibrationRunning = (g_calibrationRunning || g_centerRunning) ? 1 : 0;
+  st.latchHeld = 0;           // a forget of an inactive host touches no radio state
+  st.menuInputFrozen = 0;     // (the menu path freezes itself; the serial path needs no gate)
+  st.rowCount = count;
+  st.activeRow = activeRow;
+  const int targetRow = optionalParameter.toInt();
+  const int decision = lsHostForgetDecision(&st, targetRow);
+  if (decision != LSHOST_ALLOW) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, targetRow);
+    lsHostRefusalLine(commandKey, decision, targetRow);
+    return;
+  }
+
+  if (rows[targetRow - 1].active && !lsHostDisconnectCurrent()) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, targetRow);
+    serialTxEnqueueLine("ERROR: BT,2 — disconnecting the active host before the forget failed");
+    return;
+  }
+  if (!lsHostForgetByMac(rows[targetRow - 1].mac)) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, targetRow);
+    serialTxEnqueueLine("ERROR: BT,2 — removing the bond file failed");
+    return;
+  }
+  printResponseInt(responseEnabled, apiEnabled, true, 0, commandKey, true, targetRow);
+  lsHostPushState();  // the list changed — the app learns immediately (BT,4, and BT,5 if the active host left)
+}
+
+//***PAIR NEW BLUETOOTH HOST FUNCTION***//
+// Function   : pairNewBluetoothHost
+//
+// Description: BT,3:1 — make sure open advertising is running so a NEW host
+//              can find and pair with the device (auto-accept Just Works,
+//              unchanged posture). Refuses while a host is connected: a new
+//              pairing needs advertising, advertising needs no connection.
+//              The pair itself completes host-side; the resulting connect
+//              transition pushes BT,5/BT,4 via btFeedbackLoop.
+//
+// Parameters :  responseEnabled / apiEnabled : the canonical response controls
+//
+// Return     : void
+//*********************************//
+void pairNewBluetoothHost(bool responseEnabled, bool apiEnabled) {
+  String commandKey = "BT,3";
+  if (needsInitialization) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, 0);
+    lsHostRefusalLine(commandKey, LSHOST_REFUSE_NOT_INITIALIZED, 0);
+    return;
+  }
+  if (Bluefruit.connected() != 0) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, 1);
+    serialTxEnqueueLine("ERROR: BT,3 refused — a host is connected; switch away first");
+    return;
+  }
+  lsHostEnsureAdvertising();
+  printResponseInt(responseEnabled, apiEnabled, true, 0, commandKey, true, 1);
+}
+
+void pairNewBluetoothHost(bool responseEnabled, bool apiEnabled, String optionalParameter) {
+  if (optionalParameter.length() == 1 && optionalParameter.toInt() == 1) {
+    pairNewBluetoothHost(responseEnabled, apiEnabled);
   }
 }
 

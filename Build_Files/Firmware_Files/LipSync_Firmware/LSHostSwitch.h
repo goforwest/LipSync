@@ -34,6 +34,9 @@
 #define LSHOST_NAME_WIRE_MAX 24   /* sanitized wire-name cap (chars, excl. NUL) */
 #define LSHOST_OLED_NAME_MAX 17   /* OLED label name portion; + " (XX)" suffix */
 #define LSHOST_MENU_MAX_ROWS 4    /* Hub page shows at most 4 host rows */
+#define LSHOST_ENUM_CAP 8         /* wire/list cap: up to 8 bonds enumerated (the   */
+                                  /* MAC-lowest 8 when more exist; Hub shows 4,    */
+                                  /* bench B8 exercises 5; Forget is the valve)    */
 
 /* Refusal reasons — the numeric values are internal; shells map them to
  * FAIL,3 + a named note (serial) or a note page (menu). */

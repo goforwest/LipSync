@@ -4590,12 +4590,14 @@ void btFeedbackLoop() {
         ledTimerId[CONF_TIMER_LED_BT] = -1;
       }
       led.setLedColor(CONF_BT_LED_NUMBER, LED_CLR_BLUE, led.getLedBrightness());
+      lsHostPushState();  // #16: the app's host list/active marker follows every connect (BT,5; BT,4 if a pair landed)
     } else {
       if (ledTimerId[CONF_TIMER_LED_BT] >= 0) {
         ledStateTimer.deleteTimer(ledTimerId[CONF_TIMER_LED_BT]);
         ledTimerId[CONF_TIMER_LED_BT] = -1;
       }
       setLedDefault();
+      lsHostPushState();  // #16: same on the disconnect transition (BT,5:0; the list count only changes if a host was forgotten)
     }
   }
 
