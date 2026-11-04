@@ -47,6 +47,7 @@
 #define LSHOST_REFUSE_FROZEN 4
 #define LSHOST_REFUSE_RANGE 5
 #define LSHOST_REFUSE_ALREADY_ACTIVE 6
+#define LSHOST_REFUSE_RADIO 7   /* the SoftDevice refused the disconnect/forget call */
 
 typedef struct {
   char mac[LSHOST_MAC_CHARS + 1]; /* 12 lowercase-free hex chars, NUL-terminated */

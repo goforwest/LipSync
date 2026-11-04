@@ -3733,36 +3733,21 @@ void switchBluetoothHost(bool responseEnabled, bool apiEnabled, String optionalP
     lsHostRefusalLine(commandKey, LSHOST_REFUSE_NOT_INITIALIZED, 0);
     return;
   }
-  lsHostRow rows[LSHOST_ENUM_CAP];
-  const uint8_t count = lsHostEnumerate(rows, LSHOST_ENUM_CAP);
-  int activeRow = 0;
-  for (uint8_t i = 0; i < count && i < LSHOST_ENUM_CAP; i++) {
-    if (rows[i].active) { activeRow = i + 1; break; }
+  // The frozen-window gate is a serial-path concern (the menu path's own
+  // selectMenuItem is already inputIsFrozen-guarded); lsHostExecuteSwitch
+  // re-checks everything else at execution time (the TOCTOU gate).
+  if (screen.inputIsFrozen()) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, optionalParameter.toInt());
+    lsHostRefusalLine(commandKey, LSHOST_REFUSE_FROZEN, optionalParameter.toInt());
+    return;
   }
-
-  // The pure decision layer owns every precondition (LSHostSwitch.h — the
-  // fixed precedence is what the refusal note names).
-  lsHostSwitchState st;
-  st.bleInitialized = 1;
-  st.calibrationRunning = (g_calibrationRunning || g_centerRunning) ? 1 : 0;
-  st.latchHeld = (outputAction == CONF_ACTION_DRAG || outputAction == CONF_ACTION_SCROLL) ? 1 : 0;
-  st.menuInputFrozen = screen.inputIsFrozen() ? 1 : 0;
-  st.rowCount = count;
-  st.activeRow = activeRow;
   const int targetRow = optionalParameter.toInt();
-  const int decision = lsHostSwitchDecision(&st, targetRow);
+  const int decision = lsHostExecuteSwitch(targetRow);
   if (decision != LSHOST_ALLOW) {
     printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, targetRow);
     lsHostRefusalLine(commandKey, decision, targetRow);
     return;
   }
-
-  if (activeRow != 0 && !lsHostDisconnectCurrent()) {
-    printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, targetRow);
-    serialTxEnqueueLine("ERROR: BT,1 — disconnecting the current host failed");
-    return;
-  }
-  lsHostEnsureAdvertising();  // belt-and-braces: the disconnect handler re-advertises on its own
   printResponseInt(responseEnabled, apiEnabled, true, 0, commandKey, true, targetRow);
 }
 
@@ -3788,36 +3773,11 @@ void forgetBluetoothHost(bool responseEnabled, bool apiEnabled, String optionalP
     lsHostRefusalLine(commandKey, LSHOST_REFUSE_NOT_INITIALIZED, 0);
     return;
   }
-  lsHostRow rows[LSHOST_ENUM_CAP];
-  const uint8_t count = lsHostEnumerate(rows, LSHOST_ENUM_CAP);
-  int activeRow = 0;
-  for (uint8_t i = 0; i < count && i < LSHOST_ENUM_CAP; i++) {
-    if (rows[i].active) { activeRow = i + 1; break; }
-  }
-
-  lsHostSwitchState st;
-  st.bleInitialized = 1;
-  st.calibrationRunning = (g_calibrationRunning || g_centerRunning) ? 1 : 0;
-  st.latchHeld = 0;           // a forget of an inactive host touches no radio state
-  st.menuInputFrozen = 0;     // (the menu path freezes itself; the serial path needs no gate)
-  st.rowCount = count;
-  st.activeRow = activeRow;
   const int targetRow = optionalParameter.toInt();
-  const int decision = lsHostForgetDecision(&st, targetRow);
+  const int decision = lsHostExecuteForget(targetRow);
   if (decision != LSHOST_ALLOW) {
     printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, targetRow);
     lsHostRefusalLine(commandKey, decision, targetRow);
-    return;
-  }
-
-  if (rows[targetRow - 1].active && !lsHostDisconnectCurrent()) {
-    printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, targetRow);
-    serialTxEnqueueLine("ERROR: BT,2 — disconnecting the active host before the forget failed");
-    return;
-  }
-  if (!lsHostForgetByMac(rows[targetRow - 1].mac)) {
-    printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, targetRow);
-    serialTxEnqueueLine("ERROR: BT,2 — removing the bond file failed");
     return;
   }
   printResponseInt(responseEnabled, apiEnabled, true, 0, commandKey, true, targetRow);
@@ -3858,6 +3818,57 @@ void pairNewBluetoothHost(bool responseEnabled, bool apiEnabled, String optional
   if (optionalParameter.length() == 1 && optionalParameter.toInt() == 1) {
     pairNewBluetoothHost(responseEnabled, apiEnabled);
   }
+}
+
+//***HOST-SWITCH EXECUTORS (shared by the serial endpoints and the Hub pages)***//
+// Each re-enumerates and re-decides AT EXECUTION TIME — the TOCTOU gate (the
+// 4.6.6 LK-confirm lesson): between a menu page rendering and its confirm
+// select, hosts can pair/forget and a drag can start, so the row indices the
+// caller captured are re-validated here against fresh enumeration. Returns
+// LSHOST_ALLOW or the refusal reason (the same enum the pure layer uses).
+
+int lsHostExecuteSwitch(int targetRow) {
+  if (needsInitialization) return LSHOST_REFUSE_NOT_INITIALIZED;
+  lsHostRow rows[LSHOST_ENUM_CAP];
+  const uint8_t count = lsHostEnumerate(rows, LSHOST_ENUM_CAP);
+  int activeRow = 0;
+  for (uint8_t i = 0; i < count && i < LSHOST_ENUM_CAP; i++) {
+    if (rows[i].active) { activeRow = i + 1; break; }
+  }
+  lsHostSwitchState st;
+  st.bleInitialized = 1;
+  st.calibrationRunning = (g_calibrationRunning || g_centerRunning) ? 1 : 0;
+  st.latchHeld = (outputAction == CONF_ACTION_DRAG || outputAction == CONF_ACTION_SCROLL) ? 1 : 0;
+  st.menuInputFrozen = 0;  // the frozen-window gate is the caller's concern (selectMenuItem / the BT,1 handler)
+  st.rowCount = count;
+  st.activeRow = activeRow;
+  const int decision = lsHostSwitchDecision(&st, targetRow);
+  if (decision != LSHOST_ALLOW) return decision;
+  if (activeRow != 0 && !lsHostDisconnectCurrent()) return LSHOST_REFUSE_RADIO;
+  lsHostEnsureAdvertising();  // belt-and-braces: the disconnect handler re-advertises on its own
+  return LSHOST_ALLOW;
+}
+
+int lsHostExecuteForget(int targetRow) {
+  if (needsInitialization) return LSHOST_REFUSE_NOT_INITIALIZED;
+  lsHostRow rows[LSHOST_ENUM_CAP];
+  const uint8_t count = lsHostEnumerate(rows, LSHOST_ENUM_CAP);
+  int activeRow = 0;
+  for (uint8_t i = 0; i < count && i < LSHOST_ENUM_CAP; i++) {
+    if (rows[i].active) { activeRow = i + 1; break; }
+  }
+  lsHostSwitchState st;
+  st.bleInitialized = 1;
+  st.calibrationRunning = (g_calibrationRunning || g_centerRunning) ? 1 : 0;
+  st.latchHeld = 0;        // a forget of an inactive host touches no radio state
+  st.menuInputFrozen = 0;
+  st.rowCount = count;
+  st.activeRow = activeRow;
+  const int decision = lsHostForgetDecision(&st, targetRow);
+  if (decision != LSHOST_ALLOW) return decision;
+  if (rows[targetRow - 1].active && !lsHostDisconnectCurrent()) return LSHOST_REFUSE_RADIO;
+  if (!lsHostForgetByMac(rows[targetRow - 1].mac)) return LSHOST_REFUSE_RADIO;
+  return LSHOST_ALLOW;
 }
 
 // *********************************************************************************

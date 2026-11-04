@@ -1647,6 +1647,16 @@ void screenModeLockedTransitionDone() {
   screen.finishModeLocked();
 }
 
+// Upstream #16: the Bluetooth host pages' dwell continuations (the switch
+// EXECUTES at the end of its dwell — the CHANGING_MODE_PAGE pattern).
+void screenBtSwitchTransitionDone() {
+  screen.finishBtSwitch();
+}
+
+void screenBtNoteTransitionDone() {
+  screen.finishBtNote();
+}
+
 //***SHOW CENTER RESET COMPLETE PAGE SCREEN FUNCTION***//
 // Function   : showCenterResetComplete
 //

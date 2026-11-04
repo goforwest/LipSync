@@ -88,6 +88,17 @@
 #define RESTRICTIONS_MENU 60
 #define TIMING_MENU 61
 #define TIMING_ADJUST_MENU 611
+// Upstream #16 (4.8.0): the Bluetooth host pages, reachable from the More
+// menu. 62 = the host list (rows rebuilt from the bond directory on every
+// entry — the bond store IS the host table); 621 = switch confirm; 622 = the
+// forget list (up to 8 rows, the on-device valve for the 4-row page cap);
+// 623/624 are dwell pages that NAME THEMSELVES for CH,0:0/CH,5 (the 4.5.7
+// honesty rule, like CHANGING_MODE_PAGE 33).
+#define BT_HOSTS_MENU 62
+#define BT_SWITCH_CONFIRM_PAGE 621
+#define BT_FORGET_LIST_PAGE 622
+#define BT_SWITCHING_PAGE 623
+#define BT_NOTE_PAGE 624
 
 #define SCROLL_DELAY_MILLIS 100 // [ms] This controls the scroll speed of long menu items //TODO 2025-Feb-28 Make this user adjustable
 
@@ -186,6 +197,18 @@ public:
   void factoryResetConfirm2Menu();
   void modeLockedPage();
   void finishModeLocked();
+
+  // Upstream #16: the Bluetooth host pages. Rows are rebuilt from the bond
+  // directory on every page entry; every action re-validates through the
+  // LSHostSwitch decision layer (refusals = error cue + named note page).
+  void btHostsMenu();
+  void btSwitchConfirmPage();
+  void btForgetListPage();
+  void btSwitchingPage();
+  void btNotePage(const String &line1, const String &line2, const String &line3 = String());
+  void btNoteForReason(int reason);
+  void finishBtSwitch();
+  void finishBtNote();
 
   // The USB-retry loop's error page: drawn at most once per error episode, and
   // only when there is a display on an answerable I2C bus. The old code redrew
@@ -331,7 +354,16 @@ private:
   String _modeMenuText[4] = { "MOUSE USB", "MOUSE BT", "GAMEPAD ", "... Back" };
   String _modeConfirmText[4] = { "Change", "mode?", "Confirm", "... Back" };
   String _cursorSpMenuText[4] = { "Speed: ", "Increase", "Decrease", "... Back" };
-  String _moreMenuText[11] = { "Sound",  "Light Brightness", "Scroll Speed",   "Sip & Puff",  "Full Calibration",   "Restart LipSync",  "Factory Reset",  "Info", "Acceleration", "Restrictions", "... Back",  };
+  String _moreMenuText[12] = { "Sound",  "Light Brightness", "Scroll Speed",   "Sip & Puff",  "Full Calibration",   "Restart LipSync",  "Factory Reset",  "Info", "Acceleration", "Restrictions", "Bluetooth", "... Back",  };
+  // Upstream #16: the Bluetooth host pages' row buffers, rebuilt on every
+  // page entry from the bond directory (lsHostEnumerate). The forget list
+  // shows up to LSHOST_ENUM_CAP rows; the host page caps at LSHOST_MENU_MAX_ROWS.
+  String _btHostsText[LSHOST_ENUM_CAP + 2];
+  String _btMenuText[LSHOST_MENU_MAX_ROWS + 3];
+  String _btConfirmText[4];   // switch confirm: header, target, Confirm, Back
+  int _btHostCount = 0;   // total bonds at the last enumeration
+  int _btTargetRow = 0;   // pending switch target (1-based enumeration row)
+  int _btForgetHostRows = 0;  // selectable host rows the forget list rendered with (the destructive-hold gate reads it)
   String _soundMenuText[4] = { "Sound:", "<>", "Turn <>", "... Back" };
   String _lightBrightMenuText[4] = { "Lights: ", "Increase", "Decrease", "... Back" };
   String _scrollSpMenuText[4] = { "Speed: ", "Increase", "Decrease", "... Back" };
@@ -364,7 +396,7 @@ private:
   const int _calibMenuLen = 2;
   const int _modeMenuLen = 4;
   const int _cursorSpMenuLen = 3;
-  const int _moreMenuLen = 11;
+  const int _moreMenuLen = 12;
   const int _soundMenuLen = 2;
   const int _lightBrightMenuLen = 3;
   const int _scrollSpMenuLen = 3;
@@ -1008,12 +1040,14 @@ void LSScreen::selectMenuItem() {
   // Destructive safe-menu and confirmation selections require a deliberate
   // hold. Short electrical glitches previously walked and confirmed these
   // rows; serial CH presses carry UINT32_MAX and intentionally bypass because
-  // the wire has no hold-duration concept.
+  // the wire has no hold-duration concept. A Bluetooth-host forget (#16)
+  // joins them: it erases a stored bond, and the execute step is immediate.
   bool destructiveSelection =
       (_currentMenu == SAFEMODE_MENU && (_currentSelection == 0 || _currentSelection == 1)) ||
       (_currentMenu == RESTART_PAGE && _currentSelection == 0) ||
       (_currentMenu == FACTORY_RESET_PAGE && _currentSelection == 0) ||
-      (_currentMenu == FACTORY_RESET_CONFIRM2_PAGE && _currentSelection == 0);
+      (_currentMenu == FACTORY_RESET_CONFIRM2_PAGE && _currentSelection == 0) ||
+      (_currentMenu == BT_FORGET_LIST_PAGE && _currentSelection < _btForgetHostRows);
   unsigned long confirmHoldMs = effectiveWindowMs(CONF_INPUT_WINDOW_SHORT_DEFAULT_MS) / 2;
   if (confirmHoldMs < CONF_MENU_CONFIRM_HOLD_MIN_MS) confirmHoldMs = CONF_MENU_CONFIRM_HOLD_MIN_MS;
   if (destructiveSelection && g_menuInputHoldMs != 0xFFFFFFFFUL && g_menuInputHoldMs < confirmHoldMs) {
@@ -1186,9 +1220,72 @@ void LSScreen::selectMenuItem() {
         case 9: // Restrictions (roadmap item 11)
           restrictionsMenu();
           break;
-        case 10: // Back
+        case 10: // Bluetooth hosts (upstream #16, 4.8.0)
+          btHostsMenu();
+          break;
+        case 11: // Back
           mainMenu();
           break;
+      }
+      break;
+
+    case BT_HOSTS_MENU: {
+      // Upstream #16: hosts (≤4) + "Pair new..." + "Forget host..." + Back —
+      // the layout btHostsMenu() rendered. Rows re-validated at EXECUTION time
+      // by lsHostExecuteSwitch/Forget (the TOCTOU gate), so a stale index can
+      // only ever refuse, never hit the wrong host.
+      const int hostRows = (_btHostCount < LSHOST_MENU_MAX_ROWS) ? _btHostCount : LSHOST_MENU_MAX_ROWS;
+      const bool hasForget = (_btHostCount > 0);
+      if (_currentSelection < hostRows) {
+        _btTargetRow = _currentSelection + 1;
+        btSwitchConfirmPage();
+      } else if (_currentSelection == hostRows) {
+        // Pair new: refuse while a host is connected (a new pairing needs
+        // advertising), otherwise make sure advertising is running.
+        if (!lsBleStackReady()) {
+          buzzerErrorCue();
+          btNotePage("Bluetooth", "not active");
+        } else if (lsHostAnyConnected()) {
+          buzzerErrorCue();
+          btNotePage("Disconnect", "host first");
+        } else {
+          lsHostEnsureAdvertising();
+          btNotePage("Pairing:", "pair from", "the host");
+        }
+      } else if (hasForget && _currentSelection == hostRows + 1) {
+        btForgetListPage();
+      } else if (_currentSelection == (hasForget ? hostRows + 2 : hostRows + 1)) {
+        _currentMenu = MORE_MENU;
+        moreMenu();
+      }
+      break;
+    }
+
+    case BT_SWITCH_CONFIRM_PAGE:
+      if (_currentSelection == 0) {
+        // The switch itself runs at the END of the "Switching to..." dwell —
+        // the CHANGING_MODE_PAGE pattern (dwell, then the action executes on
+        // the screen timer). finishBtSwitch re-validates everything.
+        btSwitchingPage();
+      } else {
+        btHostsMenu();
+      }
+      break;
+
+    case BT_FORGET_LIST_PAGE:
+      if (_currentSelection < _btForgetHostRows) {
+        const int decision = lsHostExecuteForget(_currentSelection + 1);
+        if (decision == LSHOST_ALLOW) {
+          lsHostPushState();  // the list changed — the app's mirror follows (BT,4/BT,5)
+          btHostsMenu();      // refresh from the shrunken bond directory
+        } else if (decision == LSHOST_REFUSE_RANGE) {
+          btHostsMenu();      // the list moved under us — redraw it, no error drama
+        } else {
+          buzzerErrorCue();
+          btNoteForReason(decision);
+        }
+      } else {
+        btHostsMenu();
       }
       break;
 
@@ -2821,6 +2918,204 @@ void LSScreen::modeLockedPage(void) {
 void LSScreen::finishModeLocked(void) {
   _transitionTimerId = -1;  // The scheduled transition just fired — its slot is free; keep the id honest (the one continuation that broke this invariant before the 4.5.7 review)
   modeMenu();
+}
+
+//*********************************//
+// Function   : btHostsMenu  (upstream #16, firmware 4.8.0+)
+//
+// Description: The Bluetooth host list. Rows are rebuilt from the bond
+//              directory on EVERY entry — the bond store IS the host table,
+//              no settings state exists to go stale. Rows: hosts (max 4,
+//              MAC-sorted, "(XX)"-suffixed) + "Pair new..." + "Forget
+//              host..." + "... Back". With more than 4 bonds the forget list
+//              (up to 8) is the on-device valve. Without a BLE stack the page
+//              is a named note that returns to the More menu.
+//
+// Arguments :  void
+//
+// Return     : void
+//*********************************//
+void LSScreen::btHostsMenu() {
+  if (!_begun) return;
+  if (!lsBleStackReady()) {
+    btNotePage("Bluetooth", "not active");
+    return;
+  }
+  lsHostRow rows[LSHOST_ENUM_CAP];
+  _btHostCount = lsHostEnumerate(rows, LSHOST_ENUM_CAP);
+
+  int textIdx = 0;
+  const int hostRows = (_btHostCount < LSHOST_MENU_MAX_ROWS) ? _btHostCount : LSHOST_MENU_MAX_ROWS;
+  for (int i = 0; i < hostRows; i++) {
+    char label[24];
+    lsHostOledLabel(&rows[i], label, sizeof(label));
+    _btMenuText[textIdx++] = label;
+  }
+  _btMenuText[textIdx++] = "Pair new...";
+  if (_btHostCount > 0) _btMenuText[textIdx++] = "Forget host...";
+  _btMenuText[textIdx++] = "... Back";
+
+  _currentMenu = BT_HOSTS_MENU;
+  _currentMenuLength = textIdx;
+  _currentMenuText = _btMenuText;
+  _cursorStart = 0;
+  _currentSelection = 0;
+  _countMenuScroll = 0;
+  displayMenu();
+}
+
+//*********************************//
+// Function   : btSwitchConfirmPage
+//
+// Description: "Switch to <name>? Confirm / ... Back" — a switch drops a live
+//              host, so it confirms like the mode-change flow. Re-enumerates
+//              so the named target is fresh even if the list was rendered
+//              earlier; the switch itself re-validates again at execution.
+//
+// Arguments :  void
+//
+// Return     : void
+//*********************************//
+void LSScreen::btSwitchConfirmPage() {
+  if (!_begun) return;
+  lsHostRow rows[LSHOST_ENUM_CAP];
+  const uint8_t count = lsHostEnumerate(rows, LSHOST_ENUM_CAP);
+  char label[24] = "this host";
+  if (_btTargetRow >= 1 && _btTargetRow <= (int)count) {
+    lsHostOledLabel(&rows[_btTargetRow - 1], label, sizeof(label));
+  }
+  _btConfirmText[0] = "Switch to";
+  _btConfirmText[1] = label;
+  _btConfirmText[2] = "Confirm";
+  _btConfirmText[3] = "... Back";
+
+  _currentMenu = BT_SWITCH_CONFIRM_PAGE;
+  _currentMenuLength = 2;
+  _currentMenuText = _btConfirmText;
+  _cursorStart = 2;
+  _currentSelection = 0;
+  _countMenuScroll = 0;
+  displayMenu();
+}
+
+//*********************************//
+// Function   : btForgetListPage
+//
+// Description: The forget list — every bond (up to 8) as a selectable row
+//              plus "... Back". Selecting a host forgets it (destroys the
+//              bond file): the destructive hold-to-confirm gate applies, and
+//              forgetting the ACTIVE host disconnects it first (the host
+//              re-pairs or is removed per the guides' per-OS note).
+//
+// Arguments :  void
+//
+// Return     : void
+//*********************************//
+void LSScreen::btForgetListPage() {
+  if (!_begun) return;
+  lsHostRow rows[LSHOST_ENUM_CAP];
+  const uint8_t count = lsHostEnumerate(rows, LSHOST_ENUM_CAP);
+  _btHostCount = count;
+  int textIdx = 0;
+  const int hostRows = (count < LSHOST_ENUM_CAP) ? count : LSHOST_ENUM_CAP;
+  for (int i = 0; i < hostRows; i++) {
+    char label[24];
+    lsHostOledLabel(&rows[i], label, sizeof(label));
+    _btHostsText[textIdx++] = label;
+  }
+  _btForgetHostRows = hostRows;
+  _btHostsText[textIdx++] = "... Back";
+
+  _currentMenu = BT_FORGET_LIST_PAGE;
+  _currentMenuLength = textIdx;
+  _currentMenuText = _btHostsText;
+  _cursorStart = 0;
+  _currentSelection = 0;
+  _countMenuScroll = 0;
+  displayMenu();
+}
+
+//*********************************//
+// Function   : btSwitchingPage / btNotePage / btNoteForReason
+//
+// Description: The dwell pages. Both NAME THEMSELVES in _currentMenu (the
+//              4.5.7 CH,0:0 honesty rule) and return to the host list —
+//              except the not-ready note, which returns to the More menu (a
+//              dead BLE stack must not loop the page into itself).
+//
+// Arguments :  btNotePage: the note lines (≤10 chars each — the size-2 width)
+//
+// Return     : void
+//*********************************//
+void LSScreen::btSwitchingPage() {
+  if (!_begun) return;
+  _currentMenu = BT_SWITCHING_PAGE;
+  setupDisplay();
+  _display.println("Switching");
+  _display.println("to host...");
+  flushDisplay();
+  scheduleTransition(2000, screenBtSwitchTransitionDone);
+}
+
+void LSScreen::btNotePage(const String &line1, const String &line2, const String &line3) {
+  if (!_begun) return;
+  _currentMenu = BT_NOTE_PAGE;
+  setupDisplay();
+  _display.println(line1);
+  _display.println(line2);
+  if (line3.length() > 0) _display.println(line3);
+  flushDisplay();
+  scheduleTransition(2000, screenBtNoteTransitionDone);
+}
+
+void LSScreen::btNoteForReason(int reason) {
+  // Line pairs kept ≤10 chars (the size-2 OLED width). The refusal REASON is
+  // named, never a bare beep — the modeLockedPage lesson (bench 2026-10-16).
+  switch (reason) {
+    case LSHOST_REFUSE_CALIBRATION:     btNotePage("Busy:", "in calib."); break;
+    case LSHOST_REFUSE_LATCH:           btNotePage("Release", "drag or", "scroll"); break;
+    case LSHOST_REFUSE_RANGE:           btNotePage("Host list", "changed"); break;
+    case LSHOST_REFUSE_ALREADY_ACTIVE:  btNotePage("Already on", "this host"); break;
+    case LSHOST_REFUSE_RADIO:           btNotePage("Radio busy", "try again"); break;
+    case LSHOST_REFUSE_NOT_INITIALIZED: btNotePage("Bluetooth", "not active"); break;
+    default:                            btNotePage("Try again", ""); break;
+  }
+}
+
+//*********************************//
+// Function   : finishBtSwitch / finishBtNote
+//
+// Description: The dwell continuations. The switch EXECUTES here (at the end
+//              of the "Switching to host..." dwell — the CHANGING_MODE_PAGE
+//              pattern), after lsHostExecuteSwitch re-validates the world
+//              that changed during the 2 s (the TOCTOU gate); a refusal lands
+//              on its named note instead. finishBtNote returns to the host
+//              list, or to the More menu when the BLE stack is down (the
+//              not-ready note must not loop into btHostsMenu's own note).
+//
+// Arguments :  void
+//
+// Return     : void
+//*********************************//
+void LSScreen::finishBtSwitch() {
+  _transitionTimerId = -1;  // the scheduled transition just fired — its slot is free (the finishModeLocked invariant)
+  const int decision = lsHostExecuteSwitch(_btTargetRow);
+  if (decision == LSHOST_ALLOW || decision == LSHOST_REFUSE_ALREADY_ACTIVE) {
+    btHostsMenu();  // switched (or the target already reconnected meanwhile) — show the fresh list
+    return;
+  }
+  buzzerErrorCue();
+  btNoteForReason(decision);
+}
+
+void LSScreen::finishBtNote() {
+  _transitionTimerId = -1;  // the scheduled transition just fired — its slot is free
+  if (!lsBleStackReady()) {
+    _currentMenu = MORE_MENU;
+    moreMenu();
+    return;
+  }
+  btHostsMenu();
 }
 
 //*********************************//

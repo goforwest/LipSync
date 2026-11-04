@@ -546,6 +546,13 @@ bool lsHostDisconnectCurrent() {
   return Bluefruit.disconnect(hdl[0]);
 }
 
+// Any central connected, bonded or not — the pair-new gate (a new pairing
+// needs advertising; advertising needs no connection).
+bool lsHostAnyConnected() {
+  if (needsInitialization) return false;
+  return Bluefruit.connected() != 0;
+}
+
 void lsHostEnsureAdvertising() {
   if (needsInitialization) return;
   // restartOnDisconnect(true) re-advertises after a disconnect (BLEAdvertising

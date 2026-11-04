@@ -227,6 +227,9 @@ void lsHostEnsureAdvertising();     // (re)start open advertising if the set is 
 bool lsHostForgetByMac(const char* mac12);  // remove one bond file (bond_remove_key)
 void lsHostPushState();             // MANUAL,0:BT,4/BT,5 pushes with change-detect (the CH,5 contract)
 void lsHostRefusalLine(String commandKey, int reason, int row);  // named ERROR line for a refusal
+int lsHostExecuteSwitch(int targetRow);  // TOCTOU re-check + disconnect + re-advertise; ALLOW or a refusal reason
+int lsHostExecuteForget(int targetRow);  // TOCTOU re-check + (disconnect) + bond-file removal
+bool lsHostAnyConnected();               // any central connected (bonded or not) — pair-new gate
 void getBluetoothHost(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void switchBluetoothHost(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void forgetBluetoothHost(bool responseEnabled, bool apiEnabled, String optionalParameter);
@@ -455,6 +458,9 @@ void screenReturnToMenuTransitionDone();
 void screenFullCalibConfirmTransitionDone();
 void screenFactoryResetConfirm2TransitionDone();
 void screenModeLockedTransitionDone();
+// Upstream #16: the Bluetooth host pages' dwell continuations
+void screenBtSwitchTransitionDone();
+void screenBtNoteTransitionDone();
 
 // Calibration state machine callbacks (timer continuations, referenced by
 // the calibration timers and by setJoystickCalibration / setJoystickInitialization)
