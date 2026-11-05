@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# LipSync V4.8.0 — multi-host Bluetooth switching bench (upstream #16)
+# LipSync V4.8.1 — multi-host Bluetooth switching bench (upstream #16)
 # Numbered pass/fail script per docs/design/16-multi-host-ble.md Q10.
 #
 # Usage:   ./bench-16-multi-host.sh [OS_LABEL]
@@ -36,14 +36,14 @@ Wire snippets used below (paste into the console after SETTINGS):
   BT,1:2            -> SUCCESS,0:BT,1:2          (switch to row 2)
   BT,2:1            -> SUCCESS,0:BT,2:1          (forget row 1)
   BT,3:1            -> SUCCESS,0:BT,3:1          (ensure advertising)
-  VN,0:0            -> SUCCESS,0:VN,0:4.8.0      (verify the build first!)
+  VN,0:0            -> SUCCESS,0:VN,0:4.8.1      (verify the build first!)
 Pushes arrive unprompted: MANUAL,0:BT,4:<n> / MANUAL,0:BT,5:<row>
 WIRE
 
 step "B0 Build identity (all OSes)"
-note "ACTION: VN,0:0 must answer 4.8.0; Hub > Info shows the same. Flash the CI artifact first."
+note "ACTION: VN,0:0 must answer 4.8.1; Hub > Info shows the same. Flash the local-builder or CI artifact first."
 note "OBSERVED: VN answered: ____________"
-read -rp "VN=4.8.0 and matches Info? [y/N] " a; [ "$a" = y ] && pass 0 "build identity" || fail 0 "build identity (VN/Info mismatch?)"
+read -rp "VN=4.8.1 and matches Info? [y/N] " a; [ "$a" = y ] && pass 0 "build identity" || fail 0 "build identity (VN/Info mismatch?)"
 
 step "B1 Baseline single-host (${OS})"
 note "ACTION: factory-fresh bond dir (or note existing bonds). Pair host A (this computer). SETTINGS; BT,0:0; BT,0:1."
@@ -109,7 +109,7 @@ read -rp "All four? [y/N] " a
 [ "$a" = y ] && pass 10 "power-loss mid-switch" || fail 10 "power-loss mid-switch"
 
 step "B11 Downgrade round-trip (${OS}) — THE OTHER DECIDING STEP"
-note "ACTION: with 3 bonds + custom settings: flash 4.7.0, run, EX,0 dump; flash 4.8.0 back."
+note "ACTION: with 3 bonds + custom settings: flash 4.7.0, run, EX,0 dump; flash 4.8.1 back."
 note "OBSERVED 4.7.0 boots normally with bonds untouched? ____ EX,0 diff vs pre-downgrade clean? ____"
 note "OBSERVED re-upgrade shows all 3 hosts with correct active? ____"
 read -rp "Bonds + settings budgets byte-identical across the round trip? [y/N] " a
