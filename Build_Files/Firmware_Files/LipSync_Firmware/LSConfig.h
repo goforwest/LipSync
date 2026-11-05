@@ -29,7 +29,7 @@
 #define CONF_LIPSYNC_MODEL 1                // 1: Lipsync w/ Hub
 
 #define CONF_LIPSYNC_VERSION_MAJOR  4
-#define CONF_LIPSYNC_VERSION_MINOR  7
+#define CONF_LIPSYNC_VERSION_MINOR  8
 #define CONF_LIPSYNC_VERSION_REV    0
 
 // 4.5.22 RESCUE-BUILD SWITCH (bench round 15): the device's settings
