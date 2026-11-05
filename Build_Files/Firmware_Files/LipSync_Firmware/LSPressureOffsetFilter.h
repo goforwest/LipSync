@@ -23,8 +23,11 @@
 // fire a phantom ACTION. RESIDUAL (exact, not overstated): with a user
 // threshold lowered BELOW the absorbed magnitude (the API floor is 2.0 hPa)
 // an absorbed sub-3.0 hold can still shift neutral past the lowered
-// threshold; that state is bounded, named on the wire by the once-a-minute
-// ERROR line, and cleared by a reboot at neutral. The limit is a hardware
+// threshold; that state is bounded (excursion < the limit), observable in
+// PV/the corrected signal, and cleared by a reboot at neutral — but it is
+// SILENT on the wire: the once-a-minute ERROR line covers the
+// never-completing baseline (RETRYING_INITIAL), not this completed-absorb
+// residual. The limit is a hardware
 // plausibility ceiling, deliberately NOT tied to the live thresholds: a
 // caregiver lowering a threshold must never be able to push the boot
 // baseline below the sensor pair's legitimate inter-sensor bias and strand

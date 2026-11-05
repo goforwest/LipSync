@@ -2332,9 +2332,13 @@ void initSwitchActions() {
 //              overlays the hard-band action overrides (HA/HB from
 //              /settings2.dat) — upstream #58. Runs with the other
 //              input-related stored settings in initRestrictions(), so the
-//              live table is in force from the first input tick. A settings
-//              file written by older firmware has no HA/HB keys, so the live
-//              table stays byte-identical to the compiled table.
+//              live table is in force from the first input tick. The seed
+//              document ships WITH HA/HB (4.7.0), so a normal store leaves
+//              the table byte-identical to the compiled one; the one accepted
+//              edge is a PARSEABLE settings2 that lacks the keys (hand-edited
+//              only) — readInt yields 0 = NOTHING, which is allowlisted, so
+//              the hard band goes INERT (the fail-safe direction), re-armed
+//              by the first HA/HB SET, which applies live.
 //
 // Parameters : void
 //
