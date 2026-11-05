@@ -220,15 +220,16 @@ void controlHubMenu(bool responseEnabled, bool apiEnabled, String optionalParame
 // store itself is the library's /adafruit/bond_prph files — this feature adds
 // NO settings file and NO settings keys (design: docs/design/16-multi-host-ble.md).
 bool lsBleStackReady();  // !needsInitialization — every BT call site gates on this
-uint8_t lsHostEnumerate(lsHostRow* rows, uint8_t cap);  // MAC-sorted bond rows; returns total count
+uint8_t lsHostEnumerate(lsHostRow* rows, uint8_t cap);  // MAC-sorted bond rows; returns the exposed (capped) row count
 bool lsHostActiveMac(char* out13);  // 12-hex bond address of the connected host, false when none/unbonded
 bool lsHostDisconnectCurrent();     // disconnect the connected host, true when nothing to do
 void lsHostEnsureAdvertising();     // (re)start open advertising if the set is not running
-bool lsHostForgetByMac(const char* mac12);  // remove one bond file (bond_remove_key)
-void lsHostPushState();             // MANUAL,0:BT,4/BT,5 pushes with change-detect (the CH,5 contract)
+bool lsHostForgetByMac(const char* mac12);  // remove one bond file (explicit InternalFS.remove + absence verification — the lib's void bond_remove_key cannot report failure)
+void lsHostPushState(bool force = false);  // MANUAL,0:BT,4/BT,5 pushes with change-detect + silent boot prime (the CH,5 contract); force skips the prime for the forget paths
 void lsHostRefusalLine(String commandKey, int reason, int row);  // named ERROR line for a refusal
-int lsHostExecuteSwitch(int targetRow);  // TOCTOU re-check + disconnect + re-advertise; ALLOW or a refusal reason
-int lsHostExecuteForget(int targetRow);  // TOCTOU re-check + (disconnect) + bond-file removal
+int lsHostExecuteSwitch(int targetRow, const char* expectedMac12);  // TOCTOU re-check + row-identity check (NULL expected = index contract) + disconnect + re-advertise; ALLOW or a refusal reason
+int lsHostExecuteForget(int targetRow, const char* expectedMac12);  // TOCTOU re-check + row-identity check + (disconnect) + bond-file removal
+void applyHardBandActionOverrides();  // upstream #58: HA/HB -> live SAP table (initSapActions at boot; the HA/HB setters apply live)
 bool lsHostAnyConnected();               // any central connected (bonded or not) — pair-new gate
 void getBluetoothHost(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void switchBluetoothHost(bool responseEnabled, bool apiEnabled, String optionalParameter);

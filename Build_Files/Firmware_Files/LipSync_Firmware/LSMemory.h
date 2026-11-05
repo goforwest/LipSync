@@ -50,7 +50,6 @@ class LSMemory {
     void initialize(String fileString, String jsonString);
     void clear(String fileString);
     void format();
-    String readAll(String fileString);
     long size(String fileString);
     bool writeAll(String fileString, String jsonString);
     JsonObject readObject(String fileString);
@@ -66,6 +65,28 @@ class LSMemory {
     bool isLastReadOk() { return _lastReadOk; }
   private:
     bool _lastReadOk = true;  // The most recent readObject deserialized a real document (4.5.7 review)
+
+    // Read the just-written temp file back and byte-compare it against the
+    // source before the atomic rename. Adafruit_LittleFS's File::close()
+    // returns void and swallows lfs_file_close errors, so the written-byte
+    // count alone cannot rule out a close-time truncation — without this
+    // check a flash error could rename a truncated temp over the settings
+    // file while writeAll/writeObject reported success. Length + byte
+    // compare (no second JSON parse — it would spend a second document pool
+    // on the loop-task stack for a failure class a byte compare already
+    // catches).
+    static bool verifyTempWrite(const char* jsonChar, size_t jsonLength) {
+      File verifyFile(CONF_SETTINGS_TMP_FILE, FILE_O_READ, InternalFS);
+      if (!verifyFile) return false;
+      bool ok = true;
+      for (size_t i = 0; ok && i < jsonLength; i++) {
+        const int c = verifyFile.read();
+        ok = (c >= 0) && ((char)c == jsonChar[i]);
+      }
+      if (ok) ok = (verifyFile.read() < 0);  // No trailing extra bytes either
+      verifyFile.close();
+      return ok;
+    }
 
     // 4.7.0 / upstream #58: per-file size budget. The main settings file's
     // budget is the 4.1.0 downgrade cliff; /settings2.dat carries the
@@ -174,8 +195,11 @@ void LSMemory::initialize(String fileString, String jsonString) {
     Serial.print("ERROR: settings file (");
     Serial.print((int)fileOverBudgetSize);
     Serial.print(" bytes) is parseable but exceeds the ");
-    Serial.print(budgetFor(CONF_SETTINGS_FILE));
-    Serial.println("-byte downgrade budget — replacing it with the compiled defaults");
+    // Per-file budget, not the main file's constant: /settings2.dat's 256-byte
+    // budget is NOT the 4.1.0 downgrade cliff, and a support tech reading this
+    // line for a destroyed settings2 must be told the right number.
+    Serial.print(budgetFor(fileString));
+    Serial.println("-byte budget — replacing it with the compiled defaults");
   }
 
   // Seed (or re-seed) the compiled default. It must fit the budget by
@@ -277,47 +301,18 @@ long LSMemory::size(String fileString) {
 }
 
 //*********************************//
-// Function   : readAll
+// Function   : readAll — REMOVED (4.8.1 review)
 //
-// Description: Reads all Json data from the settings file and stores it in a buffer
+// Dead code: no caller anywhere in the firmware (only this definition and
+// its declaration existed). It duplicated readObject's budget/short-read/
+// clamp logic that had to be kept in sync for nothing — the next caller
+// would have silently inherited divergent read semantics.
 //
-// Arguments :  fileString : String : the name of the file
-//
-// Return     : buffer : String array : Output from file
 //*********************************//
-String LSMemory::readAll(String fileString){
-  const char* fileName = fileString.c_str();
-
-  // Check the open (4.5.7 review): File::read on an unopened handle passes
-  // a NULL lfs_file_t into littlefs — a verified HardFault chain (vector-
-  // table garbage passes the BADF check, the ctz walk hits an unmapped
-  // block, the raw flash read dereferences it). A missing/unopenable file
-  // reads as empty; the callers' defaults apply.
-  if (!file.open(fileName, FILE_O_READ)) {
-    return "";
-  }
-  const uint32_t fileSize = file.size();
-  if (fileSize == 0 || fileSize > budgetFor(fileString) || fileSize >= BUFFER_SIZE) {
-    file.close();
-    return "";
-  }
-  uint32_t readlen = 0;
-  char buffer[BUFFER_SIZE] = { 0 };
-  int readResult = file.read(buffer, sizeof(buffer));
-  if (readResult > 0) readlen = (uint32_t)readResult;
-  if (readlen >= sizeof(buffer)) readlen = sizeof(buffer) - 1;  // 4.5.7 review: the one-byte overflow at exactly 512 bytes
-
-  delay(1);
-  buffer[readlen] = 0;
-  file.close();
-  delay(1);
-  if (readlen != fileSize) return "";
-  return buffer;
-}
 
 
 //*********************************//
-// Function   : writeAll 
+// Function   : writeAll
 // 
 // Description: Replaces the entire settings file with new values. Refuses
 //              (returns false, file untouched) a write whose serialized form
@@ -341,12 +336,16 @@ bool LSMemory::writeAll(String fileString, String jsonString){
     if (jsonLength > budgetFor(fileString)) {
       // Name the reason on serial: a refused settings write must never read
       // as a flash failure — it is a deliberate downgrade guard, and the
-      // line tells the maker/support tech which knob moved.
+      // line tells the maker/support tech which knob moved. The rationale is
+      // per-file: only the main file's budget is the 4.1.0 downgrade cliff.
       String errorLine = "ERROR: settings file budget refused (";
       errorLine += String((int)strlen(jsonChar));
       errorLine += " > ";
       errorLine += String(budgetFor(fileString));
-      errorLine += " bytes) — firmware 4.1.0's 512-byte reader would truncate it";
+      errorLine += " bytes) — ";
+      errorLine += (fileString == CONF_SETTINGS_FILE)
+          ? "firmware 4.1.0's 512-byte reader would truncate it"
+          : "the secondary settings file budget is a hard cap (not the 4.1.0 downgrade cliff)";
       serialTxEnqueueLine(errorLine);
       return false;
     }
@@ -378,6 +377,14 @@ bool LSMemory::writeAll(String fileString, String jsonString){
     file.close();
 
     if (written != jsonLength) {
+      InternalFS.remove(CONF_SETTINGS_TMP_FILE);
+      return false;
+    }
+
+    // Read-back verification before the rename: a swallowed close-time error
+    // must not rename a truncated temp over the settings while reporting
+    // success (verifyTempWrite comment).
+    if (!verifyTempWrite(jsonChar, jsonLength)) {
       InternalFS.remove(CONF_SETTINGS_TMP_FILE);
       return false;
     }
@@ -436,7 +443,7 @@ JsonObject LSMemory::readObject(String fileString){
     return doc.as<JsonObject>();
   }
 
-  // Deserialize he JSON documetn
+  // Deserialize the JSON document
   doc.clear();
   DeserializationError deserializationError = deserializeJson(doc, String(jsonBuffer));
 
@@ -545,7 +552,11 @@ bool LSMemory::readPoint(String fileString, String key, pointFloatType &out){
   if (corner.size() < 2) return false;
   const float x = corner[0].as<float>();
   const float y = corner[1].as<float>();
-  if (isnan(x) || isnan(y)) return false;
+  // isfinite, not just isnan: a corrupt-but-parseable literal that overflows
+  // float (e.g. 1e400) yields +/-inf, which passes an isnan check and flows
+  // into setInputMax -> an infinite/degenerate radius (the full-throw cursor
+  // class). A failed read must leave the caller's fallback in charge.
+  if (!isfinite(x) || !isfinite(y)) return false;
   out = {x, y};
   return true;
 }
@@ -597,7 +608,10 @@ bool LSMemory::writeObject(String fileString, String key, JsonObject obj){
       errorLine += String((int)strlen(jsonChar));
       errorLine += " > ";
       errorLine += String(budgetFor(fileString));
-      errorLine += " bytes) — firmware 4.1.0's 512-byte reader would truncate it";
+      errorLine += " bytes) — ";
+      errorLine += (fileString == CONF_SETTINGS_FILE)
+          ? "firmware 4.1.0's 512-byte reader would truncate it"
+          : "the secondary settings file budget is a hard cap (not the 4.1.0 downgrade cliff)";
       serialTxEnqueueLine(errorLine);
       return false;
     }
@@ -618,6 +632,14 @@ bool LSMemory::writeObject(String fileString, String key, JsonObject obj){
     file.close();
 
     if (written != jsonLength) {
+      InternalFS.remove(CONF_SETTINGS_TMP_FILE);
+      return false;
+    }
+
+    // Read-back verification before the rename: a swallowed close-time error
+    // must not rename a truncated temp over the settings while reporting
+    // success (verifyTempWrite comment).
+    if (!verifyTempWrite(jsonChar, jsonLength)) {
       InternalFS.remove(CONF_SETTINGS_TMP_FILE);
       return false;
     }

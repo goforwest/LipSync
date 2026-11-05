@@ -90,7 +90,7 @@ public:
   void begin();
   void clearLedAll();
   void clearLed(int ledNumber);
-  uint32_t getLedColor(int ledNumber);
+  // (getLedColor removed 4.8.1 — lying stub, see the definition-site comment)
   int getLedBrightness();                   // get brightness value from 0 to 255
   void setLedBrightness(int ledBrightness);
   int getLedBrightnessLevel();              // get brightness level from 1-10
@@ -184,12 +184,11 @@ void LSOutput::clearLed(int ledNumber) {
 // Arguments :  void
 // 
 // Return     : void
-//*********************************//
-uint32_t LSOutput::getLedColor(int ledNumber) {
-
-  //uint32_t colorValue = ledPixels.getPixelColor(ledNumber-1);
-  return 0;
-}
+// (getLedColor removed — 4.8.1 review: a lying stub. It always returned 0
+// while its declaration promised the pixel's color; uncalled in the shipped
+// firmware, and wiring it to a future query endpoint would have reported
+// "all LEDs off" — the health-check-lies class. Re-add only with a real
+// implementation.)
 
 
 //***GET RGB LED BRIGHTNESS FUNCTION***//

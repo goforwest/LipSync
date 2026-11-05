@@ -124,7 +124,7 @@ void checkResetReason() {
 void initWatchdog() {
   if (USB_DEBUG) { Serial.println("USBDEBUG: initWatchdog()"); }
   // Configure watchdog timer with a defined timeout
-  NRF_WDT->CONFIG = (WDT_CONFIG_HALT_Pause << WDT_CONFIG_HALT_Pos) |  // Keep running during halt
+  NRF_WDT->CONFIG = (WDT_CONFIG_HALT_Pause << WDT_CONFIG_HALT_Pos) |  // Pause while the CPU is halted (a debugger session does not get WDT-reset)
                     (WDT_CONFIG_SLEEP_Run << WDT_CONFIG_SLEEP_Pos);   // Keep running in sleep mode
   NRF_WDT->CRV = CONF_WATCHDOG_TIMEOUT_SEC * 32768;                   // Convert timeout in seconds to watchdog cycles (1 cycle = 1/32.768kHz)
   NRF_WDT->RREN |= WDT_RREN_RR0_Msk;                                  // Enable reload register 0

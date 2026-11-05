@@ -532,7 +532,11 @@ int LSTimer<T>::setTimeout(unsigned long interval, ObjType* obj) {
 //
 // Arguments :  unsigned long : interval : Time between function calls (ms)
 //             unsigned long : startDelay : Delay before the first call (ms)
-//             unsigned n     : n         : Number of times to call the function
+//             unsigned n     : n         : Number of times to call the function.
+//                                           NOTE: n == 0 IS the RUN_FOREVER flag (RUN_FOREVER == 0,
+//                                           the same value setInterval passes) — the API cannot
+//                                           express "run zero times"; a caller passing 0 gets an
+//                                           unbounded timer BY CONTRACT, not by accident.
 //             timerCallbackPtr : f         : Function to be called repeatedly
 // 
 // Return     : int : Timer index (identifier for the timer)
@@ -696,9 +700,9 @@ int LSTimer<T>::deleteTimer(int timerId) {
 //*********************************//
 // Function   : anchorAllToNow
 //
-// Description: Re-anchor every ACTIVE (registered) slot to now, so its next
-//              fire is one full interval away. 4.6.6: after a long deliberate
-//              loop stall the idealized trigger anchor
+// Description: Re-anchor every ACTIVE ENABLED callback slot to now, so its
+//              next fire is one full interval away. 4.6.6: after a long
+//              deliberate loop stall the idealized trigger anchor
 //              (previousTime += interval, the header's own TODO) makes every
 //              missed interval come due at once — run() then repays the debt
 //              one fire per loop pass, i.e. a multi-second burst of
@@ -708,7 +712,12 @@ int LSTimer<T>::deleteTimer(int timerId) {
 //              the caller anchors the pools at the test's exit so normal
 //              operation resumes on a clean cadence instead of a burst.
 //              Disabled slots are left alone (their enable-time semantics
-//              keep their own anchor contract).
+//              keep their own anchor contract — re-anchoring them would
+//              restart their cadence at enable), and STOPWATCH slots are
+//              left alone: for a stopwatch previousTime IS the start anchor,
+//              so re-anchoring would silently reset any elapsed measurement
+//              in flight (a hold-duration stopwatch would lose its elapsed
+//              time and re-classify on release).
 //
 // Arguments :  void
 //
@@ -718,7 +727,7 @@ template<typename T>
 void LSTimer<T>::anchorAllToNow(void) {
     const unsigned long now = millis();
     for (int i = 0; i < MAX_TIMERS; i++) {
-        if (timer[i].callback != NULL || stopwatch[i]) {
+        if (timer[i].callback != NULL && timer[i].enabled) {
             timer[i].previousTime = now;
         }
     }

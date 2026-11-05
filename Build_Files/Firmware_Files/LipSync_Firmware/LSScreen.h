@@ -243,6 +243,10 @@ public:
 
   bool showCenterResetComplete = false;
 
+  // Public (4.8.1): the serial ST/PT setters heal the hard pair with the
+  // same rule the menu pages use — one implementation, two call sites.
+  void healHardThresholds();
+
 private:
   Adafruit_SSD1306 _display = Adafruit_SSD1306(CONF_SCREEN_WIDTH, CONF_SCREEN_HEIGHT, &Wire, OLED_RESET);
 
@@ -336,7 +340,6 @@ private:
   void adjustPuffThreshMenu();
   void adjustHardSipThreshMenu();   // upstream #58 (4.7.0)
   void adjustHardPuffThreshMenu();
-  void healHardThresholds();        // keeps hard >= regular + margin across menu edits
   void accelMenu();
   void restrictionsMenu();
   void timingMenu();
@@ -361,9 +364,11 @@ private:
   String _btHostsText[LSHOST_ENUM_CAP + 2];
   String _btMenuText[LSHOST_MENU_MAX_ROWS + 3];
   String _btConfirmText[4];   // switch confirm: header, target, Confirm, Back
-  int _btHostCount = 0;   // total bonds at the last enumeration
+  int _btHostCount = 0;   // exposed bond count at the last enumeration (capped at LSHOST_ENUM_CAP)
   int _btTargetRow = 0;   // pending switch target (1-based enumeration row)
+  String _btSwitchTargetMac = "";  // the target's identity captured at confirm-render — finishBtSwitch verifies the executed row still IS the one the page named (MAC-sorted rows renumber in-range when the bond set changes)
   int _btForgetHostRows = 0;  // selectable host rows the forget list rendered with (the destructive-hold gate reads it)
+  String _btForgetRowMacs[LSHOST_ENUM_CAP];  // per-row identity captured at forget-list render (lsHostExecuteForget refuses a renumbered match — the wrong host must never be erased)
   String _soundMenuText[4] = { "Sound:", "<>", "Turn <>", "... Back" };
   String _lightBrightMenuText[4] = { "Lights: ", "Increase", "Decrease", "... Back" };
   String _scrollSpMenuText[4] = { "Speed: ", "Increase", "Decrease", "... Back" };
@@ -619,6 +624,14 @@ void LSScreen::closeMenu() {
 // Return     : void
 //*********************************//
 void LSScreen::scheduleTransition(unsigned long delayMs, void (*transitionFn)()) {
+  // ONE slot for every scheduled continuation (delete-before-schedule).
+  // 4.8.1 review note: displayCursor's long-text scroll delay shares this
+  // slot. That is safe today because every render path into displayCursor
+  // is inputIsFrozen-gated (nextMenuItem/selectMenuItem/continuations), so a
+  // scroll redraw can never land while a mode-switch/BT dwell is pending.
+  // Any FUTURE event-driven render (e.g. a BLE-event-triggered btHostsMenu
+  // refresh) must NOT call displayCursor directly while a dwell may be
+  // pending — it would delete the pending continuation and strand the flow.
   _inputFrozenUntil = millis() + delayMs;
   if (_transitionTimerId >= 0) {
     _screenStateTimer.deleteTimer(_transitionTimerId);
@@ -674,6 +687,19 @@ void LSScreen::calibrationEndsByClosingMenu(bool enable) {
 
 void LSScreen::finishChangeMode() {
   _transitionTimerId = -1;
+
+  // 4.8.1: the 4.6.6 TOCTOU fix re-checks the lock at the CONFIRMING select,
+  // but the executor runs at the END of the 2 s "Changing mode." dwell — a
+  // caregiver enabling LK over serial DURING the dwell (menu input is
+  // frozen, the API is not) still persisted + reset the locked change. The
+  // same refusal shape as the confirm gate, re-checked where the action
+  // actually happens (the exact pattern finishBtSwitch uses for its own
+  // TOCTOU re-validation).
+  if (g_modeLocked) {
+    buzzerErrorCue();
+    modeLockedPage();
+    return;
+  }
 
   // Persist both halves before the single reset. Calling the public setters
   // sequentially is not atomic: CM resets immediately on change, so a
@@ -1274,9 +1300,10 @@ void LSScreen::selectMenuItem() {
 
     case BT_FORGET_LIST_PAGE:
       if (_currentSelection < _btForgetHostRows) {
-        const int decision = lsHostExecuteForget(_currentSelection + 1);
+        const int decision = lsHostExecuteForget(_currentSelection + 1,
+                                                 _btForgetRowMacs[_currentSelection].c_str());
         if (decision == LSHOST_ALLOW) {
-          lsHostPushState();  // the list changed — the app's mirror follows (BT,4/BT,5)
+          lsHostPushState(true);  // the list changed — the app's mirror follows (BT,4/BT,5); forced — see the BT,2 handler
           btHostsMenu();      // refresh from the shrunken bond directory
         } else if (decision == LSHOST_REFUSE_RANGE) {
           btHostsMenu();      // the list moved under us — redraw it, no error drama
@@ -1984,15 +2011,17 @@ void LSScreen::exitConfirmMenu() {
 
 void LSScreen::calibMenu(void) {
   _currentMenu = CALIB_MENU;
-  if (_prevMenu != _currentMenu) {
-    _currentMenuLength = _calibMenuLen;
-    _currentMenuText = _calibMenuText;
-    _cursorStart = 0;
-    _currentSelection = 0;
-    _countMenuScroll = 0;
+  // (4.8.1: the old `_prevMenu != _currentMenu` re-entry guard was dead —
+  // _prevMenu is only ever assigned MAIN/MORE/SAFEMODE/exit-confirm, never
+  // CALIB_MENU — and had it ever fired, the page would have returned with no
+  // text/length registered. Register the page state unconditionally.)
+  _currentMenuLength = _calibMenuLen;
+  _currentMenuText = _calibMenuText;
+  _cursorStart = 0;
+  _currentSelection = 0;
+  _countMenuScroll = 0;
 
-    displayMenu();  //  Print items in current menu
-  }
+  displayMenu();  //  Print items in current menu
 }
 
 
@@ -2644,12 +2673,20 @@ void LSScreen::adjustPuffThreshMenu(void) {
 // Return     : void
 //*********************************//
 void LSScreen::healHardThresholds(void) {
+  // Only heal while the floor is STORABLE (4.8.1): the hard setters refuse
+  // values at/above CONF_PRESS_MAX_THRESHOLD, so a regular threshold raised
+  // past (MAX - margin) leaves a floor no write can satisfy. The old shape
+  // re-attempted the write on every heal call — a FAIL,3 line after every
+  // ST/PT success and every hard-page entry — while the classifier's
+  // fail-safe keeps the band inert regardless. Skip silently in that state:
+  // the band is structurally unavailable (documented fail-safe), and the
+  // spam stops.
   const float sipFloor = getSipPressureThreshold(false, false) + CONF_PRESS_HARD_MARGIN_HPA;
-  if (getHardSipPressureThreshold(false, false) < sipFloor) {
+  if (sipFloor < CONF_PRESS_MAX_THRESHOLD && getHardSipPressureThreshold(false, false) < sipFloor) {
     setHardSipPressureThreshold(true, false, sipFloor);
   }
   const float puffFloor = getPuffPressureThreshold(false, false) + CONF_PRESS_HARD_MARGIN_HPA;
-  if (getHardPuffPressureThreshold(false, false) < puffFloor) {
+  if (puffFloor < CONF_PRESS_MAX_THRESHOLD && getHardPuffPressureThreshold(false, false) < puffFloor) {
     setHardPuffPressureThreshold(true, false, puffFloor);
   }
 }
@@ -2983,6 +3020,20 @@ void LSScreen::btSwitchConfirmPage() {
   char label[24] = "this host";
   if (_btTargetRow >= 1 && _btTargetRow <= (int)count) {
     lsHostOledLabel(&rows[_btTargetRow - 1], label, sizeof(label));
+    // Capture the target's identity (4.8.1): the 2 s dwell that follows is
+    // exactly the window where the MAC-sorted table can renumber (a host
+    // pairs while advertising, a forget lands over serial). finishBtSwitch
+    // verifies the executed row still IS the one this page named.
+    _btSwitchTargetMac = rows[_btTargetRow - 1].mac;
+  } else {
+    // The row this page was opened for no longer exists (a serial BT,2
+    // landed between list-render and confirm-open). Force a range refusal at
+    // execution instead of switching an index that a re-grown count could
+    // silently repurpose — the page says "this host", so it must not switch
+    // any host (the pre-4.8.1 shape had this hole; the identity check
+    // cannot cover it with no identity to check).
+    _btTargetRow = 0;
+    _btSwitchTargetMac = "";
   }
   _btConfirmText[0] = "Switch to";
   _btConfirmText[1] = label;
@@ -3022,6 +3073,13 @@ void LSScreen::btForgetListPage() {
     char label[24];
     lsHostOledLabel(&rows[i], label, sizeof(label));
     _btHostsText[textIdx++] = label;
+    // Per-row identity (4.8.1): the forget select maps the DISPLAYED row to
+    // a CURRENT index at execution — without the identity check, a
+    // concurrent forget (serial BT,2 — it has no frozen gate) renumbers the
+    // MAC-sorted rows in-range and the hold-to-confirm erases the WRONG
+    // host's bond. lsHostExecuteForget verifies the identity and refuses
+    // with the "Host list changed" note on a mismatch.
+    _btForgetRowMacs[i] = rows[i].mac;
   }
   _btForgetHostRows = hostRows;
   _btHostsText[textIdx++] = "... Back";
@@ -3050,6 +3108,7 @@ void LSScreen::btForgetListPage() {
 void LSScreen::btSwitchingPage() {
   if (!_begun) return;
   _currentMenu = BT_SWITCHING_PAGE;
+  _currentSelection = 0;  // a draw-only page reports row 0 (the CH,0:0/CH,5 triple's row is meaningless here — never inherit the interrupted page's selection)
   setupDisplay();
   _display.println("Switching");
   _display.println("to host...");
@@ -3060,6 +3119,7 @@ void LSScreen::btSwitchingPage() {
 void LSScreen::btNotePage(const String &line1, const String &line2, const String &line3) {
   if (!_begun) return;
   _currentMenu = BT_NOTE_PAGE;
+  _currentSelection = 0;  // a draw-only page reports row 0 — never inherit the interrupted page's selection
   setupDisplay();
   _display.println(line1);
   _display.println(line2);
@@ -3071,6 +3131,12 @@ void LSScreen::btNotePage(const String &line1, const String &line2, const String
 void LSScreen::btNoteForReason(int reason) {
   // Line pairs kept ≤10 chars (the size-2 OLED width). The refusal REASON is
   // named, never a bare beep — the modeLockedPage lesson (bench 2026-10-16).
+  // LSHOST_REFUSE_FROZEN is deliberately unmapped: a frozen window means a
+  // scheduled transition owns the display, so no note page may be scheduled
+  // into it — the executors hardcode menuInputFrozen = 0 (the serial path's
+  // named ERROR line is the only FROZEN reporter). If a future caller ever
+  // reaches the default arm with FROZEN, the generic "Try again" note shows
+  // after the freeze lifts.
   switch (reason) {
     case LSHOST_REFUSE_CALIBRATION:     btNotePage("Busy:", "in calib."); break;
     case LSHOST_REFUSE_LATCH:           btNotePage("Release", "drag or", "scroll"); break;
@@ -3099,7 +3165,7 @@ void LSScreen::btNoteForReason(int reason) {
 //*********************************//
 void LSScreen::finishBtSwitch() {
   _transitionTimerId = -1;  // the scheduled transition just fired — its slot is free (the finishModeLocked invariant)
-  const int decision = lsHostExecuteSwitch(_btTargetRow);
+  const int decision = lsHostExecuteSwitch(_btTargetRow, _btSwitchTargetMac.c_str());
   if (decision == LSHOST_ALLOW || decision == LSHOST_REFUSE_ALREADY_ACTIVE) {
     btHostsMenu();  // switched (or the target already reconnected meanwhile) — show the fresh list
     return;

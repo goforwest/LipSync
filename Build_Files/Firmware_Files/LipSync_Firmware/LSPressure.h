@@ -25,6 +25,13 @@
 #include <Adafruit_Sensor.h>     // Generic sensor
 #include "LSApiDeclarations.h"
 #include "LSPressureClassify.h"
+// Pin the pure classifier's release fraction to the config constant: the
+// classifier is host-compiled without LSConfig.h and carries its own copy —
+// a config change that skips this assert would leave the shipped release
+// boundary at the old value while every reader of the macro believes
+// otherwise. Float-precision comparison (the macro is a double literal).
+static_assert((float)LSPRESSURE_CLASSIFY_RELEASE_FRACTION == (float)CONF_PRESS_RELEASE_FRACTION,
+              "LSPRESSURE_CLASSIFY_RELEASE_FRACTION must equal CONF_PRESS_RELEASE_FRACTION");
 #include "LSPressureEngageFilter.h"
 #include "LSPressureOffsetFilter.h"
 
@@ -67,6 +74,9 @@ enum PressureReadResult : uint8_t {
 #define PRESS_OFFSET_STABILITY_HPA 0.25 // A baseline candidate must stay within this spread
 #define PRESS_OFFSET_NEUTRAL_FRACTION 0.25 // Established offsets only refresh very near neutral
 #define PRESS_OFFSET_NEUTRAL_MAX_HPA 1.0 // Never treat a large pressure shift as neutral just because thresholds are high
+#define PRESS_OFFSET_INITIAL_MAX_HPA 3.0 // Boot baseline magnitude ceiling: at/under the DEFAULT regular threshold, above the sensor pair's plausible inter-sensor bias (each part is a +/-1 hPa class) — a held gesture this strong can never become "neutral"; see LSPressureOffsetFilter.h for the exact residual with lowered user thresholds
+#define PRESS_OFFSET_RETRY_REPORT_WINDOWS 120 // Consecutive failed boot-baseline windows (~60 s at the 50 ms poll) before one ERROR line names the stuck neutral
+#define PRESS_UNHEALTHY_REPORT_MIN_INTERVAL_MS 5000UL // Minimum spacing of the "sensors not responding" ERROR line (a flapping cable re-enters the unhealthy state every re-probe cycle)
 
 // Pressure structure 
 typedef struct {
@@ -89,6 +99,7 @@ class LSPressure {
     int getPressureMode();                              // Get Sip and Puff Pressure Mode : ABS or DIFF pressure
     float getOffsetPressure();                          // Get Offset pressure: (sapPressureAbs- ambientPressure)
     void setOffsetPressure(float offsetPressure);       // Set Offset pressure: 
+    float offsetNeutralLimit();                         // The shared "very near neutral" band (min(ST,PT)*0.25 capped at PRESS_OFFSET_NEUTRAL_MAX_HPA) — one definition for both the collector and the 60 s refresh gate
     void startOffsetUpdate();                           // Begin a stepped offset measurement: five valid (sap - ambient)
                                                         // samples gathered one per update() tick, then averaged
     void setSipThreshold(float s);                      // Set sip threshold
@@ -133,6 +144,20 @@ class LSPressure {
       float _puffThreshold = PRESS_SAP_DEFAULT_THRESHOLD;  // Puff Threshold
       float _hardSipThreshold = CONF_HARD_SIP_THRESHOLD;   // Hard sip threshold (upstream #58) — must exceed _sipThreshold (API-enforced margin)
       float _hardPuffThreshold = CONF_HARD_PUFF_THRESHOLD; // Hard puff threshold (upstream #58) — must exceed _puffThreshold (API-enforced margin)
+      // Thresholds pinned at hold START (4.8.1): continuation and the release
+      // boundary run on these snapshots, not the live values. A live ST/PT
+      // reconfiguration mid-hold (the app pushes settings on connect — a
+      // caregiver opening Connect while the user holds a puff is realistic)
+      // used to re-test the in-flight hold against the NEW threshold and emit
+      // an action-bearing RELEASED the user did not perform (a phantom click),
+      // or to extend a hold below its old engage level. The classifier's own
+      // contract ("class held for life", hard-sticky down) now holds for the
+      // regular bands too: one gesture, the thresholds it started with. Fresh
+      // entries always classify against the live values.
+      float _activeSipThreshold = PRESS_SAP_DEFAULT_THRESHOLD;
+      float _activePuffThreshold = PRESS_SAP_DEFAULT_THRESHOLD;
+      float _activeHardSipThreshold = CONF_HARD_SIP_THRESHOLD;
+      float _activeHardPuffThreshold = CONF_HARD_PUFF_THRESHOLD;
       int _sapMainState = PRESS_SAP_MAIN_STATE_NONE;       // The value which represents the current main state (example: PRESS_SAP_MAIN_STATE_PUFF)
       bool _sensorsHealthy;                               // Both sensors return valid readings (false until begin() correlates it with the sensor-detection globals — see the constructor)
       bool _begun;                                        // begin() ran, so the Adafruit driver objects are safe to call. A never-begun LPSressure holds NULL i2c_dev pointers and ANY driver call faults (bench 2026-10-28: PV,0:0 on a missing-sensor boot HardFaulted inside Adafruit_I2CDevice::write_then_read — pm=2 pt=7 fp=0xE000, twice). Every driver I/O this class makes is behind this gate.
@@ -143,7 +168,15 @@ class LSPressure {
       bool _offsetUpdateRunning;                          // Offset measurement in progress (stepped by updatePressure())
       bool _offsetBaselineValid;                          // A complete stable baseline exists; later refreshes must remain neutral relative to it
       bool _offsetRequiredBeforeSensing;                  // Boot/recovery must complete a safe baseline before sip/puff can resume
-      LSPressureOffsetFilter _offsetFilter{PRESS_BUFF_SIZE, PRESS_OFFSET_ATTEMPT_LIMIT, PRESS_OFFSET_STABILITY_HPA};
+      uint8_t _bootOffsetRetryWindows = 0;                // Consecutive failed boot-baseline windows — names a stuck neutral on the wire once per minute instead of failing in silence (the 4.6.6 destroy-in-silence lesson)
+      unsigned long _lastUnhealthyReportMs = 0;           // Last "sensors not responding" line (rate-limited by PRESS_UNHEALTHY_REPORT_MIN_INTERVAL_MS)
+      LSPressureOffsetFilter _offsetFilter{PRESS_BUFF_SIZE, PRESS_OFFSET_ATTEMPT_LIMIT, PRESS_OFFSET_STABILITY_HPA, PRESS_OFFSET_INITIAL_MAX_HPA};
+      // (requiredSamples intentionally reuses PRESS_BUFF_SIZE: the offset
+      // baseline is a 5-sample stable run, matching the pressure ring depth
+      // and the documented "five valid samples" behavior. Changing
+      // PRESS_BUFF_SIZE for buffering reasons also changes the baseline
+      // length and the ~250 ms collect budget — keep them deliberately
+      // coupled or split the constant if they ever diverge.)
       bool _currentSampleValid;                           // This poll produced a fresh plausible pressure pair (never count stale buffer data as another engagement sample)
       LSPressureEngageFilter _engageFilter{PRESS_SAP_ENGAGE_SAMPLES}; // New holds require consecutive same-direction samples
       unsigned long _sapEngageElapsedBiasMs;              // Time already spent in the consecutive-sample qualifier, included in hold-window timing
@@ -302,16 +335,19 @@ int LSPressure::getPressureMode()
 //*********************************//
 void LSPressure::setPressureMode(int mode)
 {
-  // 4.6.6: refuse PRESS_MODE_ABS. The ABS math (updatePressure: ambient :=
-  // the mouthpiece reading, difference = rawDifference - 0) algebraically
-  // zeroes _sapPressure — with ABS active, NO sip or puff could ever cross
-  // any threshold: a fully silent input device. No shipped caller selects
-  // ABS (begin() passes DIFF and there is no API endpoint or menu path), so
-  // this is a dead-code landmine rather than a live defect — but the setter
-  // is public, and one future caller away from disabling every input.
-  // Refuse loudly (counted as a no-op) instead of storing a poison value.
-  if (mode == PRESS_MODE_ABS) {
-    return;  // ABS is not wired — see updatePressure's ABS branch comment
+  // 4.6.6, tightened 4.8.1: only PRESS_MODE_DIFF is wired. The ABS math
+  // (ambient := the mouthpiece reading, difference = rawDifference - 0)
+  // algebraically zeroes _sapPressure — with ABS active, NO sip or puff could
+  // ever cross any threshold: a fully silent input device. PRESS_MODE_NONE
+  // was equally silent (the non-DIFF path folded the mouthpiece reading into
+  // ambient), so the guard is now a whitelist rather than a single refusal:
+  // any mode that is not the one wired implementation is a no-op. No shipped
+  // caller passes anything else (begin() passes DIFF; no API endpoint or
+  // menu path exists) — this is dead-code landmine disposal, not a live
+  // defect. The refusal is a silent store-refusal; the getter keeps
+  // reporting the mode actually in force.
+  if (mode != PRESS_MODE_DIFF) {
+    return;
   }
   _pressureMode = mode;
 }
@@ -349,9 +385,19 @@ float LSPressure::getHardPuffThreshold()
   return _hardPuffThreshold;
 }
 
+float LSPressure::offsetNeutralLimit()
+{
+  // One definition (4.8.1 review): the collector (startOffsetUpdate) and the
+  // 60 s refresh gate both need the same conservative band. The filter's own
+  // begin() clamps a non-positive limit to 0.01; with the API-enforced
+  // threshold floor (2.0 hPa) this is always >= 0.5.
+  float neutralLimit = min(_sipThreshold, _puffThreshold) * PRESS_OFFSET_NEUTRAL_FRACTION;
+  return min(neutralLimit, (float)PRESS_OFFSET_NEUTRAL_MAX_HPA);
+}
+
 //*********************************//
-// Function   : startOffsetUpdate 
-// 
+// Function   : startOffsetUpdate
+//
 // Description: Begin a stepped offset-pressure measurement. Five valid
 //              (sap - ambient) samples are gathered one per update() tick by
 //              updatePressure() and then averaged. This replaces the old
@@ -367,10 +413,8 @@ void LSPressure::startOffsetUpdate()
 {
   if (_offsetUpdateRunning) return;  // Already gathering samples
 
-  float neutralLimit = min(_sipThreshold, _puffThreshold) * PRESS_OFFSET_NEUTRAL_FRACTION;
-  neutralLimit = min(neutralLimit, (float)PRESS_OFFSET_NEUTRAL_MAX_HPA);
   _offsetUpdateRunning = true;
-  _offsetFilter.begin(_offsetPressure, _offsetBaselineValid, neutralLimit);
+  _offsetFilter.begin(_offsetPressure, _offsetBaselineValid, offsetNeutralLimit());
   _engageFilter.reset();  // A pre-refresh one-sample candidate cannot survive the inert collection window
 }
 
@@ -393,15 +437,28 @@ void LSPressure::markSensorsUnhealthy()
   _badReadCount = 0;
   _goodProbeCount = 0;
   _lastProbeMs = millis();
-  _sapMainState = PRESS_SAP_MAIN_STATE_NONE;  // Stale data must never trigger sip or puff
+  _sapMainState = PRESS_SAP_MAIN_STATE_NONE;  // Defense-in-depth (the operative suppression is updateState's _sensorsHealthy gate + the fault-settle branch; this store is overwritten on the next qualify())
   _currentSampleValid = false;
   _offsetUpdateRunning = false;
   _offsetRequiredBeforeSensing = true;
   _offsetFilter.cancel();
   _engageFilter.reset();
   _sapEngageElapsedBiasMs = 0;
+  // Bounded reporting (4.8.1 review): a flapping cable re-enters this path
+  // every re-probe cycle and used to enqueue the line on EVERY entry. One
+  // report per minimum interval keeps the wire honest without spamming the
+  // response queue during an I2C storm.
   static const char sensorError[] = "ERROR: Pressure sensors not responding — sip and puff disabled until they recover";
-  serialTxEnqueueLine(sensorError, sizeof(sensorError) - 1);
+  const unsigned long nowMs = millis();
+  // The FIRST report after boot is unconditional (_lastUnhealthyReportMs == 0
+  // is the sentinel): a failure in the first seconds must not be suppressed.
+  // The rate limit then bounds a FLAPPING cable that re-enters the state on
+  // every recovery cycle.
+  if (_lastUnhealthyReportMs == 0
+      || (nowMs - _lastUnhealthyReportMs) >= PRESS_UNHEALTHY_REPORT_MIN_INTERVAL_MS) {
+    _lastUnhealthyReportMs = nowMs;
+    serialTxEnqueueLine(sensorError, sizeof(sensorError) - 1);
+  }
 }
 
 //*********************************//
@@ -549,12 +606,11 @@ void LSPressure::updatePressure()
   float tempSapPressureAbs = 0.0f;
   float tempAmbientPressure = 0.0f;
   PressureReadResult sapRead = readFreshPressure(LPS35HW_I2CADDR_DEFAULT, &tempSapPressureAbs);
-  PressureReadResult ambientRead = PRESS_READ_FRESH;
-  if (_pressureMode == PRESS_MODE_DIFF) {
-    ambientRead = readFreshPressure(LPS22_I2CADDR, &tempAmbientPressure);
-  } else {
-    tempAmbientPressure = tempSapPressureAbs;
-  }
+  // Only DIFF is wired (setPressureMode refuses everything else), so the
+  // ambient read is unconditional — the old ABS shortcut branch (ambient :=
+  // the mouthpiece reading) was unreachable dead code whose math would
+  // algebraically zero the sip/puff signal.
+  PressureReadResult ambientRead = readFreshPressure(LPS22_I2CADDR, &tempAmbientPressure);
 
   // A cooperative timer that is catching up can invoke two nominal 50 ms
   // pressure ticks only a millisecond apart. Reading output registers alone
@@ -586,13 +642,11 @@ void LSPressure::updatePressure()
   // sip/puff into the reference made release/weak inputs appear reversed
   // (upstream #88).
   if (_offsetUpdateRunning) {
+    // rawDifference = the two sensors' disagreement (the quantity the offset
+    // cancels). The ABS alternative is refused at the setter — see above.
     float rawDifference = 0.0f;
     if (validReading) {
-      if (_pressureMode == PRESS_MODE_DIFF) {
-        rawDifference = _sapPressureAbs - _ambientPressure;
-      } else {  // Absolute mode: offset is zero and the reading is its own reference
-        _ambientPressure = _sapPressureAbs;
-      }
+      rawDifference = _sapPressureAbs - _ambientPressure;
     }
     LSPressureOffsetFilter::Result offsetResult = _offsetFilter.addSample(validReading, rawDifference);
     if (offsetResult == LSPressureOffsetFilter::COMPLETE) {
@@ -600,6 +654,7 @@ void LSPressure::updatePressure()
       _offsetBaselineValid = true;
       _offsetRequiredBeforeSensing = false;
       _offsetUpdateRunning = false;
+      _bootOffsetRetryWindows = 0;
     } else if (offsetResult == LSPressureOffsetFilter::ACTIVITY_REJECTED
                || offsetResult == LSPressureOffsetFilter::ATTEMPTS_EXHAUSTED) {
       // Keep the last complete baseline. A routine 60-second refresh waits
@@ -609,6 +664,20 @@ void LSPressure::updatePressure()
       // offset is explicitly known to be unresolved.
       _offsetUpdateRunning = false;
       if (_offsetRequiredBeforeSensing) startOffsetUpdate();
+    } else if (offsetResult == LSPressureOffsetFilter::RETRYING_INITIAL
+               && _offsetRequiredBeforeSensing) {
+      // A boot/recovery baseline keeps failing its bounded collection windows.
+      // Either the user is pressing across every window or the sensors' neutral
+      // difference is beyond the initial plausibility ceiling — both leave
+      // sensing permanently inert, which must not happen in silence (the 4.6.6
+      // destroy-in-silence lesson). One ERROR line per minute of continuous
+      // failure; the counter resets when a baseline completes or the class
+      // begins sensing again.
+      if (++_bootOffsetRetryWindows == PRESS_OFFSET_RETRY_REPORT_WINDOWS) {
+        _bootOffsetRetryWindows = 0;
+        serialTxEnqueueLine("ERROR: pressure neutral not established — release the mouthpiece; sip and puff stay disabled until a resting baseline completes",
+                            sizeof("ERROR: pressure neutral not established — release the mouthpiece; sip and puff stay disabled until a resting baseline completes") - 1);
+      }
     }
   }
 
@@ -705,9 +774,17 @@ void LSPressure::updateState()  //  TODO 2025-Feb-22 This code should be abstrac
     // continuation rules. The engage filter below still qualifies every NEW
     // hold (two consecutive same-direction fresh samples), so a hard event
     // means "started the gesture hard" with full phantom-click protection.
+    // 4.8.1: an in-flight hold (prev STARTED) classifies against the
+    // thresholds SNAPPED at its START, so a live ST/PT/HS/HP reconfiguration
+    // mid-hold can neither release it early (the phantom-click class) nor
+    // extend it — fresh entries use the live values.
+    const bool holdContinuing = (_sapPrevState.secondaryState == PRESS_SAP_SEC_STATE_STARTED);
     detectedMainState = lipsyncClassifySapMainState(
-        pressureValue, _sipThreshold, _puffThreshold,
-        _hardSipThreshold, _hardPuffThreshold,
+        pressureValue,
+        holdContinuing ? _activeSipThreshold : _sipThreshold,
+        holdContinuing ? _activePuffThreshold : _puffThreshold,
+        holdContinuing ? _activeHardSipThreshold : _hardSipThreshold,
+        holdContinuing ? _activeHardPuffThreshold : _hardPuffThreshold,
         _sapPrevState.mainState, _sapPrevState.secondaryState,
         PRESS_SAP_SEC_STATE_STARTED);
   }
@@ -793,14 +870,34 @@ void LSPressure::updateState()  //  TODO 2025-Feb-22 This code should be abstrac
         _sapEngageElapsedBiasMs = 0;
       }
       // State: Sip or puff
-      // Previous state: {none, released, time}
+      // Previous state: {Sip or puff, released, time}
       // New state: {Sip or puff, started, 0}
+      // Defensive arm: with PRESS_SAP_ENGAGE_SAMPLES == 2 a RELEASED element
+      // survives exactly one poll, the qualifier was reset at the release,
+      // and the engage filter can only yield NONE on that tick — the
+      // {RELEASED -> NONE} arm above always wins first. This re-arm path only
+      // becomes live if the engage qualifier is ever reconfigured to a single
+      // sample; it keeps that shape correct (qualifier-interval bias included)
+      // instead of relying on the old comment's impossible "{none, released}"
+      // previous state.
       else if(_sapPrevState.secondaryState == PRESS_SAP_SEC_STATE_RELEASED && _sapMainState != PRESS_SAP_MAIN_STATE_NONE) {
         _sapEngageElapsedBiasMs = (unsigned long)(PRESS_SAP_ENGAGE_SAMPLES - 1) * CONF_PRESSURE_POLL_RATE;
         _sapCurrState = {_sapMainState, PRESS_SAP_SEC_STATE_STARTED, _sapEngageElapsedBiasMs};
       }      
       // Push the new state   
       _sapBuffer.pushElement(_sapCurrState);
+      // A STARTED hold carries the thresholds it started with for its whole
+      // life (the classification snapshot above) — pin them here, at the only
+      // two transitions that mint a STARTED element (WAITING->STARTED and
+      // RELEASED->STARTED). Continuation and the release boundary then run on
+      // these snapshots; a mid-hold ST/PT/HS/HP write applies from the NEXT
+      // fresh entry.
+      if (_sapCurrState.secondaryState == PRESS_SAP_SEC_STATE_STARTED) {
+        _activeSipThreshold = _sipThreshold;
+        _activePuffThreshold = _puffThreshold;
+        _activeHardSipThreshold = _hardSipThreshold;
+        _activeHardPuffThreshold = _hardPuffThreshold;
+      }
       // Reset and start the timer
       _sapStateTimer.restartTimer(_sapStateTimerId);  
   }
@@ -819,11 +916,10 @@ void LSPressure::updateState()  //  TODO 2025-Feb-22 This code should be abstrac
   // then averaged the user's applied pressure into neutral. Require the
   // state after this poll to be idle, a fresh sample, and pressure inside
   // the same conservative neutral band used by the collector.
-  float offsetNeutralLimit = min(_sipThreshold, _puffThreshold) * PRESS_OFFSET_NEUTRAL_FRACTION;
-  offsetNeutralLimit = min(offsetNeutralLimit, (float)PRESS_OFFSET_NEUTRAL_MAX_HPA);
+  const float neutralLimitNow = offsetNeutralLimit();
   if(_sapCurrState.secondaryState == PRESS_SAP_SEC_STATE_WAITING
     && _currentSampleValid
-    && fabsf(pressureValue) <= offsetNeutralLimit
+    && fabsf(pressureValue) <= neutralLimitNow
     && _sapStateTimer.elapsedTime(_sapStateTimerId) > PRESS_SAP_ACTION_TIMEOUT) {
       if (_sensorsHealthy) startOffsetUpdate();  // Stepped re-measure (was the blocking updateOffsetPressure()); skipped while unhealthy
       _sapStateTimer.restartTimer(_sapStateTimerId);    // Reset and start the timer
@@ -857,7 +953,7 @@ float LSPressure::getAmbientPressure()
 }
 
 //*********************************//
-// Function   : getAmbientPressure 
+// Function   : getSapPressure 
 // 
 // Description: Get the last pressure difference from the pressure buffer 
 // Arguments :  void
@@ -871,7 +967,7 @@ float LSPressure::getSapPressure()
 
 
 //*********************************//
-// Function   : getAllPressureure 
+// Function   : getAllPressure 
 // 
 // Description: Get the last pressure readings including the main ,reference, and difference pressure values from the pressure buffer 
 // Arguments :  void

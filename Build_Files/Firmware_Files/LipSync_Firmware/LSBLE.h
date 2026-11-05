@@ -425,10 +425,14 @@ bool LSBLEMouse::isConnected(void) {
 
 using namespace Adafruit_LittleFS_Namespace;
 
-// Push change-detect state: 0xFF / -1 sentinels guarantee the first
-// transition after boot pushes (the app may have connected since).
+// Push change-detect state. The CH,5 doctrine (LSScreen's
+// _lastReportedMenuState): the FIRST enumeration after boot PRIMES this
+// state silently — no unsolicited MANUAL lines on a healthy boot (the
+// 4.5.29 wire contract); the app's connect load reads BT,0 for the current
+// truth. Every real change after the prime pushes BT,4/BT,5.
 uint8_t g_btPushedHostCount = 0xFF;
 int g_btPushedActiveRow = -1;
+bool g_btPushedPrimed = false;
 
 bool lsBleStackReady() {
   return !needsInitialization;
@@ -456,13 +460,29 @@ bool lsHostActiveMac(char* out13) {
 }
 
 // Enumerate the bond directory into MAC-sorted rows (the deterministic row
-// order the wire and the Hub page both use). Returns the TOTAL bond count;
-// fills at most cap rows — when more bonds exist than cap, the MAC-lowest
-// `cap` are kept (bounded top-K, so the listed rows are deterministic
-// regardless of filesystem order). Rows carry the sanitized wire name (the
-// lib caches the peer's GAP name in the file at pair time) and the active
-// flag. Local File handles throughout — the 4.5.20 lesson: the shared LSMemory
-// handle must never be touched from here.
+// order the wire and the Hub page both use). Returns the count of rows the
+// wire actually exposes — min(total bonds, cap), the MAC-lowest `cap` when
+// more bonds exist (bounded top-K, so the listed rows are deterministic
+// regardless of filesystem order). The return is CAPPED, never the raw total:
+// every consumer keys row indices and counts off this value, so a 10-bond
+// directory must answer 8 — a count of 10 with only 8 readable rows sent
+// executors indexing rows[] past what this function filled (uninitialized
+// stack read) and promised the app rows the BT,0 getter would refuse. Rows
+// carry the sanitized wire name (the lib caches the peer's GAP name in the
+// file at pair time) and the active flag. Local File handles throughout —
+// the 4.5.20 lesson: the shared LSMemory handle must never be touched from
+// here.
+//
+// CROSS-TASK NOTE (4.8.1 review): this runs on the loop task while the BLE
+// stack's deferred callbacks (bond_save_keys_dfr) write bond files from the
+// core's callback task. That is SAFE at the operation level — the core's
+// Adafruit_LittleFS takes a static FreeRTOS mutex around EVERY public
+// File/FS operation (Adafruit_LittleFS.cpp _lockFS), so lfs itself is never
+// touched concurrently. The 4.5.20 corruption was two tasks interleaving a
+// SEQUENCE of operations through ONE shared File handle — the reason this
+// function (and every BT path) uses only local handles. An enumeration that
+// overlaps a bond write simply sees the directory before or after the
+// commit; the next change-detected pass picks the result up.
 uint8_t lsHostEnumerate(lsHostRow* rows, uint8_t cap) {
   if (rows == NULL || cap == 0) return 0;
   char activeMac[LSHOST_MAC_CHARS + 1];
@@ -473,7 +493,6 @@ uint8_t lsHostEnumerate(lsHostRow* rows, uint8_t cap) {
   if (!dirFile) return 0;
 
   uint8_t filled = 0;
-  uint8_t total = 0;
   File f(InternalFS);
   while ((f = dirFile.openNextFile(FILE_O_READ))) {
     if (f.isDirectory()) { f.close(); continue; }
@@ -492,7 +511,6 @@ uint8_t lsHostEnumerate(lsHostRow* rows, uint8_t cap) {
       if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'))) { macOk = false; break; }
     }
     if (!macOk || stem[LSHOST_MAC_CHARS] != '\0') { f.close(); continue; }
-    total++;
 
     lsHostRow row;
     strncpy(row.mac, stem, LSHOST_MAC_CHARS);
@@ -535,7 +553,9 @@ uint8_t lsHostEnumerate(lsHostRow* rows, uint8_t cap) {
   dirFile.close();
 
   lsHostSortRows(rows, filled);
-  return total;
+  // The wire count is the capped count, never the raw total — see the header
+  // comment. `filled <= cap` by construction.
+  return filled;
 }
 
 bool lsHostDisconnectCurrent() {
@@ -565,7 +585,12 @@ void lsHostEnsureAdvertising() {
 
 // Remove one bond file. The filename keying uses the 6 address BYTES only
 // (bonding.cpp get_fname ignores addr_type), so any type builds the right
-// name; the identity bytes come from the enumerated row.
+// name; the identity bytes come from the enumerated row. 4.8.1: the lib's
+// bond_remove_key returns void and discards InternalFS.remove's result, so
+// it cannot report failure — this wrapper removes explicitly and VERIFIES
+// (absent after = removed), so a failed removal refuses the BT,2/Hub forget
+// (FAIL,3 + named line) instead of acking SUCCESS for a host that is still
+// bonded.
 bool lsHostForgetByMac(const char* mac12) {
   if (mac12 == NULL || strlen(mac12) != LSHOST_MAC_CHARS) return false;
   ble_gap_addr_t id;
@@ -575,16 +600,25 @@ bool lsHostForgetByMac(const char* mac12) {
     char byteStr[3] = { mac12[i * 2], mac12[i * 2 + 1], '\0' };
     id.addr[i] = (uint8_t)strtoul(byteStr, NULL, 16);
   }
-  bond_remove_key(BLE_GAP_ROLE_PERIPH, &id);
-  return true;
+  char fname[48];  // sizeof("/adafruit/bond_prph/%02X%02X%02X%02X%02X%02X") — the lib's get_fname is internal to bonding.cpp, so build the documented name from the public format macro
+  snprintf(fname, sizeof(fname), BOND_FNAME_PRPH,
+           id.addr[0], id.addr[1], id.addr[2], id.addr[3], id.addr[4], id.addr[5]);
+  if (!InternalFS.exists(fname)) return true;  // already absent — forget is idempotent
+  if (!InternalFS.remove(fname)) return false;
+  return !InternalFS.exists(fname);  // verify — a "removed but still there" is a refusal, not a SUCCESS
 }
 
 // The push half of the BT surface (the CH,5 pattern): whenever the host list
-// length or the active row changes, print MANUAL,0:BT,4:<count> /
-// MANUAL,0:BT,5:<activeRow> — MANUAL + seq 0 matches no command waiter
-// (LSScreen.h reportMenuState contract). Called from btFeedbackLoop's
-// connection-transition branch and after a BT,2 forget.
-void lsHostPushState() {
+// length or the active row changes after the boot prime, print
+// MANUAL,0:BT,4:<count> / MANUAL,0:BT,5:<activeRow> — MANUAL + seq 0 matches
+// no command waiter (LSScreen.h reportMenuState contract). Called every
+// btFeedbackLoop pass (1 s) and after a BT,2 forget. The FIRST poll call
+// after boot primes silently (see g_btPushedPrimed): a healthy boot stays
+// silent, and the app's connect load reads BT,0 for the current state.
+// force = true (the forget paths): a BT,2 that lands BEFORE the first poll
+// pass must still deliver its contractual BT,4 — a forced call skips the
+// prime-swallow and pushes the (still-sentinel) changed values.
+void lsHostPushState(bool force) {  // default lives on the LSApiDeclarations.h declaration
   if (needsInitialization) return;
   lsHostRow rows[LSHOST_ENUM_CAP];
   const uint8_t count = lsHostEnumerate(rows, LSHOST_ENUM_CAP);
@@ -592,6 +626,13 @@ void lsHostPushState() {
   for (uint8_t i = 0; i < count && i < LSHOST_ENUM_CAP; i++) {
     if (rows[i].active) { activeRow = i + 1; break; }
   }
+  if (!g_btPushedPrimed && !force) {
+    g_btPushedPrimed = true;
+    g_btPushedHostCount = count;
+    g_btPushedActiveRow = activeRow;
+    return;
+  }
+  g_btPushedPrimed = true;  // a forced first call syncs fully (sentinels still differ -> both lines below fire)
   if (count != g_btPushedHostCount) {
     g_btPushedHostCount = count;
     printResponseInt(true, false, true, 0, "BT,4", true, count);
@@ -613,6 +654,7 @@ void lsHostRefusalLine(String commandKey, int reason, int row) {
     case LSHOST_REFUSE_FROZEN:          line += "a menu transition owns the display — retry in a moment"; break;
     case LSHOST_REFUSE_RANGE:           line += "no such host row (re-read BT,0 after any forget)"; break;
     case LSHOST_REFUSE_ALREADY_ACTIVE:  line += "this host is already the connected one"; break;
+    case LSHOST_REFUSE_RADIO:           line += "the radio refused the operation — retry in a moment"; break;
     default:                            line += "unknown reason"; break;
   }
   serialTxEnqueueLine(line);

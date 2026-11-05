@@ -47,22 +47,19 @@ class LSCircularBuffer {
 };
 
 //*********************************//
-// Function   : LSCircularBuffer 
-// 
-// Description: Construct LSCircularBuffer type with arguments
-// 
-// Arguments :  uint16_t inputSize: number of elements
-// 
+// Function   : LSCircularBuffer
+//
+// Description: Construct LSCircularBuffer. Storage is allocated by begin()
+//              (no-arg ctor: members already value-initialized in-class);
+//              the old inputSize-taking body is retired.
+//
+// Arguments :  void
+//
 // Return     : void
 //*********************************//
 template<typename T>
 LSCircularBuffer<T>::LSCircularBuffer()
 {
-//  cBufferData = new T[inputSize];
-//  cBufferLastPtr = 0;
-//  cBufferElementsUsed = 0;  
-//  cBufferSize = inputSize;
-  
 }
 
 //*********************************//
@@ -154,8 +151,11 @@ T LSCircularBuffer<T>::getElement( uint16_t elementNum )
     return T{};
   }
   // Translate elementNum into terms of cBufferLastPtr.
-  int16_t virtualElementNum;
-  virtualElementNum = cBufferLastPtr - elementNum;
+  // int32 arithmetic (the pointer's own width): an int16 here could go
+  // negative despite the wrap fix below when a future instantiation grows
+  // past 32 K elements and a deep index arrives — the bound then becomes
+  // structural, not size-dependent.
+  int32_t virtualElementNum = cBufferLastPtr - (int32_t)elementNum;
   if( virtualElementNum < 0 ) {
     virtualElementNum += cBufferSize;
   }

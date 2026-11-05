@@ -166,8 +166,11 @@ void LSInput::update() {
       // into inputAllState = x|y — a glitch on jack 1 plus a real press
       // of jack 3 could fire the S13 combo row's START_MENU on release.
       // A sub-reaction press is a GLITCH by this machine's own definition:
-      // discard it. If another input is already down, the WAITING entry
-      // re-arms its fresh STARTED on the next tick.
+      // discard it. This branch is only reached with inputAllState == NONE
+      // (an "another input already down" shape is merged by the
+      // within-reaction branch above) — the WAITING entry is a fresh idle
+      // anchor, and a genuinely held input re-arms its STARTED on the next
+      // tick's branch 1/2 when the still-down input re-merges.
       else if(inputPrevState.secondaryState == INPUT_SEC_STATE_STARTED) {
 
         inputCurrState = {inputAllState, INPUT_SEC_STATE_WAITING, 0};

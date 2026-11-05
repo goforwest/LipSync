@@ -86,7 +86,7 @@ class LSJoystick {
     int getMagnetZDirection();                                            // Get the Z direction of the magnet.
     void setMagnetZDirection();                                           // Update the magnet Z direction variable.
     void setMagnetDirection(int magnetXDirection, int magnetYDirection);  // Set magnet direction based on orientation of magnet (z axis), X and Y direction variables.
-    void setInnerDeadzone(bool deadzoneEnabled,float deadzoneFactor);     // Enable or disable deadzone and set deadzone scale factor (0-100), default 0.12
+    void setInnerDeadzone(bool deadzoneEnabled,float deadzoneFactor);     // Enable or disable the inner deadzone and set its factor (0,1.0); the compiled default is CONF_JOY_DEADZONE_INNER_DEFAULT (0.07) — begin() seeds it via JOY_OUTPUT_DEADZONE_FACTOR (0.05) when no stored value loads
     float getInnerDeadzoneFactor(void);                                   // Get the inner deadzone factor ()
     void setOuterDeadzone(bool upperDeadzoneEnabled,float outerDeadzoneFactor);  // Enable or disable deadzone and set deadzone scale factor  Default 0.95 
     int getOutputRange();                                                 // Get the output range or speed levels.
@@ -310,7 +310,9 @@ bool LSJoystick::begin() {
 //*********************************//
 // Function   : clear 
 // 
-// Description: Clear LSJoystick class
+// Description: Reset the calibration array to {0,0} corners and seed the
+//              raw/input/output sample buffers with one neutral {0,0}
+//              element each.
 // 
 // Arguments :  void
 // 
@@ -512,7 +514,8 @@ void LSJoystick::setInnerDeadzone(bool innerDeadzoneEnabled, float innerDeadzone
 // 
 // Arguments :  void
 // 
-// Return     : deadzoneFactor  : float : deadzoneFactor from 0.01 to 1.0
+// Return     : deadzoneFactor  : float : deadzoneFactor in (0.0, 1.0) — the
+//              enforced range (setInnerDeadzone refuses 0 and >=1)
 //*********************************//
 float LSJoystick::getInnerDeadzoneFactor(void){
   return _innerDeadzoneFactor;  
@@ -627,7 +630,15 @@ int LSJoystick::getMinimumRadius(){
 void LSJoystick::setMinimumRadius(){
   float tempRadius = 0.0;
   pointFloatType tempPoint = {JOY_RAW_XY_MAX, JOY_RAW_XY_MAX};
-  _inputRadius = magnitudePoint(tempPoint, _magnetInputCalibration[0]) / sqrt(2.0);
+  // The INITIAL radius (center-to-{30,30} default distance) needs the same
+  // validity floor as the per-corner loop below: a center genuinely near
+  // {30,30} (or a non-finite one) collapses/contaminates the initial term,
+  // and when no valid corner beats it the degenerate radius stands — the
+  // full-throw/dead-cursor class. The floor keeps the default radius inside
+  // the range the corner guard already treats as meaningful.
+  float initialRadius = magnitudePoint(tempPoint, _magnetInputCalibration[0]) / sqrt(2.0);
+  _inputRadius = (isfinite(initialRadius) && initialRadius >= JOY_MIN_CALIB_RADIUS)
+                     ? initialRadius : (float)JOY_MIN_CALIB_RADIUS;
 
   // Loop through calibration points and calculate the smallest magnitude from center point
   for (int i = 1; i < JOY_CALIBR_ARRAY_SIZE; i++) {
@@ -1133,6 +1144,12 @@ bool LSJoystick::canSkipInputChange(pointFloatType inputPoint) {
   // (4.5.7 review): compare the ARGUMENT, not the member — the only caller
   // passes the same value today, but the function is one call-site change
   // away from comparing the wrong point.
+  // NOTE on abs(): these are FLOAT differences resolved through the
+  // ArduinoCore-API's `using std::abs` overloads (bench-proven live
+  // pipeline). If the core ever resolved abs() to int abs(int), both
+  // differences would truncate to 0 and this gate would silently freeze the
+  // pipeline at out == {0,0} — the exact class fillPipelineDiagnostics
+  // exists to catch. Keep them float-safe if this file ever moves.
   bool skipInputChange = abs(inputPoint.x - prevInputPoint.x) < JOY_INPUT_CHANGE_TOLERANCE
                       && abs(inputPoint.y - prevInputPoint.y) < JOY_INPUT_CHANGE_TOLERANCE;
 
@@ -1283,7 +1300,17 @@ int LSJoystick::mapFloatInt(float input, float inputStart, float inputEnd, int o
   float inputRange = inputEnd - inputStart;
   int outputRange = outputEnd - outputStart;
 
-  if (!isfinite(inputRange) || inputRange == 0.0f) return outputStart;
+  // Degenerate input range: the map carries NO information, so the honest
+  // output is the range MIDPOINT, not outputStart. The only callers map
+  // symmetrically around zero (-radius..radius -> -XY_MAX..XY_MAX, the
+  // cursor-deflection path), where outputStart is FULL THROW (-XY_MAX): a
+  // zero/non-finite _inputRadius (uncalibrated boot with a failed center, a
+  // collapsed radius, an inf center) used to map every reading — including
+  // dead center — to full-throw deflection and raced the cursor to a corner
+  // every 20 ms tick. The midpoint is neutral (0) for that call shape.
+  if (!isfinite(inputRange) || inputRange == 0.0f) {
+    return (outputStart + outputEnd) / 2;
+  }
 
   int output = round((input - inputStart) * outputRange / inputRange + outputStart);
   
@@ -1304,6 +1331,11 @@ int LSJoystick::mapFloatInt(float input, float inputStart, float inputEnd, int o
 // Return     : output : int : Mapped input value 
 //*********************************//
 int LSJoystick::mapRoundInt(int input, int inputStart, int inputEnd, int outputStart, int outputEnd) {
+  // Degenerate input range falls back to outputStart, NOT the midpoint (cf.
+  // mapFloatInt): every caller's outputStart IS the neutral output — the
+  // magnitude map (inner..outer -> 0..XY_MAX) degenerates only when
+  // inner==outer, where 0 = "no deflection" is the safe answer, and the
+  // mouse/gamepad output maps use constant, never-degenerate input ranges.
   if (inputEnd == inputStart) return outputStart;
   int output = round(float(input - inputStart) * float(outputEnd - outputStart) / float(inputEnd - inputStart) + outputStart);
   
@@ -1387,7 +1419,8 @@ int LSJoystick::sgn(float val) {
 //*********************************//
 // Function   : pointIntFromMagnitudeAngle 
 // 
-// Description: The sign of float value ( -1 or +1 )
+// Description: Reconstruct an integer (x,y) point from a magnitude and an
+//              angle (the inverse of the radial-deadzone's polar form).
 // 
 // Arguments :  inputMagnitude : float : Magnitude
 //              inputPointAngle : float : Angle of point

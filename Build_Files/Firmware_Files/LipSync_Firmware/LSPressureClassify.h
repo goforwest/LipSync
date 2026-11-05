@@ -35,7 +35,11 @@
 #define LSPRESSURE_CLASSIFY_HARD_SIP 3
 #define LSPRESSURE_CLASSIFY_HARD_PUFF 4
 
-static const float LSPRESSURE_CLASSIFY_RELEASE_FRACTION = 0.7f;  // CONF_PRESS_RELEASE_FRACTION's value, host-side
+// constexpr (not just const) so LSPressure.h can static_assert the match
+// against CONF_PRESS_RELEASE_FRACTION — the firmware's release boundary and
+// this pure copy must never drift apart (a config change used to silently
+// leave the classifier at its own hand-copied value).
+static constexpr float LSPRESSURE_CLASSIFY_RELEASE_FRACTION = 0.7f;  // CONF_PRESS_RELEASE_FRACTION's value, host-side
 
 static inline int lipsyncClassifySapMainState(
     float pressureValue,

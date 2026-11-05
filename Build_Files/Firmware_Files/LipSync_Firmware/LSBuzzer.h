@@ -201,17 +201,27 @@ void LSBuzzer::update(){
     }
   }
   if (dueIndex == _noteQueueLen) return;
-  if (_noteQueue[dueIndex].frequency != 0) {
+  if (_noteQueue[dueIndex].frequency != 0 && _noteQueue[dueIndex].duration > 0) {
     // A tone fired LATE (after a stall) must still sound for its duration:
-    // reschedule due silences behind it past the tone's actual finish.
+    // reschedule every later entry behind it past the tone's actual finish.
+    // 4.8.1: the original loop rescheduled only frequency==0 (silence)
+    // entries, which protected the trailing-noTone release but NOT a
+    // tone-then-tone pair — a >=250 ms stall made the first tone's fire eat
+    // into its audible length while the second tone still fired on its
+    // original schedule (the ready cue's two notes truncated). Rescheduling
+    // all later entries preserves every note's length under catch-up.
     const unsigned long toneDoneAtMs = millis() + _noteQueue[dueIndex].duration;
     for (uint8_t j = dueIndex + 1; j < _noteQueueLen; j++) {
-      if (_noteQueue[j].frequency == 0 && (long)(_noteQueue[j].fireAtMs - toneDoneAtMs) < 0) {
+      if ((long)(_noteQueue[j].fireAtMs - toneDoneAtMs) < 0) {
         _noteQueue[j].fireAtMs = toneDoneAtMs;
       }
     }
     tone(CONF_BUZZER_PIN, _noteQueue[dueIndex].frequency, _noteQueue[dueIndex].duration);
   } else {
+    // Silence entries — and, defensively, any tone entry with duration 0
+    // (Arduino tone() reads a 0-duration as "no timeout": an indefinite
+    // hold). No shipped caller queues that shape; treating it as silence
+    // keeps the pin's release guarantee structural.
     noTone(CONF_BUZZER_PIN);
   }
   for (uint8_t j = dueIndex; j < _noteQueueLen - 1; j++) {

@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <type_traits>
 
@@ -146,6 +147,55 @@ static void test_pressure_offset_only_accepts_stable_neutral_samples() {
     CHECK(initial.addSample(true, 2.5f) == Filter::COLLECTING);
   }
   CHECK(initial.addSample(true, 2.5f) == Filter::COMPLETE);
+}
+
+// 4.8.1: the boot-baseline magnitude bound. A no-baseline (initial) run whose
+// stable value exceeds the initial magnitude limit is a held gesture (or a
+// shift too large to call neutral) — it must be rejected and retried, never
+// averaged into the boot baseline (a baseline that absorbed a held sip/puff
+// inverts the apparent direction after release: the phantom hold/click class).
+// Established-baseline refreshes are NOT magnitude-bounded — their neutral
+// band already guards them.
+static void test_pressure_offset_boot_baseline_rejects_held_gestures() {
+  using Filter = LSPressureOffsetFilter;
+  Filter filter(5, 5, 0.25f, 3.0f);
+
+  // A stable-but-beyond-limit run is refused sample by sample: the candidate
+  // resets and the window keeps retrying (sensing stays inert).
+  filter.begin(0.0f, false, 0.75f);
+  CHECK(filter.addSample(true, 4.0f) == Filter::COLLECTING);   // beyond limit -> run reset
+  CHECK(filter.addSample(true, 4.0f) == Filter::COLLECTING);
+  CHECK(filter.addSample(true, 4.0f) == Filter::COLLECTING);
+  CHECK(filter.addSample(true, 4.0f) == Filter::COLLECTING);
+  CHECK(filter.addSample(true, 4.0f) == Filter::RETRYING_INITIAL);
+  CHECK(filter.isRunning());  // still collecting — release re-opens collection
+  // The user releases: a stable within-limit run now completes.
+  for (int i = 0; i < 4; ++i) {
+    CHECK(filter.addSample(true, 0.5f) == Filter::COLLECTING);
+  }
+  CHECK(filter.addSample(true, 0.5f) == Filter::COMPLETE);
+  CHECK(!filter.isRunning());
+  CHECK(filter.resultOffset() > 0.49f && filter.resultOffset() < 0.51f);
+
+  // The bound applies only to the initial path: an established baseline
+  // refresh still accepts a stable correction within its neutral band even
+  // when that band sits beyond the initial limit.
+  Filter refresh(5, 10, 0.25f, 3.0f);
+  refresh.begin(2.50f, true, 0.75f);
+  CHECK(refresh.addSample(true, 2.60f) == Filter::COLLECTING);
+  CHECK(refresh.addSample(true, 2.58f) == Filter::COLLECTING);
+  CHECK(refresh.addSample(true, 2.62f) == Filter::COLLECTING);
+  CHECK(refresh.addSample(true, 2.59f) == Filter::COLLECTING);
+  CHECK(refresh.addSample(true, 2.61f) == Filter::COMPLETE);
+
+  // A limit of 0 disables the bound (the legacy shape the older tests pin).
+  Filter unbounded(5, 5, 0.25f, 0.0f);
+  unbounded.begin(0.0f, false, 0.75f);
+  for (int i = 0; i < 4; ++i) {
+    CHECK(unbounded.addSample(true, 6.0f) == Filter::COLLECTING);
+  }
+  CHECK(unbounded.addSample(true, 6.0f) == Filter::COMPLETE);
+  CHECK(unbounded.resultOffset() > 5.99f && unbounded.resultOffset() < 6.01f);
 }
 
 static void drain_queue(LSSerialTxQueue<32>& queue, char* output, size_t& length, size_t chunkLimit) {
@@ -404,6 +454,40 @@ static void test_host_forget_decision_allows_active() {
   CHECK(lsHostForgetDecision(&st, 1) == LSHOST_ALLOW);
 }
 
+// 4.8.1: row-identity verification. Rows are MAC-sorted and RENUMBER when the
+// bond set changes, so the menu paths capture a row's MAC at render and verify
+// it at execution — a stale index must refuse, never hit the wrong host (for a
+// forget that means erasing the wrong bond). NULL/empty expected means the
+// serial index contract: no check.
+static void test_host_row_identity_matches() {
+  lsHostRow row;
+  std::strcpy(row.mac, "A1B2C3D4E5F6");
+  std::strcpy(row.name, "Laptop");
+  row.lastMacByte = 0xF6;
+  row.active = 0;
+
+  // Exact match (12 hex chars + NUL) verifies.
+  CHECK(lsHostRowIdentityMatches(&row, "A1B2C3D4E5F6") == 1);
+
+  // A renumbered table presents a DIFFERENT mac at the same index — mismatch.
+  CHECK(lsHostRowIdentityMatches(&row, "A1B2C3D4E5FF") == 0);
+  CHECK(lsHostRowIdentityMatches(&row, "B1B2C3D4E5F6") == 0);
+
+  // No identity captured: NULL or empty means "no check" (serial path).
+  CHECK(lsHostRowIdentityMatches(&row, (const char*)0) == 1);
+  CHECK(lsHostRowIdentityMatches(&row, "") == 1);
+
+  // A too-short capture is a mismatch, not a prefix match.
+  CHECK(lsHostRowIdentityMatches(&row, "A1B2C3D4E5F") == 0);
+
+  // A NULL row with a real expected identity is a mismatch.
+  CHECK(lsHostRowIdentityMatches((const lsHostRow*)0, "A1B2C3D4E5F6") == 0);
+
+  // Uppercase hex is the on-disk convention (bonding.cpp %02X): lowercase is
+  // NOT the same identity.
+  CHECK(lsHostRowIdentityMatches(&row, "a1b2c3d4e5f6") == 0);
+}
+
 int main() {
   static_assert(!std::is_copy_constructible<LSCircularBuffer<int>>::value,
                 "owning circular buffers must not be shallow-copyable");
@@ -414,6 +498,7 @@ int main() {
   test_order_clamping_clear_and_rebegin();
   test_pressure_engagement_rejects_single_sample_spikes();
   test_pressure_offset_only_accepts_stable_neutral_samples();
+  test_pressure_offset_boot_baseline_rejects_held_gestures();
   test_serial_queue_never_truncates_an_inflight_line();
   test_hard_band_classification_semantics();
   test_host_name_sanitization();
@@ -421,6 +506,7 @@ int main() {
   test_host_oled_label_and_overflow();
   test_host_switch_decision_precedence();
   test_host_forget_decision_allows_active();
+  test_host_row_identity_matches();
 
   std::printf("%d checks, %d failures\n", checks, failures);
   return failures == 0 ? 0 : 1;

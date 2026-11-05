@@ -16,8 +16,8 @@
   If not, see <http://www.gnu.org/licenses/>
 */
 
-#include "Adafruit_TinyUSB.h"
 #pragma once
+#include "Adafruit_TinyUSB.h"
 
 #define ATTRIBUTE_PACKED  __attribute__((packed, aligned(1)))
 
@@ -59,6 +59,7 @@ class LSUSBMouse {
     bool _clickPending = false;
     bool _clickPressedSent = false;
     uint8_t _clickButton = 0;
+    bool _unmountedWithButtonState = false;  // set by service()'s unmount cleanup, consumed once by the loop (see takeUnmountedWithButtonState)
   public:
     inline LSUSBMouse(void);
     inline void begin(void);
@@ -69,6 +70,11 @@ class LSUSBMouse {
     inline void scroll(signed char wheel = 0);
     inline void pan(signed char pan = 0); 
     inline void service(void);                    // Flush queued button/click state without relying on joystick movement
+    inline bool takeUnmountedWithButtonState(void) {  // take-and-clear: the USB host went away while this object still held click/drag state
+      const bool v = _unmountedWithButtonState;
+      _unmountedWithButtonState = false;
+      return v;
+    }
     inline void click(uint8_t b = MOUSE_LEFT);
     inline void press(uint8_t b = MOUSE_LEFT);     // press LEFT by default
     inline void release(uint8_t b = MOUSE_LEFT);   // release LEFT by default
@@ -156,9 +162,9 @@ class LSUSBGamepad {
     inline void release(uint8_t b);
     inline void releaseAll(void);
     inline void buttons(uint8_t b);
-    inline void xAxis(uint8_t a);
-    inline void yAxis(uint8_t a);
-    inline void move(uint8_t x,uint8_t y);
+    inline void xAxis(int a);   // -127..127; 128-center offset, clamped — the uint8_t form depended on modular wrap to sign-correct
+    inline void yAxis(int a);
+    inline void move(int x, int y);
     inline bool isReady(void);
     inline bool isConnected(void);
     bool usbRetrying = false;
@@ -329,8 +335,23 @@ void LSUSBMouse::service(void)
   if (!_clickPending && !_buttonStatePending && _buttons == 0) return;
   // A USB disconnect releases state at the old host. Clear both queued click
   // phases and settled button state before the fast return so a drag cannot
-  // be replayed as a fresh press after re-enumeration.
+  // be replayed as a fresh press after re-enumeration. 4.8.1: raise the
+  // take-and-clear flag when button state was actually held — the loop
+  // consumer ends the DRAG mode latch with it. usbCheckConnection's
+  // not-ready branch misses a fast unmount->remount that completes between
+  // its one-second checks (it only sees the healthy remounted bus), which
+  // used to leave outputAction == DRAG latched with the wire button gone:
+  // movement reported as plain cursor motion, no drag, until the user
+  // happened to release. (The BLE mirror is btFeedbackLoop's "never carry a
+  // drag/scroll latch across hosts".) A SCROLL hold carries NO wire button
+  // state, reaches the old host through the still-legal scroll reports, and
+  // legitimately continues while the user keeps holding — the latch ending
+  // at the input release is correct for scroll, so this flag is raised only
+  // for button-carrying state.
   if (!USBDevice.mounted()) {
+    if (_buttons != 0 || _clickPending || _buttonStatePending) {
+      _unmountedWithButtonState = true;
+    }
     _buttons = 0;
     _buttonStatePending = false;
     _clickPending = false;
@@ -558,21 +579,23 @@ void LSUSBGamepad::buttons(uint8_t b)
 }
 
 
-void LSUSBGamepad::xAxis(uint8_t a)
+void LSUSBGamepad::xAxis(int a)
 {
-  _report.xAxis = 128 + a;
+  // Centered HID axis: 128 + (-127..127), clamped — no reliance on uint8_t
+  // modular wrap to sign-correct the caller's value.
+  _report.xAxis = (uint8_t)(128 + constrain(a, -127, 127));
 }
 
 
-void LSUSBGamepad::yAxis(uint8_t a)
+void LSUSBGamepad::yAxis(int a)
 {
-  _report.yAxis = 128 + a;
+  _report.yAxis = (uint8_t)(128 + constrain(a, -127, 127));
 }
 
-void LSUSBGamepad::move(uint8_t x,uint8_t y)
+void LSUSBGamepad::move(int x, int y)
 {
-  _report.xAxis = 128 + x;
-  _report.yAxis = 128 + y;
+  xAxis(x);
+  yAxis(y);
 }
 
 bool LSUSBGamepad::isReady(void)
@@ -583,9 +606,8 @@ bool LSUSBGamepad::isReady(void)
 }
 
 bool LSUSBGamepad::isConnected(void) {
-  	if (usb_hid.ready()) { 
-	    return true;
-    } else {
-      return false;
-    }	
+  // Mirror the mouse (4.8.1 review): a suspended bus is not a connected one —
+  // BH's health field and any isConnected-keyed logic must not report
+  // "connected" while the host has suspended the link.
+  return usb_hid.ready() && !USBDevice.suspended();
 }

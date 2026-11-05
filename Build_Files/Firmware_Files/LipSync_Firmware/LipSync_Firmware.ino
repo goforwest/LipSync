@@ -241,10 +241,15 @@ void initHangWitness() {
   // = 4-7" model) blocked sd_softdevice_enable with 0x1001 on every BLE
   // boot since 4.5.10, when the BLE init moved AFTER the witness arms.
   // Priority 7 is legal under BOTH models (classic 4-7 and the confirmed
-  // {0,1,4}-reserved), never masked by FreeRTOS's BASEPRI=2 critical
-  // sections, and still preempts any thread-mode hang — the witness's
-  // actual job. USB-only boots (SD never comes up) keep priority 0 for
-  // the freeze hunt.
+  // {0,1,4}-reserved). MASKING TRUTH (4.8.1 comment fix): a FreeRTOS
+  // critical section at BASEPRI=2 DOES mask numeric priorities >= 2 — a
+  // hang inside a held critical section is unwitnessed and dies on the
+  // 30 s hardware DOG (pt=0) instead of the ~4 s witnessed SREQ; the
+  // witness's pm=1/pm=0 split still names which class happened. What
+  // priority 7 guarantees is preemption of any ordinary thread-mode hang
+  // (BASEPRI = 0 there) — the witness's actual job — plus legality under
+  // both priority models. USB-only boots (SD never comes up) keep priority
+  // 0 for the freeze hunt.
   NVIC_SetPriority(TIMER3_IRQn, (needsInitialization && !g_bleInitPending) ? 0 : 7);
   NVIC_ClearPendingIRQ(TIMER3_IRQn);
   NVIC_EnableIRQ(TIMER3_IRQn);
@@ -392,7 +397,7 @@ extern "C" __attribute__((naked)) void HardFault_Handler(void) {
 // window is a no-op window, not a fault window.
 volatile int g_bleInitStage = 0;                 // 4.5.11: init-task progress/failure stage (see LSApiDeclarations.h)
 volatile int8_t g_bleSdWasEnabled = -1;          // 4.5.13: the init task's SD probe: -1 = not probed yet, 0 = the SoftDevice was down (normal), 1 = it was ALREADY enabled when the app started (bootloader leftover — see LSBLE.h)
-volatile bool g_softDeviceEnabled = false;      // 4.5.27: THE SoftDevice is up (set right after Bluefruit.begin() succeeds) — every retention-register access routes through the SD SVCs while this is true; see LSApiDeclarations.h          // 4.5.13: the init task's SD probe: -1 = not probed yet, 0 = the SoftDevice was down (normal), 1 = it was ALREADY enabled when the app started (bootloader leftover — see LSBLE.h)
+volatile bool g_softDeviceEnabled = false;      // 4.5.27: THE SoftDevice is up (set right after Bluefruit.begin() succeeds) — every retention-register access routes through the SD SVCs while this is true; see LSApiDeclarations.h
 volatile bool g_bleInitWindow = false;          // 4.6.6: the BLE init task raises this for the duration of Bluefruit.begin() — see lipsyncRetentionUnsafe() in LSApiDeclarations.h
 volatile uint8_t g_bleProbeStep = 0;             // 4.5.14: the begin()-mirror probe's first failing call (0 = not run/non-BLE, 1..10 = that call failed, 11 = all passed) — see LSBLE.h
 volatile uint32_t g_bleProbeCode = 0;            // 4.5.14: the failing call's SoftDevice error code (0 = none)
@@ -459,10 +464,11 @@ void bleVerdictPersist() {  // LOOP-CONTEXT ONLY (see the 4.5.21 note above)
 void bleVerdictConsume() {
   g_blePrevSt = -1;  // absent until proven present
   g_blePrevRc = 0;
-  if (file.open(BLE_VERDICT_FILE, FILE_O_READ)) {
+  File verdictFile(InternalFS);  // its own handle — never the shared settings object (the 4.5.21 single-task-FS rule)
+  if (verdictFile.open(BLE_VERDICT_FILE, FILE_O_READ)) {
     uint8_t rec[8];
-    const size_t n = file.read(rec, sizeof(rec));
-    file.close();
+    const size_t n = verdictFile.read(rec, sizeof(rec));
+    verdictFile.close();
     if (n == sizeof(rec) && rec[0] == 0xB5 && rec[7] == 0xA5) {
       g_blePrevSt = (int8_t)rec[1];
       g_blePrevRc = (uint16_t)rec[4] | ((uint16_t)rec[5] << 8);
@@ -832,11 +838,13 @@ void setup() {
   }
 
 
-  //enablePoll(true);
+  // (enablePoll(true) — removed 4.8.1 with the function; setup's explicit
+  // per-poll registration/enable below is the single source of truth.)
 
   ledActionEnabled = true;
 
-  //ledReadyFeedback();
+  // (ledReadyFeedback() — removed 4.8.1 with the function; the ready cue is
+  // the buzzer's playReadySound plus the LED defaults.)
 
   if (g_displayConnected) {
     pollTimer.enable(pollTimerId[CONF_TIMER_SCREEN]);
@@ -885,7 +893,8 @@ void setup() {
   // after any sound, on every boot. Same cues for the user, no overlap.
   ledWaitFeedback();  // Turn on all LEDS (moved from before checkI2C — see above)
 
-  //handleHardwareErrors(); // Currently not implemented
+  // (handleHardwareErrors() — removed 4.8.1 with the empty function; the
+  // real hardware-error handling is checkI2C + checkSafeMode + BH.)
 
   toggleSafeMode(g_safeModeEnabled);
 
@@ -989,6 +998,21 @@ void loop() {
   usbmouse.service();
   btmouse.service();
   gamepad.service();
+
+  // 4.8.1: the mouse's unmount cleanup raised its take-and-clear flag — the
+  // USB host went away while click/drag state was held. End the DRAG mode
+  // latch the same way btFeedbackLoop does for a BLE host change ("never
+  // carry a drag/scroll latch across hosts"): usbCheckConnection's not-ready
+  // branch misses a fast unmount->remount between its checks, and without
+  // this the latch survived with the wire button already cleared. No
+  // action-bearing event is emitted — the hold simply ends. (The scroll
+  // latch is deliberately NOT ended here: a scroll hold carries no wire
+  // button state — see LSUSBMouse::service's unmount comment — and ends at
+  // the input release as usual.)
+  if (usbmouse.takeUnmountedWithButtonState()
+      && (outputAction == CONF_ACTION_DRAG || outputAction == CONF_ACTION_SCROLL)) {
+    releaseOutputAction();
+  }
 
   // Degraded-state heartbeat (bench 2026-10-18, boot-with-unseated-cable
   // forensics): a 4.5.0 boot with the interface cable unseated reset at an
@@ -1230,18 +1254,9 @@ void hardwareErrorCheck(void) {
 }
 
 
-//***HANDLE HARDWARE ERRORS ***//
-// Function   : handleHardwareErrors
-//
-// Description: This function handles hardware errors
-//
-// Parameters : void
-//
-// Return     : void
-//****************************************//
-void handleHardwareErrors(void) {
-  
-}
+// (handleHardwareErrors REMOVED — 4.8.1 review: an empty body whose only
+// call was commented out ("Currently not implemented"). The real hardware
+// error handling is checkI2C + checkSafeMode + the BH health fields.)
 
 
 //***ERROR CHECK FUNCTION***//
@@ -1458,33 +1473,11 @@ void readyToUse(void) {
   }
 }
 
-//***ENABLE POLL FUNCTION***//
-// Function   : enablePoll
-//
-// Description: This function enables polling by enabling poll timers. It can be used to disable main features
-//              during initialization.
-//
-// Parameters : isEnabled : bool : enable polling if it's True
-//
-// Return     : void
-//****************************************//
-void enablePoll(bool isEnabled) {
-  if (USB_DEBUG) { Serial.println("USBDEBUG: enablePoll()"); }
-
-  if (isEnabled) {
-    getDebugMode(false, false);
-    pollTimer.enable(pollTimerId[CONF_TIMER_PRESSURE]);
-    pollTimer.enable(pollTimerId[CONF_TIMER_INPUT]);
-    pollTimer.enable(pollTimerId[CONF_TIMER_BLUETOOTH]);
-  } else {
-    pollTimer.disable(pollTimerId[CONF_TIMER_JOYSTICK]);
-    pollTimer.disable(pollTimerId[CONF_TIMER_PRESSURE]);
-    pollTimer.disable(pollTimerId[CONF_TIMER_INPUT]);
-    pollTimer.disable(pollTimerId[CONF_TIMER_BLUETOOTH]);
-    pollTimer.disable(pollTimerId[CONF_TIMER_DEBUG]);
-    pollTimer.disable(pollTimerId[CONF_TIMER_SCROLL]);
-  }
-}
+// (enablePoll REMOVED — 4.8.1 review: its only call site was the removed
+// dead ledIBMEffect (plus a commented-out one). It force-enabled
+// PRESSURE/INPUT/BLUETOOTH polls with no safe-mode or debug-mode gate — the
+// exact wrong-re-enable class the poll restore paths now gate individually.
+// Safe mode and setDebugState own the poll enables.)
 
 //*********************************//
 // Memory Functions
@@ -2074,7 +2067,9 @@ void initOperatingMode() {
   // tick. Out of range falls back to the default mouse mode.
   if ((g_operatingMode < CONF_OPERATING_MODE_MIN) || (g_operatingMode > CONF_OPERATING_MODE_SETTABLE_MAX)) {
     g_operatingMode = CONF_OPERATING_MODE_DEFAULT;  // also catches a stored SAFE(3) — not a valid boot mode (4.5.7 review)
-    mem.writeInt(CONF_SETTINGS_FILE, "OM", g_operatingMode);
+    if (mem.isLastReadOk()) {  // boot-path heal: a transient failed read is 0 too — never rewrite the stored mode from it (the getModelNumber pattern; the getOperatingMode fix's boot-side twin)
+      mem.writeInt(CONF_SETTINGS_FILE, "OM", g_operatingMode);
+    }
   }
 
 }
@@ -2414,11 +2409,13 @@ void applyHardBandActionOverrides() {
     if (sapActionProperty[i].inputActionState == PRESS_SAP_MAIN_STATE_HARD_PUFF) hardPuffRow = i;
   }
   int ha = mem.readInt(CONF_SETTINGS2_FILE, "HA");
+  const bool haReadOk = mem.isLastReadOk();  // a failed read yields 0 = NOTHING, which is allowlisted — applying it would silence the band while the file still holds the real action (and the setter just acked SUCCESS: the live-apply path must not act on a failed read)
   int hb = mem.readInt(CONF_SETTINGS2_FILE, "HB");
-  if (hardSipRow >= 0 && switchRemapAllowed(ha, false)) {
+  const bool hbReadOk = mem.isLastReadOk();
+  if (hardSipRow >= 0 && haReadOk && switchRemapAllowed(ha, false)) {
     g_sapActionTable[hardSipRow].mouseOutputActionNumber = (uint8_t)ha;
   }
-  if (hardPuffRow >= 0 && switchRemapAllowed(hb, false)) {
+  if (hardPuffRow >= 0 && hbReadOk && switchRemapAllowed(hb, false)) {
     g_sapActionTable[hardPuffRow].mouseOutputActionNumber = (uint8_t)hb;
   }
 }
@@ -3273,18 +3270,9 @@ void gamepadButtonPress(int buttonNumber) {
   }
 }
 
-//***GAMEPAD BUTTON CLICK FUNCTION***//
-// Function   : gamepadButtonClick
-//
-// Description: This function performs button click action.
-//
-// Parameters : int : buttonNumber
-//
-// Return     : void
-//****************************************//
-void gamepadButtonClick(int buttonNumber) {
-  gamepadButtonPress(buttonNumber);
-}
+// (gamepadButtonClick REMOVED — 4.8.1 review: dead code, no callers; it
+// only forwarded to gamepadButtonPress, a second name for the same entry
+// point waiting to drift.)
 
 //***GAMEPAD BUTTON RELEASE FUNCTION***//
 // Function   : gamepadButtonRelease
@@ -3386,7 +3374,7 @@ void performJoystickCenter(int* args) {
   // (500 + 150*3) - time until start of current reading.
   unsigned long currentReadingStart = CONF_JOY_INIT_START_DELAY + (CONF_JOY_INIT_STEP_BLINK_DELAY * ((CONF_JOY_INIT_STEP_BLINK * 2) + 1));
 
-  // Time until start of next step. (1450 seconds )
+  // Time until start of next step. (milliseconds: readingDelay x readings)
   unsigned long nextStepStart = currentReadingStart + readingDuration;
 
   pointFloatType centerPoint;
@@ -3530,10 +3518,14 @@ void abortJoystickCalibration(bool calibFromApi, const char* reason) {
   pollTimer.enable(pollTimerId[CONF_TIMER_INPUT]);
   if (!g_safeModeEnabled) {
     screen.enableTimeout();
-    if (outputAction == CONF_ACTION_SCROLL) {
+    // Restore the swap with the same debug gate the swap itself uses (the
+    // 4.6.6 DM=1 contract): a DM=1 debug stream owns the joystick poll, so
+    // the calibration must not silently re-enable it alongside the debug
+    // poll (the double-polled sensor + surprise cursor output class).
+    if (outputAction == CONF_ACTION_SCROLL && g_debugMode != CONF_DEBUG_MODE_JOYSTICK) {
       pollTimer.disable(pollTimerId[CONF_TIMER_JOYSTICK]);
       pollTimer.enable(pollTimerId[CONF_TIMER_SCROLL]);
-    } else {
+    } else if (g_debugMode != CONF_DEBUG_MODE_JOYSTICK) {
       pollTimer.enable(pollTimerId[CONF_TIMER_JOYSTICK]);
       pollTimer.disable(pollTimerId[CONF_TIMER_SCROLL]);
     }
@@ -3580,8 +3572,8 @@ void performJoystickCalibration(int* args) {
   // Time until start of current reading
   unsigned long currentReadingStart = CONF_JOY_CALIB_STEP_DELAY + (CONF_JOY_CALIB_STEP_BLINK_DELAY * ((CONF_JOY_CALIB_STEP_BLINK * 2) + 1));
 
-  // Time until start of next step. (1.5 + (3*300) seconds )
-  unsigned long nextStepStart = currentReadingStart + readingDuration + CONF_JOY_CALIB_START_DELAY;  // Time until start of next step. ( 2.4 + 2 + 1 seconds )
+  // Time until start of next step (milliseconds: currentReadingStart + readingDuration + CONF_JOY_CALIB_START_DELAY)
+  unsigned long nextStepStart = currentReadingStart + readingDuration + CONF_JOY_CALIB_START_DELAY;  // Time until start of next step (ms)
 
   if (stepNumber == 0) {                     // STEP 0: Calibration started
     // (g_calibrationRunning was set at chain acceptance — see setJoystickCalibration)
@@ -3671,10 +3663,12 @@ void performJoystickCalibration(int* args) {
       // against whatever hardware toggleSafeMode shut down, and re-arm the
       // 5-minute timeout the safe menu deliberately disables.
       screen.enableTimeout();  // The run may have been menu-driven — see step 0
-      if (outputAction == CONF_ACTION_SCROLL) {
+      // Restore the swap with the same debug gate the swap itself uses (the
+      // 4.6.6 DM=1 contract — see abortJoystickCalibration's matching fix).
+      if (outputAction == CONF_ACTION_SCROLL && g_debugMode != CONF_DEBUG_MODE_JOYSTICK) {
         pollTimer.disable(pollTimerId[CONF_TIMER_JOYSTICK]);
         pollTimer.enable(pollTimerId[CONF_TIMER_SCROLL]);
-      } else {
+      } else if (g_debugMode != CONF_DEBUG_MODE_JOYSTICK) {
         pollTimer.enable(pollTimerId[CONF_TIMER_JOYSTICK]);
         pollTimer.disable(pollTimerId[CONF_TIMER_SCROLL]);
       }
@@ -3694,6 +3688,11 @@ void performJoystickCalibration(int* args) {
 // Return     : void
 //****************************************//
 void performJoystickCalibrationStep(int* args) {
+  // The run gate its chain driver has (the abortJoystickCalibration comment):
+  // a stale corner callback must become a no-op rather than revive a failed
+  // flow — this body persists a corner, acks it on the wire, and can abort
+  // the chain, none of which may happen for an already-aborted calibration.
+  if (!g_calibrationRunning) return;
   // See performJoystickCalibration(): the payload carries this chain's
   // initiator alongside the step number — the corner line is an ack (SUCCESS)
   // only when the serial API started the calibration, MANUAL otherwise.
@@ -4049,7 +4048,15 @@ void setDebugState(int inputDebugMode) {
 
   if (inputDebugMode == CONF_DEBUG_MODE_NONE) {
     pollTimer.disable(pollTimerId[CONF_TIMER_DEBUG]);
-  } else {
+  } else if (!g_safeModeEnabled) {
+    // Safe-mode gate (4.8.1 review): toggleSafeMode deliberately shuts the
+    // DEBUG poll down (initDebug ran BEFORE it, so the safe boot won); the
+    // API is not filtered by safe mode, so an ungated enable here would let
+    // a serial DM,1..5 re-arm a 100 ms poll against hardware the safe boot
+    // deliberately stopped touching (sensorless boots: js is never begun —
+    // the same class the joystick restore below gates on g_safeModeEnabled).
+    // A debug stream on the CDC-only recovery surface is also pure noise
+    // for the caregiver using it.
     pollTimer.enable(pollTimerId[CONF_TIMER_DEBUG]);
   }
 
@@ -4188,21 +4195,9 @@ void ledWaitFeedback() {
   performLedAction(ledCurrentState);
 }
 
-//***LED READY FEEDBACK FUNCTION***//
-// Function   : ledReadyFeedback
-//
-// Description: This function sets the LEDS to cue the user to wait for initialization.
-//
-// Parameters : void
-//
-// Return     : void
-//****************************************//
-void ledReadyFeedback() {
-  if (USB_DEBUG) { Serial.println("USBDEBUG: ledReadyFeedback"); }
-  setLedState(LED_ACTION_OFF, LED_CLR_NONE, CONF_LED_ALL, 0, 0, led.getLedBrightness());    // Turn off all LEDS
-  setLedState(LED_ACTION_ON, LED_CLR_GREEN, CONF_LED_MICRO, 0, 0, led.getLedBrightness());  // Turn micro LED green
-  performLedAction(ledCurrentState);
-}
+// (ledReadyFeedback REMOVED — 4.8.1 review: dead code, its only call is
+// commented out at the setup call site; the ready cue is the buzzer's
+// playReadySound plus the LED defaults. Restore only with a real consumer.)
 
 //***STARTUP INITIALIZATION LED FUNCTION***//
 // Function   : startupFeedback
@@ -4248,58 +4243,16 @@ void setLedState(int ledAction, int ledColorNumber, int ledNumber, int ledBlinkN
 }
 
 
-//***LED STARTUP EFFECT FUNCTION***//
-// Function   : ledStartupEffect
-//
-// Description: This function performs the Startup LED effect based on step number.
-//
-// Parameters : args : ledStateStruct* : It includes step number.
-//
-// Return     : void
-//****************************************//
-void ledStartupEffect(ledStateStruct* args) {
+// (ledStartupEffect and ledIBMEffect REMOVED — 4.8.1 review: dead code.
+// ledStartupEffect was entirely commented out; ledIBMEffect had no callers
+// and was a wrong-re-enable hazard if ever rewired — its end branch called
+// enablePoll(true), force-enabling PRESSURE/INPUT/BLUETOOTH polls while
+// ignoring safe mode AND debug mode (the exact "re-enable polls wrongly"
+// class the rest of this file keeps gating), and it re-armed from the
+// SHARED ledCurrentState (the mid-run hijack the blinkStateSnapshot fix
+// removed for blinks). CONF_TIMER_LED_IBM's slot holder stays; the id
+// remains -1 forever. Restore only with a real consumer and its own gates.)
 
-
-
-  // setLedState(LED_ACTION_ON,
-  //             ledActionProperty[tempActionIndex].ledStartColor,
-  //             ledActionProperty[tempActionIndex].ledNumber,
-  //             0,                     // number of blinks
-  //             0,                     // blink time
-  //             CONF_LED_BRIGHTNESS);  // brightness
-  // // Perform led action
-  // performLedAction(ledCurrentState);
-
-  // if (args->ledColorNumber < MAX_LED_COLORS) {
-  //   led.setLedColor(args->ledNumber, args->ledColorNumber, args->ledBrightness);
-  //   setLedState(args->ledAction, (args->ledColorNumber) + 1, args->ledNumber, args->ledBlinkNumber, (args->ledBlinkTime), args->ledBrightness);
-  //   ledTimerId[CONF_TIMER_LED_STARTUP] = ledStateTimer.setTimeout(ledCurrentState->ledBlinkTime, ledStartupEffect, ledCurrentState);
-  // } else if (args->ledColorNumber == MAX_LED_COLORS) {
-  //   ledActionEnabled = true;
-  //   enablePoll(true);
-  // }
-}
-
-//***LED IBM EFFECT FUNCTION***//
-// Function   : ledIBMEffect
-//
-// Description: This function performs the IBM LED effect based on step number.
-//
-// Parameters : args : ledStateStruct* : It includes step number.
-//
-// Return     : void
-//****************************************//
-void ledIBMEffect(ledStateStruct* args) {
-  const int MAX_LED_COLORS = 7;
-  if (args->ledColorNumber < MAX_LED_COLORS) {
-    led.setLedColor(args->ledNumber, args->ledColorNumber, args->ledBrightness);
-    setLedState(args->ledAction, (args->ledColorNumber) + 1, args->ledNumber, args->ledBlinkNumber, (args->ledBlinkTime), args->ledBrightness);
-    ledTimerId[CONF_TIMER_LED_IBM] = ledStateTimer.setTimeout(ledCurrentState->ledBlinkTime, ledIBMEffect, ledCurrentState);
-  } else if (args->ledColorNumber == MAX_LED_COLORS) {
-    ledActionEnabled = true;
-    enablePoll(true);
-  }
-}
 
 //***LED BLINK EFFECT FUNCTION***//
 // Function   : ledBlinkEffect
@@ -4440,7 +4393,7 @@ void turnLedOff(ledStateStruct* args) {
 }
 
 //***TURN LED ON FUNCTION***//
-// Function   : turnLedOff
+// Function   : turnLedOn
 //
 // Description: This function turns on the specified LED based on led number passed by arguments.
 //
@@ -4600,16 +4553,27 @@ void btFeedbackLoop() {
         ledTimerId[CONF_TIMER_LED_BT] = -1;
       }
       led.setLedColor(CONF_BT_LED_NUMBER, LED_CLR_BLUE, led.getLedBrightness());
-      lsHostPushState();  // #16: the app's host list/active marker follows every connect (BT,5; BT,4 if a pair landed)
     } else {
       if (ledTimerId[CONF_TIMER_LED_BT] >= 0) {
         ledStateTimer.deleteTimer(ledTimerId[CONF_TIMER_LED_BT]);
         ledTimerId[CONF_TIMER_LED_BT] = -1;
       }
       setLedDefault();
-      lsHostPushState();  // #16: same on the disconnect transition (BT,5:0; the list count only changes if a host was forgotten)
     }
   }
+
+  // #16: the app's host list/active marker (BT,4/BT,5) is change-detected, so
+  // this runs EVERY pass, not only on connect/disconnect transitions. The
+  // transition-only shape left the app stale for the two events that land
+  // AFTER the connect transition: a first pairing writes the bond file in the
+  // lib's deferred callback (seconds after CONNECTED), and a reconnect's
+  // bonding completes at CONN_SEC_UPDATE (also after the CONNECTED event) —
+  // both were only picked up on the NEXT transition. The per-pass enumeration
+  // is one LittleFS directory read over <=8 entries at the 1 s poll rate; the
+  // boot prime keeps the first pass silent, and the change-detect keeps every
+  // pass after it silent until something actually changes (the 4.5.29
+  // healthy-boots-print-nothing contract; the CH,5 pattern).
+  lsHostPushState();
 
   //if (USB_DEBUG) { Serial.println("USBDEBUG: end of btFeedbackLoop"); }
 }

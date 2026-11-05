@@ -10,6 +10,25 @@
 // initial boot measurement has no reference against which activity can be
 // distinguished, but it still requires a complete, consecutive stable run;
 // partial or changing readings are never averaged into a baseline.
+//
+// 4.8.1 (boot-baseline magnitude bound): the no-baseline path additionally
+// refuses any candidate sample whose |rawDifference| exceeds an initial
+// magnitude limit — a STEADY held gesture is indistinguishable from a stable
+// neutral by the stability test alone, and a boot baseline that absorbed a
+// held sip/puff inverts the apparent direction after release (the phantom
+// hold/click class). The limit sits at/under the DEFAULT compiled regular
+// threshold: any hold strong enough to matter is rejected and collection
+// keeps retrying — the user only has to stop pressing for one bounded window
+// after boot — while an absorbed sub-limit hold at default thresholds cannot
+// fire a phantom ACTION. RESIDUAL (exact, not overstated): with a user
+// threshold lowered BELOW the absorbed magnitude (the API floor is 2.0 hPa)
+// an absorbed sub-3.0 hold can still shift neutral past the lowered
+// threshold; that state is bounded, named on the wire by the once-a-minute
+// ERROR line, and cleared by a reboot at neutral. The limit is a hardware
+// plausibility ceiling, deliberately NOT tied to the live thresholds: a
+// caregiver lowering a threshold must never be able to push the boot
+// baseline below the sensor pair's legitimate inter-sensor bias and strand
+// sensing (RETRYING_INITIAL forever).
 class LSPressureOffsetFilter {
   public:
     enum Result : uint8_t {
@@ -23,10 +42,12 @@ class LSPressureOffsetFilter {
 
     LSPressureOffsetFilter(uint8_t requiredSamples,
                            uint8_t maxAttempts,
-                           float stabilityTolerance)
+                           float stabilityTolerance,
+                           float initialMagnitudeLimit = 0.0f)
       : _requiredSamples(requiredSamples == 0 ? 1 : requiredSamples),
         _maxAttempts(maxAttempts < _requiredSamples ? _requiredSamples : maxAttempts),
-        _stabilityTolerance(stabilityTolerance > 0.0f ? stabilityTolerance : 0.01f) {}
+        _stabilityTolerance(stabilityTolerance > 0.0f ? stabilityTolerance : 0.01f),
+        _initialMagnitudeLimit(initialMagnitudeLimit > 0.0f ? initialMagnitudeLimit : 0.0f) {}
 
     void begin(float currentOffset, bool baselineValid, float neutralLimit) {
       _currentOffset = currentOffset;
@@ -53,6 +74,17 @@ class LSPressureOffsetFilter {
       if (!valid || !isfinite(rawDifference)) {
         // A baseline is only the average of one uninterrupted run of real
         // readings. Never bridge an I2C failure with samples from before it.
+        resetSamples();
+        return finishAttemptWindowIfNeeded();
+      }
+
+      if (!_baselineValid && _initialMagnitudeLimit > 0.0f
+          && fabsf(rawDifference) > _initialMagnitudeLimit) {
+        // No boot baseline exists yet and this reading is beyond the initial
+        // plausibility magnitude: it is a held gesture (or a hardware shift
+        // too large to call neutral). Reset the candidate run exactly like an
+        // unstable reading — the boot baseline must be built only from
+        // plausible-at-neutral samples, never absorb a steady input.
         resetSamples();
         return finishAttemptWindowIfNeeded();
       }
@@ -98,6 +130,7 @@ class LSPressureOffsetFilter {
     uint8_t _requiredSamples;
     uint8_t _maxAttempts;
     float _stabilityTolerance;
+    float _initialMagnitudeLimit = 0.0f;  // <=0 disables the boot-magnitude bound (host tests of the legacy shape)
     float _currentOffset = 0.0f;
     float _neutralLimit = 0.0f;
     float _sampleSum = 0.0f;

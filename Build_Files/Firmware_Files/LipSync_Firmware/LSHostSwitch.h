@@ -153,4 +153,28 @@ static inline int lsHostForgetDecision(const lsHostSwitchState* st, int targetRo
   return LSHOST_ALLOW;
 }
 
+/* Row-identity verification (4.8.1): rows are MAC-sorted and RENUMBER whenever
+ * the bond set changes, so a range check alone cannot make a stale index
+ * "only ever refuse" — a concurrent forget renumbers rows in-range and the
+ * executor would hit the WRONG host. Callers that captured a row's identity
+ * when they rendered it (the Hub pages) pass it here; a mismatch means the
+ * world moved under the index and the action must refuse (the serial path
+ * keeps the documented index contract and passes NULL).
+ *
+ * Semantics: a NULL or EMPTY expected mac means "no identity captured — no
+ * check" (the serial path). Any non-empty expected that does not match
+ * character-for-character (12 uppercase hex + NUL) is a MISMATCH — including
+ * a too-short capture and a lowercase form (the on-disk convention is
+ * bonding.cpp's %02X uppercase). A NULL row with a real expected identity is
+ * a mismatch too. */
+static inline int lsHostRowIdentityMatches(const lsHostRow* row, const char* expectedMac12) {
+  if (expectedMac12 == (const char*)0 || expectedMac12[0] == '\0') return 1;  // no identity captured — no check
+  if (row == (const lsHostRow*)0) return 0;
+  for (int i = 0; i < LSHOST_MAC_CHARS; i++) {
+    if (expectedMac12[i] == '\0') return 0;  // captured identity too short
+    if (row->mac[i] != expectedMac12[i]) return 0;
+  }
+  return row->mac[LSHOST_MAC_CHARS] == '\0' && expectedMac12[LSHOST_MAC_CHARS] == '\0';
+}
+
 #endif  // LSHOST_SWITCH_H

@@ -714,7 +714,13 @@ int getOperatingMode(bool responseEnabled, bool apiEnabled) {
 
   if ((tempOperatingMode < CONF_OPERATING_MODE_MIN) || (tempOperatingMode > CONF_OPERATING_MODE_SETTABLE_MAX)) {  // SAFE is not a stored value (4.5.7 review)
     tempOperatingMode = CONF_OPERATING_MODE_DEFAULT;
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempOperatingMode);
+    // Heal only a genuinely out-of-range STORED value (the getModelNumber
+    // pattern): a transient failed read also converts to 0, and rewriting
+    // the key from it would overwrite the user's real mode on the wire AND
+    // at the next boot.
+    if (mem.isLastReadOk()) {
+      mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempOperatingMode);
+    }
   }
 
   printResponseInt(responseEnabled, apiEnabled, true, 0, "OM,0", true, tempOperatingMode);
@@ -820,7 +826,9 @@ int getCursorSpeed(bool responseEnabled, bool apiEnabled) {
     tempCursorSpeedLevel = mem.readInt(CONF_SETTINGS_FILE, commandKey);
     if ((tempCursorSpeedLevel < CONF_JOY_CURSOR_SPEED_LEVEL_MIN) || (tempCursorSpeedLevel > CONF_JOY_CURSOR_SPEED_LEVEL_MAX)) {
       tempCursorSpeedLevel = CONF_JOY_CURSOR_SPEED_LEVEL_DEFAULT;
-      mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempCursorSpeedLevel);
+      if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+        mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempCursorSpeedLevel);
+      }
     }
     
   }
@@ -936,7 +944,9 @@ int getScrollLevel(bool responseEnabled, bool apiEnabled) {
     tempScrollLevel = mem.readInt(CONF_SETTINGS_FILE, commandKey);
     if ((tempScrollLevel < CONF_SCROLL_LEVEL_MIN) || (tempScrollLevel > CONF_SCROLL_LEVEL_MAX)) {
       tempScrollLevel = CONF_SCROLL_LEVEL_DEFAULT;
-      mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempScrollLevel);
+      if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+        mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempScrollLevel);
+      }
     }
     
   }
@@ -1240,13 +1250,17 @@ void setJoystickInitialization(bool responseEnabled, bool apiEnabled, String opt
 //*********************************//
 // 4.6.6: corner plausibility gate for reads (mirror of the full-calibration
 // convention, CONF_JOY_CALIB_CORNER_MIN = 3: a corner coordinate below 3 mT
-// is degenerate). A REAL corner has at least one axis at or beyond the min —
-// the compiled defaults are ±13 and measured corners land 13-30 mT out — so
-// {0,0} (what a failed read used to yield implicitly) and any NaN/garbage
-// fail this gate and the caller keeps the live stored corner instead.
+// is degenerate). The capture-time convention requires BOTH axes at or
+// beyond the min (a corner with one axis below is replaced by the ±13
+// default at capture, LipSync_Firmware.ino) — this gate now requires BOTH
+// too: the one-axis-or shape accepted corners capture itself would have
+// rejected, so a stored {20, 1.5} read back as "usable" while the same
+// reading at capture time could never have persisted. {0,0} (what a failed
+// read used to yield implicitly) and any NaN/garbage fail this gate and the
+// caller keeps the live stored corner instead.
 static bool isPlausibleStoredCorner(pointFloatType p) {
-  if (isnan(p.x) || isnan(p.y)) return false;
-  return (fabsf(p.x) >= CONF_JOY_CALIB_CORNER_MIN) || (fabsf(p.y) >= CONF_JOY_CALIB_CORNER_MIN);
+  if (!isfinite(p.x) || !isfinite(p.y)) return false;
+  return (fabsf(p.x) >= CONF_JOY_CALIB_CORNER_MIN) && (fabsf(p.y) >= CONF_JOY_CALIB_CORNER_MIN);
 }
 
 void getJoystickCalibration(bool responseEnabled, bool apiEnabled) {
@@ -1541,7 +1555,7 @@ float getJoystickOuterDeadzone(bool responseEnabled, bool apiEnabled) {
   return tempOuterDeadzone;
 }
 //***GET JOYSTICK OUTER DEADZONE API FUNCTION***//
-// Function   : getJoystickInnerDeadzone
+// Function   : getJoystickOuterDeadzone
 //
 // Description: This function is redefinition of main getJoystickOuterDeadzone function to match the types of API function arguments.
 //
@@ -1839,7 +1853,9 @@ float getSipPressureThreshold(bool responseEnabled, bool apiEnabled) {
       (tempSipThreshold < CONF_PRESS_MIN_THRESHOLD) ||
       (tempSipThreshold >= CONF_PRESS_MAX_THRESHOLD)) {
     tempSipThreshold = CONF_SIP_THRESHOLD;
-    mem.writeFloat(CONF_SETTINGS_FILE, commandKey, tempSipThreshold);
+    if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+      mem.writeFloat(CONF_SETTINGS_FILE, commandKey, tempSipThreshold);
+    }
   }
   ps.setSipThreshold(tempSipThreshold);
   printResponseFloat(responseEnabled, apiEnabled, true, 0, "ST,0", true, tempSipThreshold);
@@ -1886,6 +1902,13 @@ void setSipPressureThreshold(bool responseEnabled, bool apiEnabled, float inputS
     // SUCCESS here would tell the app a threshold the device did not keep.
     ps.setSipThreshold(inputSipThreshold);
     printResponseFloat(responseEnabled, apiEnabled, true, 0, "ST,1", true, inputSipThreshold);
+    // A raised regular floor can strand the hard band (hard < regular +
+    // margin classifies as an empty hard pair — the feature silently goes
+    // inert). The menu path heals after every step; the serial path — which
+    // the app uses on every connect — heals here with the same rule
+    // (screen.healHardThresholds emits the usual MANUAL lines so Connect
+    // re-syncs the healed values).
+    screen.healHardThresholds();
   }
   else {
     printResponseFloat(responseEnabled, apiEnabled, false, 3, "ST,1", true, inputSipThreshold);
@@ -1930,7 +1953,9 @@ float getPuffPressureThreshold(bool responseEnabled, bool apiEnabled) {
       (tempPuffThreshold < CONF_PRESS_MIN_THRESHOLD) ||
       (tempPuffThreshold >= CONF_PRESS_MAX_THRESHOLD)) {
     tempPuffThreshold = CONF_PUFF_THRESHOLD;
-    mem.writeFloat(CONF_SETTINGS_FILE, commandKey, tempPuffThreshold);
+    if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+      mem.writeFloat(CONF_SETTINGS_FILE, commandKey, tempPuffThreshold);
+    }
   }
   ps.setPuffThreshold(tempPuffThreshold);
   printResponseFloat(responseEnabled, apiEnabled, true, 0, "PT,0", true, tempPuffThreshold);
@@ -1978,6 +2003,8 @@ void setPuffPressureThreshold(bool responseEnabled, bool apiEnabled, float input
     // See setSipPressureThreshold: a refused store reports FAIL,3.
     ps.setPuffThreshold(inputPuffThreshold);
     printResponseFloat(responseEnabled, apiEnabled, true, 0, "PT,1", true, inputPuffThreshold);
+    // See setSipPressureThreshold: a raised regular floor heals the hard pair here too.
+    screen.healHardThresholds();
   }
   else {
     printResponseFloat(responseEnabled, apiEnabled, false, 3, "PT,1", true, inputPuffThreshold);
@@ -2024,7 +2051,9 @@ float getHardSipPressureThreshold(bool responseEnabled, bool apiEnabled) {
       (tempHardSipThreshold < CONF_PRESS_MIN_THRESHOLD) ||
       (tempHardSipThreshold >= CONF_PRESS_MAX_THRESHOLD)) {
     tempHardSipThreshold = CONF_HARD_SIP_THRESHOLD;
-    mem.writeFloat(CONF_SETTINGS2_FILE, commandKey, tempHardSipThreshold);
+    if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+      mem.writeFloat(CONF_SETTINGS2_FILE, commandKey, tempHardSipThreshold);
+    }
   }
   ps.setHardSipThreshold(tempHardSipThreshold);
   printResponseFloat(responseEnabled, apiEnabled, true, 0, "HS,0", true, tempHardSipThreshold);
@@ -2125,7 +2154,9 @@ float getHardPuffPressureThreshold(bool responseEnabled, bool apiEnabled) {
       (tempHardPuffThreshold < CONF_PRESS_MIN_THRESHOLD) ||
       (tempHardPuffThreshold >= CONF_PRESS_MAX_THRESHOLD)) {
     tempHardPuffThreshold = CONF_HARD_PUFF_THRESHOLD;
-    mem.writeFloat(CONF_SETTINGS2_FILE, commandKey, tempHardPuffThreshold);
+    if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+      mem.writeFloat(CONF_SETTINGS2_FILE, commandKey, tempHardPuffThreshold);
+    }
   }
   ps.setHardPuffThreshold(tempHardPuffThreshold);
   printResponseFloat(responseEnabled, apiEnabled, true, 0, "HP,0", true, tempHardPuffThreshold);
@@ -2217,9 +2248,18 @@ static int getHardAction(bool responseEnabled, bool apiEnabled, const char* comm
   int tempHardAction;
   tempHardAction = mem.readInt(CONF_SETTINGS2_FILE, commandKey);
 
-  if ((tempHardAction < 0) || (tempHardAction > 127)) {
+  // Heal bound is the ACTION VOCABULARY, not an arbitrary 127: actions run
+  // 0..CONF_ACTION_FACTORY_RESET, so a stored 50 (hand-edited/foreign file)
+  // used to be answered with SUCCESS while the live table kept the compiled
+  // row — the read reported a value not in force (the read-vs-truth class).
+  // Out-of-vocabulary values heal to the compiled default here; the live
+  // table additionally applies the caregiver allowlist at load (a stored
+  // in-range but disallowed action keeps the compiled row there).
+  if ((tempHardAction < CONF_ACTION_NOTHING) || (tempHardAction > CONF_ACTION_FACTORY_RESET)) {
     tempHardAction = compiledDefault;
-    mem.writeInt(CONF_SETTINGS2_FILE, commandKey, tempHardAction);
+    if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+      mem.writeInt(CONF_SETTINGS2_FILE, commandKey, tempHardAction);
+    }
   }
   String responseKey = String(commandKey) + ",0";
   printResponseInt(responseEnabled, apiEnabled, true, 0, responseKey, true, tempHardAction);
@@ -2259,8 +2299,9 @@ void getHardPuffAction(bool responseEnabled, bool apiEnabled, String optionalPar
 //              never be remapped to erase settings or restart the device;
 //              mouse column, so drag/scroll — the compiled defaults — stay
 //              legal). On success the action is written to /settings2.dat
-//              and applied to the live SAP table by initSapActions() at the
-//              next boot.
+//              and applied to the LIVE SAP table immediately (4.8.1 — the
+//              old store-only shape needed a reboot; applyHardBandAction-
+//              Overrides also runs at boot via initSapActions).
 //
 // Parameters :  responseEnabled : bool
 //               apiEnabled : bool
@@ -2275,6 +2316,14 @@ static void setHardAction(bool responseEnabled, bool apiEnabled, const char* com
   String responseKey = String(commandKey) + ",1";
   if (switchRemapAllowed(inputHardAction, false)) {
     if (mem.writeInt(CONF_SETTINGS2_FILE, commandKey, inputHardAction)) {
+      // Apply LIVE, not just at the next boot: every sibling setter (SA-GC
+      // apply to the live remap table; HS/HP call ps.setHard*Threshold)
+      // takes effect immediately, and the getter contract says "the first
+      // SET of HA/HB re-arms" a table that a keyless file left inert. The
+      // old store-only shape acked SUCCESS while the gesture kept firing
+      // the old action until a reboot — no wire hint that a reboot was
+      // "required".
+      applyHardBandActionOverrides();
       printResponseInt(responseEnabled, apiEnabled, true, 0, responseKey, true, inputHardAction);
     }
     else {
@@ -2325,7 +2374,9 @@ int getJoystickAcceleration(bool responseEnabled, bool apiEnabled) {
     tempJoystickAccelerationLevel = mem.readInt(CONF_SETTINGS_FILE, commandKey);
     if ((tempJoystickAccelerationLevel < CONF_JOY_ACCELERATION_LEVEL_MIN) || (tempJoystickAccelerationLevel > CONF_JOY_ACCELERATION_LEVEL_MAX)) {
       tempJoystickAccelerationLevel = CONF_JOY_ACCELERATION_LEVEL_DEFAULT;
-      mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempJoystickAccelerationLevel);
+      if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+        mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempJoystickAccelerationLevel);
+      }
     }
     
   }
@@ -2483,7 +2534,9 @@ int getCommunicationMode(bool responseEnabled, bool apiEnabled) {
 
   if ((tempComMode < CONF_COM_MODE_MIN) || (tempComMode > CONF_COM_MODE_MAX)) {
     tempComMode = CONF_COM_MODE_DEFAULT;
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempComMode);
+    if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+      mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempComMode);
+    }
   }
 
   printResponseInt(responseEnabled, apiEnabled, true, 0, "CM,0", true, tempComMode);
@@ -2694,7 +2747,9 @@ int getSoundMode(bool responseEnabled, bool apiEnabled) {
 
   if ((tempSoundMode < CONF_SOUND_MODE_MIN) || (tempSoundMode > CONF_SOUND_MODE_MAX)) {
     tempSoundMode = CONF_SOUND_MODE_DEFAULT;
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempSoundMode);
+    if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+      mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempSoundMode);
+    }
   }
 
   printResponseInt(responseEnabled, apiEnabled, true, 0, "SM,0", true, tempSoundMode);
@@ -2786,9 +2841,10 @@ int getLightMode(bool responseEnabled, bool apiEnabled) {
 
   if ((tempLightMode < CONF_LIGHT_MODE_MIN) || (tempLightMode > CONF_LIGHT_MODE_MAX)) {
     tempLightMode = CONF_LIGHT_MODE_DEFAULT;
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempLightMode);
+    if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+      mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempLightMode);
+    }
   }
-
   g_lightMode = tempLightMode;  // Keep the live global honest (the input-state
                                 // LED mode reads it; before this it was only
                                 // ever set by setLightMode, so a boot with a
@@ -2820,7 +2876,7 @@ void getLightMode(bool responseEnabled, bool apiEnabled, String optionalParamete
 //***SET LIGHT MODE STATE FUNCTION***//
 // Function   : setLightMode
 //
-// Description: This function sets the state of sound mode.
+// Description: This function sets the state of light mode.
 //
 // Parameters :  responseEnabled : bool : The response for serial printing is enabled if it's set to true.
 //                                        The serial printing is ignored if it's set to false.
@@ -2885,7 +2941,9 @@ int getLightBrightnessLevel(bool responseEnabled, bool apiEnabled) {
 
   if ((tempLightLevel < CONF_LED_BRIGHTNESS_LEVEL_MIN) || (tempLightLevel > CONF_LED_BRIGHTNESS_LEVEL_MAX)) {
     tempLightLevel = CONF_LED_BRIGHTNESS_LEVEL_DEFAULT;
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempLightLevel);
+    if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+      mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempLightLevel);
+    }
   }
 
   printResponseInt(responseEnabled, apiEnabled, true, 0, "LL,0", true, tempLightLevel);
@@ -2995,7 +3053,9 @@ int getSapDisabled(bool responseEnabled, bool apiEnabled) {
     tempSapDisabled = mem.readInt(CONF_SETTINGS_FILE, commandKey);
     if ((tempSapDisabled != 0) && (tempSapDisabled != 1)) {
       tempSapDisabled = CONF_SAP_DISABLED_DEFAULT;
-      mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempSapDisabled);
+      if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+        mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempSapDisabled);
+      }
     }
   }
   g_sapDisabled = (tempSapDisabled == 1);
@@ -3051,7 +3111,9 @@ int getMenuButtonsOnly(bool responseEnabled, bool apiEnabled) {
     tempMenuButtonsOnly = mem.readInt(CONF_SETTINGS_FILE, commandKey);
     if ((tempMenuButtonsOnly != 0) && (tempMenuButtonsOnly != 1)) {
       tempMenuButtonsOnly = CONF_MENU_BUTTONS_ONLY_DEFAULT;
-      mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempMenuButtonsOnly);
+      if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+        mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempMenuButtonsOnly);
+      }
     }
   }
   g_menuButtonsOnly = (tempMenuButtonsOnly == 1);
@@ -3106,7 +3168,9 @@ int getModeLocked(bool responseEnabled, bool apiEnabled) {
     tempModeLocked = mem.readInt(CONF_SETTINGS_FILE, commandKey);
     if ((tempModeLocked != 0) && (tempModeLocked != 1)) {
       tempModeLocked = CONF_MODE_LOCK_DEFAULT;
-      mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempModeLocked);
+      if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+        mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempModeLocked);
+      }
     }
   }
   g_modeLocked = (tempModeLocked == 1);
@@ -3162,7 +3226,9 @@ int getCursorHoldDuringSap(bool responseEnabled, bool apiEnabled) {
     tempCursorHold = mem.readInt(CONF_SETTINGS_FILE, commandKey);
     if ((tempCursorHold != 0) && (tempCursorHold != 1)) {
       tempCursorHold = CONF_CURSOR_HOLD_DEFAULT;
-      mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempCursorHold);
+      if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+        mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempCursorHold);
+      }
     }
   }
   g_freezeCursorDuringSap = (tempCursorHold == 1);
@@ -3222,7 +3288,9 @@ int getInputWindowShort(bool responseEnabled, bool apiEnabled) {
     int stored = mem.readInt(CONF_SETTINGS_FILE, commandKey);
     if (stored < 0) {
       stored = 0;
-      mem.writeInt(CONF_SETTINGS_FILE, commandKey, 0);
+      if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+        mem.writeInt(CONF_SETTINGS_FILE, commandKey, 0);
+      }
     }
     g_inputWindowShortMs = (stored > 0) ? (unsigned long)stored : 0;
     sanitizeInputWindows();
@@ -3288,7 +3356,9 @@ int getInputWindowLong(bool responseEnabled, bool apiEnabled) {
     int stored = mem.readInt(CONF_SETTINGS_FILE, commandKey);
     if (stored < 0) {
       stored = 0;
-      mem.writeInt(CONF_SETTINGS_FILE, commandKey, 0);
+      if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+        mem.writeInt(CONF_SETTINGS_FILE, commandKey, 0);
+      }
     }
     g_inputWindowLongMs = (stored > 0) ? (unsigned long)stored : 0;
     sanitizeInputWindows();
@@ -3350,7 +3420,9 @@ int getInputWindowMax(bool responseEnabled, bool apiEnabled) {
     int stored = mem.readInt(CONF_SETTINGS_FILE, commandKey);
     if (stored < 0) {
       stored = 0;
-      mem.writeInt(CONF_SETTINGS_FILE, commandKey, 0);
+      if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+        mem.writeInt(CONF_SETTINGS_FILE, commandKey, 0);
+      }
     }
     g_inputWindowMaxMs = (stored > 0) ? (unsigned long)stored : 0;
     sanitizeInputWindows();
@@ -3689,6 +3761,13 @@ void getBluetoothHost(bool responseEnabled, bool apiEnabled, String optionalPara
   lsHostRow rows[LSHOST_ENUM_CAP];
   const uint8_t count = lsHostEnumerate(rows, LSHOST_ENUM_CAP);
   const int row = optionalParameter.toInt();
+  if (row < 0) {
+    // Negative is out of contract ("0 = count, 1..n = row") — answer FAIL,3
+    // like BT,1/BT,2 instead of silently treating it as the count read.
+    printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, row);
+    lsHostRefusalLine(commandKey, LSHOST_REFUSE_RANGE, row);
+    return;
+  }
   if (row <= 0) {
     printResponseInt(responseEnabled, apiEnabled, true, 0, commandKey, true, count);
     return;
@@ -3742,7 +3821,9 @@ void switchBluetoothHost(bool responseEnabled, bool apiEnabled, String optionalP
     return;
   }
   const int targetRow = optionalParameter.toInt();
-  const int decision = lsHostExecuteSwitch(targetRow);
+  // NULL identity: the serial index contract (the app re-reads BT,0 after
+  // every BT,4 push; the menu paths pass the identities they rendered).
+  const int decision = lsHostExecuteSwitch(targetRow, NULL);
   if (decision != LSHOST_ALLOW) {
     printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, targetRow);
     lsHostRefusalLine(commandKey, decision, targetRow);
@@ -3774,14 +3855,14 @@ void forgetBluetoothHost(bool responseEnabled, bool apiEnabled, String optionalP
     return;
   }
   const int targetRow = optionalParameter.toInt();
-  const int decision = lsHostExecuteForget(targetRow);
+  const int decision = lsHostExecuteForget(targetRow, NULL);  // NULL identity: the serial index contract — see switchBluetoothHost
   if (decision != LSHOST_ALLOW) {
     printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, targetRow);
     lsHostRefusalLine(commandKey, decision, targetRow);
     return;
   }
   printResponseInt(responseEnabled, apiEnabled, true, 0, commandKey, true, targetRow);
-  lsHostPushState();  // the list changed — the app learns immediately (BT,4, and BT,5 if the active host left)
+  lsHostPushState(true);  // the list changed — the app learns immediately (BT,4, and BT,5 if the active host left); forced: a forget landing before the first poll pass still delivers its contractual push
 }
 
 //***PAIR NEW BLUETOOTH HOST FUNCTION***//
@@ -3803,6 +3884,15 @@ void pairNewBluetoothHost(bool responseEnabled, bool apiEnabled) {
   if (needsInitialization) {
     printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, 0);
     lsHostRefusalLine(commandKey, LSHOST_REFUSE_NOT_INITIALIZED, 0);
+    return;
+  }
+  // Same calibration gate as BT,1/BT,2's executors: a pairing completing
+  // mid-calibration is exactly the event churn those flows refuse to allow.
+  // (No frozen-window gate: unlike BT,1, this action draws nothing — the
+  // menu path's own pair-new runs under selectMenuItem's frozen gate.)
+  if (g_calibrationRunning || g_centerRunning) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, 1);
+    lsHostRefusalLine(commandKey, LSHOST_REFUSE_CALIBRATION, 0);
     return;
   }
   if (Bluefruit.connected() != 0) {
@@ -3827,7 +3917,7 @@ void pairNewBluetoothHost(bool responseEnabled, bool apiEnabled, String optional
 // caller captured are re-validated here against fresh enumeration. Returns
 // LSHOST_ALLOW or the refusal reason (the same enum the pure layer uses).
 
-int lsHostExecuteSwitch(int targetRow) {
+int lsHostExecuteSwitch(int targetRow, const char* expectedMac12) {
   if (needsInitialization) return LSHOST_REFUSE_NOT_INITIALIZED;
   lsHostRow rows[LSHOST_ENUM_CAP];
   const uint8_t count = lsHostEnumerate(rows, LSHOST_ENUM_CAP);
@@ -3844,12 +3934,27 @@ int lsHostExecuteSwitch(int targetRow) {
   st.activeRow = activeRow;
   const int decision = lsHostSwitchDecision(&st, targetRow);
   if (decision != LSHOST_ALLOW) return decision;
-  if (activeRow != 0 && !lsHostDisconnectCurrent()) return LSHOST_REFUSE_RADIO;
+  // Row-identity check (4.8.1, lsHostRowIdentityMatches): a MAC-sorted table
+  // renumbers in-range when the bond set changes between a page render and
+  // this execution — the range check alone would hit the WRONG host. Menu
+  // callers pass the identity they rendered; the serial path passes NULL
+  // (the documented index contract, the app re-reads on every BT,4).
+  if (targetRow >= 1 && targetRow <= (int)count
+      && !lsHostRowIdentityMatches(&rows[targetRow - 1], expectedMac12)) {
+    return LSHOST_REFUSE_RANGE;  // "Host list changed" — the same refusal shape as a stale index
+  }
+  // Disconnect ANY connected host, bonded or not: activeRow keys on the bond
+  // file, so a connected-but-not-yet-bonded peer (the seconds-wide window
+  // between CONNECTED and the lib's deferred bond save) used to skip the
+  // disconnect entirely — the switch acked SUCCESS while the old host held
+  // the link and the target could never take it. The switch's job is to free
+  // the radio connection, whatever its bonding state.
+  if (lsHostAnyConnected() && !lsHostDisconnectCurrent()) return LSHOST_REFUSE_RADIO;
   lsHostEnsureAdvertising();  // belt-and-braces: the disconnect handler re-advertises on its own
   return LSHOST_ALLOW;
 }
 
-int lsHostExecuteForget(int targetRow) {
+int lsHostExecuteForget(int targetRow, const char* expectedMac12) {
   if (needsInitialization) return LSHOST_REFUSE_NOT_INITIALIZED;
   lsHostRow rows[LSHOST_ENUM_CAP];
   const uint8_t count = lsHostEnumerate(rows, LSHOST_ENUM_CAP);
@@ -3866,6 +3971,12 @@ int lsHostExecuteForget(int targetRow) {
   st.activeRow = activeRow;
   const int decision = lsHostForgetDecision(&st, targetRow);
   if (decision != LSHOST_ALLOW) return decision;
+  // Row-identity check — see lsHostExecuteSwitch. For the DESTRUCTIVE forget
+  // this is the difference between "stale index refuses" and "renumbered
+  // index erases the wrong host's bond".
+  if (!lsHostRowIdentityMatches(&rows[targetRow - 1], expectedMac12)) {
+    return LSHOST_REFUSE_RANGE;
+  }
   if (rows[targetRow - 1].active && !lsHostDisconnectCurrent()) return LSHOST_REFUSE_RADIO;
   if (!lsHostForgetByMac(rows[targetRow - 1].mac)) return LSHOST_REFUSE_RADIO;
   return LSHOST_ALLOW;
@@ -3892,7 +4003,9 @@ int getDebugMode(bool responseEnabled, bool apiEnabled) {
 
   if ((tempDebugMode < CONF_DEBUG_MODE_MIN) || (tempDebugMode > CONF_DEBUG_MODE_MAX)) {
     tempDebugMode = CONF_DEBUG_MODE_DEFAULT;
-    mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempDebugMode);
+    if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+      mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempDebugMode);
+    }
   }
 
   // NO setDebugState here (4.5.7 review): a READ re-applied the debug
@@ -3996,10 +4109,19 @@ void setDebugMode(bool responseEnabled, bool apiEnabled, String optionalParamete
 //              and log exports draw; a support request that genuinely needs
 //              the identifier can ask for ID,0:0 explicitly.
 //
-//              Every replayed getter is a pure read of stored settings (the
-//              identical calls the app's connect-time load makes), so this
-//              is safe to run at any time — no input, screen or output state
-//              changes.
+//              Every replayed getter is the identical call the app's
+//              connect-time load makes (the documented heal/apply convention
+//              applies: getters like CA,0 recompute radius/deadzone state
+//              and heal out-of-range stored values exactly as a connect
+//              load would), so this is safe to run at any time — no input,
+//              screen or output state changes beyond those conventions.
+//
+//              4.8.1: the dump replays BT,0:0 (the exposed bond count) at
+//              the end — the host table is bond state, not a setting, but a
+//              multi-host support ticket needs the count; individual rows
+//              are read with BT,0:<i> (the dump stays one call per
+//              endpoint). Refused on a non-BLE boot the same way a direct
+//              BT,0 is.
 //
 // Parameters :  responseEnabled : bool : The response for serial printing is enabled if it's set to true.
 //                                        The serial printing is ignored if it's set to false.
@@ -4054,6 +4176,8 @@ void exportSettings(bool responseEnabled, bool apiEnabled) {
   getSwitchAction(responseEnabled, apiEnabled, "GA");
   getSwitchAction(responseEnabled, apiEnabled, "GB");
   getSwitchAction(responseEnabled, apiEnabled, "GC");
+  // 4.8.1: the host-table count (rows read individually with BT,0:<i>).
+  getBluetoothHost(responseEnabled, apiEnabled, "0");
 
   printResponseString(responseEnabled, apiEnabled, true, 0, "EX,0", true, "END");
 }
@@ -4469,79 +4593,10 @@ void printResponseIntArray(bool responseEnabled,
 
 }
 
-//***SERIAL PRINT OUT COMMAND RESPONSE WITH POINT PARAMETER FUNCTION***//
-// Function   : printResponseIntPoint
-//
-// Description: Serial Print output of the responses from APIs with an point as the output
-//
-// Parameters :  responseEnabled : bool : Print the response if it's set to true, and skip the response if it's set to false.
-//               apiEnabled : bool : Print the response and indicate if the the function was called via the API if it's set to true.
-//                                   Print Manual response if the function wasn't called via API.
-//               responseStatus : bool : The response status (SUCCESS,FAIL)
-//               responseNumber : int : 0,1,2 (Different meanings depending on the responseStatus)
-//               responseCommand : String : The End-Point command which is returned as output.
-//               responseParameterEnabled : bool : Print the parameter if it's set to true, and skip the parameter if it's set to false.
-//               responseParameter : pointIntType : The response parameter printed as output.
-//
-// Return     : void
-//***********************************************************************//
-void printResponseIntPoint(bool responseEnabled,
-                           bool apiEnabled, 
-                           bool responseStatus, 
-                           int responseNumber, 
-                           String responseCommand, 
-                           bool responseParameterEnabled, 
-                           pointIntType responseParameter) {
-  String responseParameterString = "";
-  responseParameterString.concat(responseParameter.x);
-  responseParameterString.concat("|");
-  responseParameterString.concat(responseParameter.y);
-  printResponseString(responseEnabled, apiEnabled, responseStatus, responseNumber, responseCommand, responseParameterEnabled, responseParameterString);
-
-}
-
-//***SERIAL PRINT OUT COMMAND RESPONSE WITH INT POINT ARRAY PARAMETER FUNCTION***//
-// Function   : printResponseIntPointArray
-//
-// Description: Serial Print output of the responses from APIs with an point array as the output
-//
-// Parameters :  responseEnabled : bool : Print the response if it's set to true, and skip the response if it's set to false.
-//               apiEnabled : bool : Print the response and indicate if the the function was called via the API if it's set to true.
-//                                   Print Manual response if the function wasn't called via API.
-//               responseStatus : bool : The response status (SUCCESS,FAIL)
-//               responseNumber : int : 0,1,2 (Different meanings depending on the responseStatus)
-//               responseCommand : String : The End-Point command which is returned as output.
-//               responseParameterEnabled : bool : Print the parameter if it's set to true, and skip the parameter if it's set to false.
-//               responseParameter : pointIntType : The response parameter printed as output.
-//
-// Return     : void
-//***********************************************************************//
-void printResponseIntPointArray(bool responseEnabled,
-                                bool apiEnabled, 
-                                bool responseStatus, 
-                                int responseNumber, 
-                                String responseCommand, 
-                                bool responseParameterEnabled, 
-                                String responsePrefix, 
-                                int responseParameterSize, 
-                                char responseParameterDelimiter, 
-                                pointIntType responseParameter[]) {
-  char tempParameterDelimiter[1];
-
-  (isValidDelimiter(responseParameterDelimiter)) ? tempParameterDelimiter[0] = {responseParameterDelimiter} : tempParameterDelimiter[0] = {'\0'};
-
-  String responseParameterString = String(responsePrefix);
-  for (int parameterIndex = 0; parameterIndex < responseParameterSize; parameterIndex++) {
-    responseParameterString.concat(responseParameter[parameterIndex].x);
-    responseParameterString.concat("|");
-    responseParameterString.concat(responseParameter[parameterIndex].y);
-    if (parameterIndex < (responseParameterSize - 1)) {
-      responseParameterString.concat(tempParameterDelimiter[0]);
-    };
-  }
-
-  printResponseString(responseEnabled, apiEnabled, responseStatus, responseNumber, responseCommand, responseParameterEnabled, responseParameterString);
-}
+// (printResponseIntPoint and printResponseIntPointArray REMOVED — 4.8.1
+// review: dead code, zero call sites; each was a second wire format waiting
+// to drift from its float twin, the readAll rationale. Restore only with a
+// real consumer.)
 
 //***SERIAL PRINT OUT COMMAND RESPONSE WITH FLOAT PARAMETER FUNCTION***//
 // Function   : printResponseFloat
