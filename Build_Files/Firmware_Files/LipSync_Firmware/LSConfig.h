@@ -30,7 +30,7 @@
 
 #define CONF_LIPSYNC_VERSION_MAJOR  4
 #define CONF_LIPSYNC_VERSION_MINOR  8
-#define CONF_LIPSYNC_VERSION_REV    1
+#define CONF_LIPSYNC_VERSION_REV    2
 
 // 4.5.22 RESCUE-BUILD SWITCH (bench round 15): the device's settings
 // filesystem was left corrupted by the 4.5.20 race + the zombie phase's
@@ -357,7 +357,10 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 #define CONF_USB_RESTART_MAGIC 0x4C535255    // "LSRU" — the .noinit once-guard value: set right before the USB-recovery
                                              // restart, checked at the next boot so the auto-restart can never loop
 
-#define CONF_UPDATE_MODE_DWELL_MS 500
+#define CONF_UPDATE_MODE_DWELL_MS 500  // Bounded dwell in enterUpdateMode() between the ack, the "Update mode" splash
+                                        // and the reset into the bootloader: long enough for the ack to reach the host
+                                        // over USB and for the OLED framebuffer push to complete (bounded by Wire), so
+                                        // the splash is the frame the OLED keeps while the bootloader owns the device
 
 // 4.5.10 bench fix: the BLE init (Bluefruit.begin -> SoftDevice enable ->
 // GATT table -> HID service -> advertising) runs on ITS OWN FreeRTOS task
@@ -375,16 +378,13 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 #define CONF_BLE_INIT_TASK_PRIORITY 2
 #define CONF_BLE_DEVICE_NAME_SZ 32  // "LS_" + 8-hex-char UID + NUL, with margin
 
-// 4.5.11: on BLE boots the USB attach waits for the BLE init task's verdict
-// (the SoftDevice enable is the fragile call, and Seeed's core lacks the
-// Adafruit USE_TINYUSB coordination hooks between an attached USB device and
-// the SD enable — the stock boot order is SD first). On a FAILED init the
-// attach still happens after this fallback so serial recovery (CM,1:1) is
-// always reachable.
-#define CONF_BLE_INIT_USB_ATTACH_FALLBACK_MS 10000  // Bounded dwell in enterUpdateMode() between the ack, the "Update mode" splash
-                                        // and the reset into the bootloader: long enough for the ack to reach the host
-                                        // over USB and for the OLED framebuffer push to complete (bounded by Wire), so
-                                        // the splash is the frame the OLED keeps while the bootloader owns the device
+// (4.8.2 review) CONF_BLE_INIT_USB_ATTACH_FALLBACK_MS was removed here: it
+// belonged to the 4.5.11 deferred-USB-attach block that 4.5.18 retired (the
+// attach is back at its stock point in beginComOpMode), and nothing has read
+// it since — a dead knob after the last consumer left. The serial-recovery
+// property it described is carried by the stock attach order (CDC comes up
+// before the BLE init task runs) and the failed-init fallback in the boot
+// path, not by a timed wait.
 
 // Polling Timer IDs for each module
 #define CONF_TIMER_JOYSTICK 0

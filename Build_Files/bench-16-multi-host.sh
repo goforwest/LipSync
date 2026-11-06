@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # ============================================================================
-# LipSync V4.8.1 — multi-host Bluetooth switching bench (upstream #16)
+# LipSync V4.8.x — multi-host Bluetooth switching bench (upstream #16)
 # Numbered pass/fail script per docs/design/16-multi-host-ble.md Q10.
+#
+# The expected build version is DERIVED from LSConfig.h at run time (the
+# 4.8.2 review: B0 used to hardcode the release version and every bump
+# silently broke the identity gate — the exact drift the byte-identity ZIP
+# check exists to prevent elsewhere). Run from any repo checkout; a missing
+# LSConfig.h leaves EXPECT empty and B0 falls back to manual verification.
 #
 # Usage:   ./bench-16-multi-host.sh [OS_LABEL]
 #          OS_LABEL: macos | windows | ios | android   (default: macos)
@@ -23,12 +29,22 @@ OS="${1:-macos}"
 RESULTS="bench-16-${OS}-results.txt"
 : > "$RESULTS"
 
+# The version the flashed build must report: read from this checkout's
+# LSConfig.h (major.minor.rev), never hardcoded — a version bump without a
+# matching bench edit used to fail B0 on a perfectly healthy build.
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+EXPECT="$(awk '/^#define[ \t]+CONF_LIPSYNC_VERSION_MAJOR/{printf "%s.", $3}
+               /^#define[ \t]+CONF_LIPSYNC_VERSION_MINOR/{printf "%s.", $3}
+               /^#define[ \t]+CONF_LIPSYNC_VERSION_REV/{printf "%s", $3}' \
+          "$SCRIPT_DIR/Firmware_Files/LipSync_Firmware/LSConfig.h" 2>/dev/null)"
+[ -n "$EXPECT" ] || EXPECT="<read LSConfig.h>"
+
 note() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$RESULTS"; }
 step() { echo "" | tee -a "$RESULTS"; echo "=== $* ===" | tee -a "$RESULTS"; }
 pass() { note "PASS B$1: $*"; }
 fail() { note "FAIL B$1: $*"; }
 
-cat <<'WIRE'
+cat <<WIRE
 Wire snippets used below (paste into the console after SETTINGS):
   SETTINGS          -> SUCCESS,0:SETTINGS        (handshake before every command)
   BT,0:0            -> SUCCESS,0:BT,0:<count>
@@ -36,14 +52,14 @@ Wire snippets used below (paste into the console after SETTINGS):
   BT,1:2            -> SUCCESS,0:BT,1:2          (switch to row 2)
   BT,2:1            -> SUCCESS,0:BT,2:1          (forget row 1)
   BT,3:1            -> SUCCESS,0:BT,3:1          (ensure advertising)
-  VN,0:0            -> SUCCESS,0:VN,0:4.8.1      (verify the build first!)
+  VN,0:0            -> SUCCESS,0:VN,0:$EXPECT     (verify the build first!)
 Pushes arrive unprompted: MANUAL,0:BT,4:<n> / MANUAL,0:BT,5:<row>
 WIRE
 
 step "B0 Build identity (all OSes)"
-note "ACTION: VN,0:0 must answer 4.8.1; Hub > Info shows the same. Flash the local-builder or CI artifact first."
+note "ACTION: VN,0:0 must answer $EXPECT; Hub > Info shows the same. Flash the local-builder or CI artifact first."
 note "OBSERVED: VN answered: ____________"
-read -rp "VN=4.8.1 and matches Info? [y/N] " a; [ "$a" = y ] && pass 0 "build identity" || fail 0 "build identity (VN/Info mismatch?)"
+read -rp "VN=$EXPECT and matches Info? [y/N] " a; [ "$a" = y ] && pass 0 "build identity" || fail 0 "build identity (VN/Info mismatch?)"
 
 step "B1 Baseline single-host (${OS})"
 note "ACTION: factory-fresh bond dir (or note existing bonds). Pair host A (this computer). SETTINGS; BT,0:0; BT,0:1."
@@ -109,7 +125,7 @@ read -rp "All four? [y/N] " a
 [ "$a" = y ] && pass 10 "power-loss mid-switch" || fail 10 "power-loss mid-switch"
 
 step "B11 Downgrade round-trip (${OS}) — THE OTHER DECIDING STEP"
-note "ACTION: with 3 bonds + custom settings: flash 4.7.0, run, EX,0 dump; flash 4.8.1 back."
+note "ACTION: with 3 bonds + custom settings: flash 4.7.0, run, EX,0 dump; flash $EXPECT back."
 note "OBSERVED 4.7.0 boots normally with bonds untouched? ____ EX,0 diff vs pre-downgrade clean? ____"
 note "OBSERVED re-upgrade shows all 3 hosts with correct active? ____"
 read -rp "Bonds + settings budgets byte-identical across the round trip? [y/N] " a

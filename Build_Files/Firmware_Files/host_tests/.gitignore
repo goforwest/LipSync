@@ -1,3 +1,5 @@
 # Host-harness build artifacts — only the .cpp source belongs in the repo
 lstimer_host_tests
 *.dSYM/
+build_core
+build_timer
