@@ -4148,8 +4148,12 @@ void exportSettings(bool responseEnabled, bool apiEnabled) {
   getScrollLevel(responseEnabled, apiEnabled);
   getSipPressureThreshold(responseEnabled, apiEnabled);
   getPuffPressureThreshold(responseEnabled, apiEnabled);
-  // Upstream #58: the hard-band keys live in /settings2.dat; the getters
-  // read their own file, so the replay stays a pure read.
+  // Upstream #58: the hard-band keys live in /settings2.dat (the getters
+  // read their own file). Like EVERY getter this frame replays, these are
+  // the app's connect-load convention, not pure reads: an out-of-range or
+  // margin-violating stored value heals (and its MANUAL/SUCCESS lines ride
+  // the same frame) — a failed read answers the compiled default and the
+  // heal write is refused (the read-truth doctrine).
   getHardSipPressureThreshold(responseEnabled, apiEnabled);
   getHardPuffPressureThreshold(responseEnabled, apiEnabled);
   getHardSipAction(responseEnabled, apiEnabled);
@@ -4176,7 +4180,9 @@ void exportSettings(bool responseEnabled, bool apiEnabled) {
   getSwitchAction(responseEnabled, apiEnabled, "GA");
   getSwitchAction(responseEnabled, apiEnabled, "GB");
   getSwitchAction(responseEnabled, apiEnabled, "GC");
-  // 4.8.1: the host-table count (rows read individually with BT,0:<i>).
+  // 4.8.1: the exposed bond count (BT,0:0) rides the dump — the app's own
+  // connect load re-reads the rows individually with BT,0:<i> right after,
+  // so the frame only needs the count to notice "hosts exist".
   getBluetoothHost(responseEnabled, apiEnabled, "0");
 
   printResponseString(responseEnabled, apiEnabled, true, 0, "EX,0", true, "END");
@@ -4333,8 +4339,9 @@ void resetSettings(bool responseEnabled, bool apiEnabled, String optionalParamet
 void doFactoryReset(bool responseEnabled, bool apiEnabled) {
 
   // Exempt the whole reset chain from the hang witness (4.5.7 review): the
-  // ~22 sequential settings writes below (each a LittleFS read + remove +
-  // write, on top of the filesystem format) can cross the witness's 3 s
+  // reset work below (filesystem format + ONE atomic default-settings seed —
+  // the pre-4.5.7 shape was ~22 sequential per-key writes, which is why this
+  // exemption exists) can cross the witness's 3 s
   // loop-stall threshold on slow flash — and the chain unconditionally ends
   // in softwareReset(), which sets this flag anyway; setting it here covers
   // the writes with the same deliberate-shutdown semantics. A witness SREQ
