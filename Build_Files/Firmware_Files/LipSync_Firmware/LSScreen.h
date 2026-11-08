@@ -2755,24 +2755,29 @@ void LSScreen::healHardThresholds(void) {
   // fail-safe keeps the band inert regardless. Skip silently in that state:
   // the band is structurally unavailable (documented fail-safe), and the
   // spam stops.
-  // (4.9.0 round-2 review) read-truth: on a FAILED settings read the regular
-  // getter fabricates the compiled default (0 -> out-of-range -> default,
-  // heal-write suppressed by its own read-truth gate) — using that 3.0 hPa
-  // fabrication as the floor could raise and PERSIST a genuine stored
-  // HS=3.0 (legal when the stored ST is 2.0) to 4.0 with a MANUAL line, once
-  // the settings2 read that follows happens to succeed. Gate each side on
-  // the read that produced its regular value, mirroring initSipAndPuff.
+  // (4.9.0 rounds-2/3 review) read-truth on BOTH sides of each comparison: a
+  // FAILED settings read makes the regular getter fabricate the compiled
+  // default (3.0), and a FAILED settings2 read makes the hard getter
+  // fabricate ITS default (10.0) — either fabrication used as truth could
+  // raise and persist a genuine in-range HS via a MANUAL line once a later
+  // read succeeds (or, with a deterministically-broken settings2, fire the
+  // setter's FAIL,3 line on every hard-page entry). Gate each side on the
+  // read that produced its value, mirroring initSipAndPuff's hsReadOk/hpReadOk.
   const float sipFloor = getSipPressureThreshold(false, false) + CONF_PRESS_HARD_MARGIN_HPA;
   const bool sipReadOk = mem.isLastReadOk();
-  if (sipReadOk && sipFloor < CONF_PRESS_MAX_THRESHOLD
-      && getHardSipPressureThreshold(false, false) < sipFloor) {
-    setHardSipPressureThreshold(true, false, sipFloor);
+  if (sipReadOk && sipFloor < CONF_PRESS_MAX_THRESHOLD) {
+    const float hardSip = getHardSipPressureThreshold(false, false);
+    if (mem.isLastReadOk() && hardSip < sipFloor) {
+      setHardSipPressureThreshold(true, false, sipFloor);
+    }
   }
   const float puffFloor = getPuffPressureThreshold(false, false) + CONF_PRESS_HARD_MARGIN_HPA;
   const bool puffReadOk = mem.isLastReadOk();
-  if (puffReadOk && puffFloor < CONF_PRESS_MAX_THRESHOLD
-      && getHardPuffPressureThreshold(false, false) < puffFloor) {
-    setHardPuffPressureThreshold(true, false, puffFloor);
+  if (puffReadOk && puffFloor < CONF_PRESS_MAX_THRESHOLD) {
+    const float hardPuff = getHardPuffPressureThreshold(false, false);
+    if (mem.isLastReadOk() && hardPuff < puffFloor) {
+      setHardPuffPressureThreshold(true, false, puffFloor);
+    }
   }
 }
 

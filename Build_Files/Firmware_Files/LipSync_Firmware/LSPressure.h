@@ -100,8 +100,9 @@ class LSPressure {
     float getOffsetPressure();                          // Get Offset pressure: (sapPressureAbs- ambientPressure)
     void setOffsetPressure(float offsetPressure);       // Set Offset pressure: 
     float offsetNeutralLimit();                         // The shared "very near neutral" band (min(ST,PT)*0.25 capped at PRESS_OFFSET_NEUTRAL_MAX_HPA) — one definition for both the collector and the 60 s refresh gate
-    void startOffsetUpdate();                           // Begin a stepped offset measurement: five valid (sap - ambient)                                                        // samples gathered one per update() tick, then averaged
-    void reportOffsetRetryWindow();                     // One ERROR line per PRESS_OFFSET_RETRY_REPORT_WINDOWS failed offset windows — covers the boot baseline AND the post-recovery loop (4.9.0 review: whichever failure ended the window)
+    void startOffsetUpdate();                           // Begin a stepped offset measurement: five valid (sap - ambient)
+                                                        // samples gathered one per update() tick, then averaged
+    void reportOffsetRetryWindow();                     // One ERROR line per PRESS_OFFSET_RETRY_REPORT_MS of continuous failure — covers the boot baseline AND the post-recovery loop (4.9.0 review: whichever failure ended the window)
     void setSipThreshold(float s);                      // Set sip threshold
     void setPuffThreshold(float p);                     // Set puff threshold
     void setHardSipThreshold(float t);                  // Set hard sip threshold (upstream #58; validated at the API layer)
@@ -422,16 +423,15 @@ void LSPressure::startOffsetUpdate()
 // Function   : reportOffsetRetryWindow
 //
 // Description: One ERROR line per PRESS_OFFSET_RETRY_REPORT_WINDOWS
-//              consecutive failed offset-collection windows. Covers BOTH
-//              stuck-neutral classes (4.9.0 review): the never-completing
-//              boot baseline (RETRYING_INITIAL) AND the post-recovery loop
-//              whose retained baseline keeps rejecting the re-seated
-//              mouthpiece's neutral (ACTIVITY_REJECTED / ATTEMPTS_EXHAUSTED
-//              — results only reachable with a baseline, and the only class
-//              the old report condition missed). Without it, a re-seated
-//              mouthpiece whose new neutral sits outside the retained-offset
-//              band held the device's primary input inert with zero wire
-//              trace.
+//              CONTINUOUS failure. Covers BOTH stuck-neutral classes (4.9.0
+//              review): the never-completing boot baseline (RETRYING_INITIAL)
+//              AND the post-recovery loop whose retained baseline keeps
+//              rejecting the re-seated mouthpiece's neutral
+//              (ACTIVITY_REJECTED / ATTEMPTS_EXHAUSTED — results only
+//              reachable with a baseline, and the only class the old report
+//              condition missed). Without it, a re-seated mouthpiece whose
+//              new neutral sits outside the retained-offset band held the
+//              device's primary input inert with zero wire trace.
 //
 // Arguments :  void
 //
@@ -724,8 +724,8 @@ void LSPressure::updatePressure()
       // difference is beyond the initial plausibility ceiling — both leave
       // sensing permanently inert, which must not happen in silence (the 4.6.6
       // destroy-in-silence lesson). One ERROR line per minute of continuous
-      // failure; the counter resets when a baseline completes or the class
-      // begins sensing again.
+      // failure (the streak timestamp resets when a baseline completes or the
+      // class begins sensing again).
       reportOffsetRetryWindow();
     }
   }

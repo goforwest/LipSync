@@ -737,6 +737,11 @@ static bool g_switchTargetIrkValid = false;           // true = g_switchTargetIr
 // on return (4.9.0: the rc is checked — the bench trail's adv_start refusals
 // in the post-disconnect SD-teardown window are real, and BT,3 must not ack
 // SUCCESS while nothing is on air). Same forever-timeout as the boot path.
+// NOTE (round-3 review): with a switch window open it returns FALSE while
+// the window's directed set may be on air — false means "open advertising is
+// not (being) started", not "the radio is silent". Both boolean consumers
+// pre-gate on lsHostSwitchWindowOpen() for exactly this reason; keep that
+// gate on any new caller.
 // (4.9.0 round-2 review) NEVER while a switch window is open: between the
 // directed set's ~1 s arms nothing is on air BY DESIGN, and the old shape
 // would treat that gap as "not running" and start open advertising — the
@@ -791,6 +796,16 @@ static bool g_switchBouncedActive = false;
 static uint16_t g_switchBouncedHdl = 0xFFFF;
 static unsigned long g_switchBouncedConnectMs = 0;  // first tick observation of the tracked handle
 static bool g_switchBounceCounted = false;          // the tracked handle's bounce already fired (same-handle passes are teardown, not new connections)
+// (4.9.0 round-3 review) DEFERRED ADVERTISING RESTART: a window ending can
+// land in the sub-second gap where the directed set has self-terminated but
+// the SD's ADV_SET_TERMINATED event has not been dispatched — the lib's
+// _runnning flag still reads true, stop() is refused, and the termination
+// event afterward clears the flag WITHOUT restarting (the directed branch).
+// A one-shot ensureAdvertising probe in that gap reads "running" and skips
+// the start: silent radio-off. The flag is set by every window ending while
+// no host is connected, and serviced per loop pass by
+// lsHostServiceSwitchWindow once the event has actually landed.
+static bool g_switchAdvRestartPending = false;
 
 // Suspend the stock DISCONNECTED auto-restart (open FP_ANY advertising) for
 // the switch lifecycle: between the disconnect and the window's filtered
@@ -1000,6 +1015,7 @@ uint32_t lsHostBeginSwitchWindow(void) {
     g_switchBouncedActive = false;
     g_switchBouncedHdl = 0xFFFF;
     g_switchBounceCounted = false;
+    g_switchAdvRestartPending = false;  // the window owns the radio now
     return NRF_SUCCESS;
   }
   g_switchWindowFailConn = Bluefruit.connected();
@@ -1032,6 +1048,10 @@ void lsHostCancelSwitchWindow(void) {
   (void)Bluefruit.Advertising.stop();
   lsHostRestoreAutoRestart();
   lsHostDisarmSwitchWindow();
+  // (round-3 review) a cancel can land in the stale-run/event-pending gap;
+  // arm the deferred settle so a forget-path cancel cannot leave the radio
+  // silently off. (A following arm/begin owns the radio and clears the flag.)
+  if (!Bluefruit.connected()) g_switchAdvRestartPending = true;
 }
 
 // CLOSE: stop the window advertise, disarm the SD lists, restore the stock
@@ -1048,10 +1068,13 @@ void lsHostCloseSwitchWindow(void) {
   g_switchBouncedHdl = 0xFFFF;
   g_switchBounceCounted = false;
   g_switchTargetIrkValid = false;
-  (void)Bluefruit.Advertising.stop();  // window set; harmless if the SD already terminated it
+  (void)Bluefruit.Advertising.stop();  // window set; harmless if the SD already terminated it (rc ignored on purpose: the deferred-restart flag below covers a stale-run refusal)
   lsHostRestoreAutoRestart();
   lsHostDisarmSwitchWindow();
   if (!Bluefruit.connected()) lsHostEnsureAdvertising();
+  // Also arm the deferred restart: the one-shot ensure above can be fooled
+  // by the stale _runnning flag in the event-pending gap (round-3 review).
+  if (!Bluefruit.connected()) g_switchAdvRestartPending = true;
 }
 
 // (4.9.0 round-2 review) the window's millis bound must fire on EVERY path —
@@ -1061,6 +1084,9 @@ void lsHostCloseSwitchWindow(void) {
 // the window (and the lockout) alive past its documented 60 s worst case —
 // up to the bounce cap's ~30 min. Call before every non-target `return 0`:
 // true = the bound elapsed, the window was closed, the caller returns -1.
+// (The g_switchWindowStartMs == 0 sentinel mirrors begin: a window opened in
+// the boot millisecond would evade its own bound — unreachable in practice
+// since begin runs long after setup, noted per the round-3 review.)
 bool lsHostSwitchWindowBoundExpired(void) {
   if (!g_switchWindowOpen) return false;
   if (g_switchWindowStartMs == 0) return false;
@@ -1301,7 +1327,22 @@ int lsHostSwitchWindowTick(void) {
 // from the main loop; the btFeedbackLoop tick call remains as the 1 s
 // backstop (idempotent).
 void lsHostServiceSwitchWindow(void) {
-  if (g_switchWindowOpen) (void)lsHostSwitchWindowTick();
+  if (g_switchWindowOpen) {
+    (void)lsHostSwitchWindowTick();
+    return;
+  }
+  // A window ended while no host was connected: make sure open advertising
+  // actually comes back up AFTER the SD's pending termination event has
+  // landed (see g_switchAdvRestartPending).
+  if (g_switchAdvRestartPending) {
+    if (Bluefruit.connected()) {
+      g_switchAdvRestartPending = false;  // a host owns the link; auto-restart owns the future
+    } else if (Bluefruit.Advertising.isRunning()) {
+      g_switchAdvRestartPending = false;  // genuinely on air (the event landed or a start succeeded)
+    } else if (lsHostEnsureAdvertising()) {
+      g_switchAdvRestartPending = false;
+    }
+  }
 }
 
 // Is a switch window open? (4.9.0 — the BT,3 pair-new gate: the window's

@@ -600,6 +600,11 @@ bool LSMemory::writeObject(String fileString, String key, JsonObject obj){
     // next boot so initialize() never re-seeded — a permanent settings
     // loss). obj.isNull() catches the null-document case directly; the
     // "null"/empty string checks are belt-and-braces.
+    // (4.9.0 round-3 review: the four writeX writers now gate on
+    // isLastReadOk AFTER their own read, so this branch is unreachable from
+    // every current call site — kept as library-layer belt-and-braces for
+    // any future direct writeObject caller; the once-per-boot readObject
+    // error lines plus the setter FAIL,3 are what name the failure today.)
     if (obj.isNull() || jsonString == "null" || strlen(jsonChar) == 0) {
       String errorLine = "ERROR: settings write refused for key ";
       errorLine += key;
