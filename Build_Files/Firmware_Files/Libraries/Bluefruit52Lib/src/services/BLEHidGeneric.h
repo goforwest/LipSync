@@ -69,6 +69,13 @@ class BLEHidGeneric : public BLEService
 
     // Send Report to default connection
     bool inputReport(uint8_t reportID, void const* data, int len);
+
+    /* LipSync HID-subscription watchdog (upstream #16 bench 2026-11-07):
+     * read-only CCCD state of one input-report characteristic. The
+     * inputReport() bool conflates "subscription off" with transient TX-buffer
+     * exhaustion; the watchdog needs the unambiguous bit. Returns false for an
+     * out-of-range reportID or when there are no input characteristics. */
+    bool inputNotifyEnabled(uint8_t reportID);
     bool bootKeyboardReport(void const* data, int len);
     bool bootMouseReport(void const* data, int len);
 

@@ -63,6 +63,14 @@
 // frozen for the page's dwell; finishModeLocked's modeMenu() restores
 // MODE_MENU.
 #define MODE_LOCKED_PAGE 32
+// The destructive hold-gate note (bench 2026-11-06, B5): a too-short hold on
+// a destructive row (forget/factory-reset/restart) answered with a bare error
+// beep and NO screen change — the user read it as a dead button and kept
+// pressing until the forget eventually fired. Same lesson as MODE_LOCKED_PAGE:
+// name the refusal. The page remembers the menu it came from; its continuation
+// redraws that page (the hold gate spans five source pages, unlike the Mode
+// page's single fixed return).
+#define HOLD_CONFIRM_NOTE_PAGE 34
 
 // More Menus
 #define SOUND_MENU 51
@@ -197,6 +205,12 @@ public:
   void factoryResetConfirm2Menu();
   void modeLockedPage();
   void finishModeLocked();
+  // Destructive hold-gate note (bench 2026-11-06): names "hold the row to
+  // confirm" for a too-short hold instead of a bare beep; _holdNoteReturnMenu
+  // carries the page to redraw (the gate spans five source pages).
+  void holdConfirmNotePage();
+  void finishHoldConfirmNote();
+  int _holdNoteReturnMenu = 0;
 
   // Upstream #16: the Bluetooth host pages. Rows are rebuilt from the bond
   // directory on every page entry; every action re-validates through the
@@ -229,7 +243,8 @@ public:
   void fullCalibrationPrompt(int stepNum);
   void calibrationAbortedPage();
   void infoMenu();
-  void testPage(unsigned int usbConnectDelay);
+  // (4.9.0 review) testPage removed: zero callers anywhere in the tree —
+  // a v4.0-era leftover, the same dead-code class as ledStartupEffect.
   void noUsbPage();
   void updateModePage();
   void warningUSBDebugOn();
@@ -299,7 +314,8 @@ private:
   int _cursorStart = 0;
   int _countMenuScroll = 0;
 
-  int _testScreenAttempt = 0;
+  // (4.9.0 review) _testScreenAttempt removed with its only reader,
+  // testPage (dead code).
 
   int _currentMenuLength;
   String *_currentMenuText = nullptr;  // null until a menu page registers (the boot dwell pages set _isActive first); read by the input/CH,5 guards
@@ -537,6 +553,19 @@ bool LSScreen::inputIsFrozen() {
   // deadline is only ever honored inside its real window: the first poll
   // after expiry (≤ one 20 ms tick) clears it, decades before any wrap
   // could resurrect it, and the factory value 0 is refused outright.
+  // (4.9.0 review) a PENDING TRANSITION owns the menu even after its freeze
+  // deadline is consumed: the poll slots fire inputLoop before screenLoop,
+  // so on the exact pass where the deadline expires, a physical close landed
+  // (unfrozen, deadline consumed) BEFORE the same pass's screen slot ran the
+  // continuation — which then re-registered its page unconditionally: the
+  // drawn-but-dead state closeMenu exists to prevent, with CH,0 honestly
+  // answering "closed" while the OLED shows a page. The timer id is the
+  // truth about who owns the flow; freeze on it too — probed through
+  // isEnabled so a stale id (a continuation that ever forgot its clear-first
+  // invariant) can NEVER freeze input forever: a fired RUN_ONCE slot is
+  // deleted (callback NULL → isEnabled false), while a genuinely pending
+  // transition is enabled until the pass it fires.
+  if (_transitionTimerId >= 0 && _screenStateTimer.isEnabled(_transitionTimerId)) return true;
   if (_inputFrozenUntil == 0) return false;
   long remaining = (long)(_inputFrozenUntil - millis());
   if (remaining > 0) {
@@ -888,6 +917,15 @@ void LSScreen::flushDisplay() {
   // it. It runs only when the framebuffer actually reached the bus: while
   // the display is demoted the menu's internal state advances but nothing
   // is shown, and the app's CH,0:0 poll still reads the same truth.
+  // (4.9.0 review — the deliberate CH,5 ordering, pinned: reportMenuState
+  // runs INSIDE the page render, i.e. inside controlHubMenu's execution, so
+  // a CH,5 push lands BEFORE the CH,1 SUCCESS frame of the press that caused
+  // it. The BT,1 rule is the opposite (INFO lines strictly after the ack) —
+  // the difference is deliberate: a CH,5 push is IDEMPOTENT state telemetry
+  // the mirror consumes wherever it lands, while a BT,1 INFO line narrates
+  // the command's own outcome and must not precede it. Reordering CH,5 after
+  // the ack would require exiting the render path and desyncing the
+  // framebuffer-push coupling for no reader benefit.)
   reportMenuState();
 }
 
@@ -1077,7 +1115,12 @@ void LSScreen::selectMenuItem() {
   unsigned long confirmHoldMs = effectiveWindowMs(CONF_INPUT_WINDOW_SHORT_DEFAULT_MS) / 2;
   if (confirmHoldMs < CONF_MENU_CONFIRM_HOLD_MIN_MS) confirmHoldMs = CONF_MENU_CONFIRM_HOLD_MIN_MS;
   if (destructiveSelection && g_menuInputHoldMs != 0xFFFFFFFFUL && g_menuInputHoldMs < confirmHoldMs) {
+    // Bench 2026-11-06 (B5): this path was a bare beep — the user read it as
+    // a dead button and kept pressing until the forget eventually fired.
+    // Name the refusal (the modeLockedPage lesson): a 2 s "hold to confirm"
+    // note, then redraw the page the selection came from.
     buzzerErrorCue();
+    holdConfirmNotePage();
     return;
   }
 
@@ -1268,14 +1311,37 @@ void LSScreen::selectMenuItem() {
       } else if (_currentSelection == hostRows) {
         // Pair new: refuse while a host is connected (a new pairing needs
         // advertising), otherwise make sure advertising is running.
+        // (4.9.0 review) the serial BT,3 refuses a calibration/center flow
+        // ("a pairing completing mid-calibration is exactly the event churn
+        // those flows refuse to allow") — the menu branch now carries the
+        // same gate. Verified hole: a serial IN,1:1/CA,1:1 landing while the
+        // Hub sat here ran lsHostEnsureAdvertising mid-flow, and the note
+        // page's 2 s transition repainted the host list OVER the calibration
+        // prompt 50 ms after step 1 drew it.
         if (!lsBleStackReady()) {
           buzzerErrorCue();
           btNotePage("Bluetooth", "not active");
+        } else if (g_calibrationRunning || g_centerRunning) {
+          buzzerErrorCue();
+          btNotePage("Busy: calib.", "in progress");
         } else if (lsHostAnyConnected()) {
           buzzerErrorCue();
           btNotePage("Disconnect", "host first");
+        } else if (lsHostSwitchWindowOpen()) {
+          // (4.9.0 round-2 review) the serial BT,3 refuses an open window —
+          // the Hub branch must too: the bouncer would drop every peer this
+          // note exists to admit, and lsHostEnsureAdvertising during the
+          // window's inter-arm gap could silently replace the directed set
+          // (which the tick then skips re-arming because isRunning holds).
+          buzzerErrorCue();
+          btNotePage("Switching", "wait");
+        } else if (!lsHostEnsureAdvertising()) {
+          // (4.9.0 review) the honest-ack rule: start() can refuse in the
+          // post-disconnect SD-teardown window — never a success-shaped note
+          // with nothing on air.
+          buzzerErrorCue();
+          btNotePage("Radio busy", "try again");
         } else {
-          lsHostEnsureAdvertising();
           btNotePage("Pairing:", "pair from", "the host");
         }
       } else if (hasForget && _currentSelection == hostRows + 1) {
@@ -1711,19 +1777,18 @@ void LSScreen::selectMenuItem() {
           softwareReset(); // Call a software reset
           break;
         case 1:  // Back
-          if (_prevMenu == MORE_MENU) {        
+          // (4.9.0 review) the SAFEMODE arm is live here (the safe menu's
+          // Restart goes through this same confirm page) — only the
+          // unreachable else/commented-out remnant was removed. The fallback
+          // for any future third _prevMenu is safeModeMenu() (the safe
+          // menu's Restart is the only non-MORE-MENU source today); revisit
+          // this if a third source ever appears.
+          if (_prevMenu == MORE_MENU) {
             moreMenu();
             break;
-          } else if (_prevMenu == SAFEMODE_MENU) {
-            safeModeMenu();
-            break;
-          } else {
-            break;
           }
-          
-          //_currentMenu = MAIN_MENU;
-          //mainMenu();
-          
+          safeModeMenu();
+          break;
       }
       break;
     case FACTORY_RESET_PAGE:
@@ -1733,12 +1798,12 @@ void LSScreen::selectMenuItem() {
           factoryResetConfirm2Page();
           break;
         case 1:  // Back
-          if(_prevMenu == MORE_MENU) {
-            moreMenu();
-          }
-          else if (_prevMenu == SAFEMODE_MENU ) {
-            safeModeMenu();
-          } 
+          // (4.9.0 review) the SAFEMODE arm here is unreachable: this page
+          // is registered only from MORE_MENU (case 6); safe mode goes
+          // straight to FACTORY_RESET_CONFIRM2_PAGE, whose own Back does
+          // handle SAFEMODE. Any future third _prevMenu now falls through
+          // to moreMenu() instead of silently no-op'ing.
+          moreMenu();
           break;
       }
       break;
@@ -2435,6 +2500,15 @@ void LSScreen::fullCalibrationPage(void) {
 
   flushDisplay();
 
+  // (4.9.0 review) mirror centerResetPage's freeze for the pre-step-1 gap:
+  // the first corner prompt lands ~2 s out (CONF_JOY_CALIB_STEP_DELAY), and
+  // until then this page was live to the input poll — a Next moved the stale
+  // confirm-page selection and displayCursor's overlay painted a stray ">"
+  // over the prompt text; a wrapped Next repainted the confirm page over it.
+  // The flow's own chain re-freezes per step (fullCalibrationPrompt), so
+  // only the entry gap needs the arm.
+  _inputFrozenUntil = millis() + CONF_JOY_CALIB_ENTRY_FREEZE_MS;
+
   setJoystickCalibration(false, false);
   if (!g_calibrationRunning) {
     // A center/calibration flow was already active or the timer registration
@@ -2681,12 +2755,23 @@ void LSScreen::healHardThresholds(void) {
   // fail-safe keeps the band inert regardless. Skip silently in that state:
   // the band is structurally unavailable (documented fail-safe), and the
   // spam stops.
+  // (4.9.0 round-2 review) read-truth: on a FAILED settings read the regular
+  // getter fabricates the compiled default (0 -> out-of-range -> default,
+  // heal-write suppressed by its own read-truth gate) — using that 3.0 hPa
+  // fabrication as the floor could raise and PERSIST a genuine stored
+  // HS=3.0 (legal when the stored ST is 2.0) to 4.0 with a MANUAL line, once
+  // the settings2 read that follows happens to succeed. Gate each side on
+  // the read that produced its regular value, mirroring initSipAndPuff.
   const float sipFloor = getSipPressureThreshold(false, false) + CONF_PRESS_HARD_MARGIN_HPA;
-  if (sipFloor < CONF_PRESS_MAX_THRESHOLD && getHardSipPressureThreshold(false, false) < sipFloor) {
+  const bool sipReadOk = mem.isLastReadOk();
+  if (sipReadOk && sipFloor < CONF_PRESS_MAX_THRESHOLD
+      && getHardSipPressureThreshold(false, false) < sipFloor) {
     setHardSipPressureThreshold(true, false, sipFloor);
   }
   const float puffFloor = getPuffPressureThreshold(false, false) + CONF_PRESS_HARD_MARGIN_HPA;
-  if (puffFloor < CONF_PRESS_MAX_THRESHOLD && getHardPuffPressureThreshold(false, false) < puffFloor) {
+  const bool puffReadOk = mem.isLastReadOk();
+  if (puffReadOk && puffFloor < CONF_PRESS_MAX_THRESHOLD
+      && getHardPuffPressureThreshold(false, false) < puffFloor) {
     setHardPuffPressureThreshold(true, false, puffFloor);
   }
 }
@@ -2759,6 +2844,7 @@ void LSScreen::adjustHardPuffThreshMenu(void) {
 void LSScreen::fullCalibrationConfirmPage(void) {
   if (!_begun) return;
   _currentMenu = FULL_CALIB_WARN_PAGE;  // Name the dwell (4.5.7 review): the 3 s warning window reads as itself on CH,0:0; the continuation restores FULL_CALIB_CONFIRM_PAGE
+  _currentSelection = 0;  // draw-only dwell reports row 0 — never inherit the interrupted page's selection (the sibling pages' convention)
   setupDisplay();
   _display.println("Incorrect");
   _display.println("full calib.");
@@ -2827,6 +2913,7 @@ void LSScreen::factoryResetConfirm2Page(void) {
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::factoryResetConfirm2Page()"); }
 
   _currentMenu = FACTORY_RESET_WARN_PAGE;  // Name the dwell (4.5.7 review): the 2 s warning window reads as itself on CH,0:0; the continuation restores FACTORY_RESET_CONFIRM2_PAGE
+  _currentSelection = 0;  // draw-only dwell reports row 0 — never inherit the interrupted page's selection (the sibling pages' convention)
   setupDisplay();
   _display.println("This will");
   _display.println("erase all");
@@ -2934,6 +3021,7 @@ void LSScreen::modeLockedPage(void) {
   // from "still on the Mode options" — this is the drift case that built
   // the endpoint. finishModeLocked → modeMenu() restores MODE_MENU.
   _currentMenu = MODE_LOCKED_PAGE;
+  _currentSelection = 0;  // draw-only dwell reports row 0 — never inherit the interrupted page's selection (the sibling pages' convention)
   setupDisplay();
   _display.println("Mode is");
   _display.println("locked.");
@@ -2955,6 +3043,64 @@ void LSScreen::modeLockedPage(void) {
 void LSScreen::finishModeLocked(void) {
   _transitionTimerId = -1;  // The scheduled transition just fired — its slot is free; keep the id honest (the one continuation that broke this invariant before the 4.5.7 review)
   modeMenu();
+}
+
+//*********************************//
+// Function   : holdConfirmNotePage / finishHoldConfirmNote
+//
+// Description: The destructive hold-gate note (bench 2026-11-06). A too-short
+//              hold on a destructive row now names its reason on screen for
+//              ~2 s and returns to the page the selection came from — the
+//              modeLockedPage pattern, generalized: the gate spans five source
+//              pages (safe-mode rows, restart, both factory-reset pages, the
+//              forget list), so the continuation dispatches on the SAVED menu
+//              id rather than one fixed restore.
+//
+// Arguments :  void
+//
+// Return     : void
+//*********************************//
+void LSScreen::holdConfirmNotePage(void) {
+  if (!_begun) return;
+  _holdNoteReturnMenu = _currentMenu;  // the page to redraw after the note
+  _currentMenu = HOLD_CONFIRM_NOTE_PAGE;
+  _currentSelection = 0;  // a draw-only page reports row 0 (never inherit the interrupted page's selection)
+  setupDisplay();
+  _display.println("Too short:");
+  // 4.8.7 review: setTextWrap(false) is sticky — every size-2 line clips at
+  // ~10.6 chars. "HOLD the row" (12) drew as "HOLD the r…".
+  _display.println("HOLD row");
+  _display.println("to confirm");
+  flushDisplay();
+  scheduleTransition(2000, screenHoldConfirmNoteTransitionDone);
+}
+
+void LSScreen::finishHoldConfirmNote(void) {
+  _transitionTimerId = -1;  // the scheduled transition just fired — its slot is free (the finishModeLocked invariant)
+  switch (_holdNoteReturnMenu) {
+    case SAFEMODE_MENU:               safeModeMenu(); break;
+    // 4.8.7 review: the return targets are the CONFIRM pages the hold was
+    // refused on — restartConfirmPage/factoryResetConfirm1Page re-register
+    // RESTART_PAGE/FACTORY_RESET_PAGE with their selectable rows. The
+    // terminal action pages (restartPage/factoryResetPage) draw
+    // "RESTARTING…"/"FACTORY RESET…" while the reset actually runs and set
+    // no menu id — returning there left _currentMenu stuck on the note page
+    // with a lying screen and no reachable continuation (4.8.6 review).
+    case RESTART_PAGE:                restartConfirmPage(); break;
+    case FACTORY_RESET_PAGE:          factoryResetConfirm1Page(); break;
+    // The "Are you sure?" page the hold was refused on is re-registered by
+    // factoryResetConfirm2Menu directly; going through factoryResetConfirm2Page
+    // re-ran the 2 s "This will erase" warn dwell first.
+    case FACTORY_RESET_CONFIRM2_PAGE: factoryResetConfirm2Menu(); break;
+    case BT_FORGET_LIST_PAGE:         btForgetListPage(); break;
+    default:
+      // Dead-code armor: every gate source is enumerated above. An unknown
+      // source restores the More menu (the finishBtNote not-ready fallback).
+      _currentMenu = MORE_MENU;
+      moreMenu();
+      break;
+  }
+  _holdNoteReturnMenu = 0;
 }
 
 //*********************************//
@@ -3046,7 +3192,34 @@ void LSScreen::btSwitchConfirmPage() {
   _cursorStart = 2;
   _currentSelection = 0;
   _countMenuScroll = 0;
-  displayMenu();
+
+  // 4.8.7 review: the target line ("name (XX)" up to 22 chars) is a header
+  // row, and displayCursor's long-text scroll covers only the SELECTED row —
+  // at size 2 (~10 chars on the 128-px panel) the "(XX)" discriminator drew
+  // past the edge, leaving two same-named hosts indistinguishable at the
+  // final confirm. Draw the page directly: the target renders at size 1
+  // (21 chars fit), one size-2 cell in so the cursor column's blank overlay
+  // cannot clip it; rows 0/2/3 keep the displayMenu shape (headers without
+  // the leading cell, selectable rows with it — displayCursor's overlay
+  // expects exactly that).
+  // (4.9.0 review) the second `if (!_begun) return;` here was dead —
+  // nothing between the two checks can clear _begun — and is removed with
+  // the honest-ack rationale it duplicated.
+  setupDisplay();
+  _display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+  _display.setTextSize(2);
+  _display.setCursor(0, 0);
+  _display.println(_btConfirmText[0]);  // "Switch to"
+  _display.setTextSize(1);
+  _display.setCursor(CHAR_PIXEL_WIDTH_S2, CHAR_PIXEL_HEIGHT_S2);
+  _display.println(_btConfirmText[1]);  // the target: "name (XX)" — full label fits at size 1
+  _display.setTextSize(2);
+  _display.setCursor(0, 2 * CHAR_PIXEL_HEIGHT_S2);
+  _display.print(" "), _display.println(_btConfirmText[2]);  // "Confirm"
+  _display.setCursor(0, 3 * CHAR_PIXEL_HEIGHT_S2);
+  _display.print(" "), _display.println(_btConfirmText[3]);  // "... Back"
+  flushDisplay();
+  displayCursor();
 }
 
 //*********************************//
@@ -3165,10 +3338,39 @@ void LSScreen::btNoteForReason(int reason) {
 //*********************************//
 void LSScreen::finishBtSwitch() {
   _transitionTimerId = -1;  // the scheduled transition just fired — its slot is free (the finishModeLocked invariant)
-  const int decision = lsHostExecuteSwitch(_btTargetRow, _btSwitchTargetMac.c_str());
-  if (decision == LSHOST_ALLOW || decision == LSHOST_REFUSE_ALREADY_ACTIVE) {
-    btHostsMenu();  // switched (or the target already reconnected meanwhile) — show the fresh list
+  // Multi-host switching (upstream #16) — whitelist contingency (bench B4):
+  // lsHostExecuteSwitch disconnects the current host and opens the bounded
+  // whitelist window for the TARGET (only the target may take the link during
+  // the window — the just-disconnected host cannot race back sub-second).
+  // NON-BLOCKING on purpose: this continuation runs on the loop task, and a
+  // poll-wait here would freeze menu input, timers and the buzzer for the
+  // whole window (the 4.8.5-era executor waits ≤200 ms internally for the SD
+  // teardown — bounded, bench-driven, far under the freeze-honor bound). The
+  // window is maintained by btFeedbackLoop's lsHostSwitchWindowTick (1 s
+  // cadence); the connect transition repaints this page via the BT,5 push
+  // path. The window's fate rides the outcome struct — this menu path emits
+  // no wire INFO lines (the screen already narrates; a phantom "BT,1" line
+  // with no BT,1 command in flight misleads the serial log).
+  lsHostSwitchOutcome oc;
+  const int decision = lsHostExecuteSwitch(_btTargetRow, _btSwitchTargetMac.c_str(), &oc);
+  if (decision == LSHOST_ALLOW) {
+    btHostsMenu();  // switch executed (window open or open-advertising fallback) — show the fresh list
     return;
+  }
+  // ALREADY_ACTIVE: a refusal like any other EXCEPT when the connected host
+  // IS the one this page captured — the target can legitimately take the link
+  // during the confirm dwell when the switch flow started with NO active host
+  // (the host list is reachable while open-advertising; 4.8.7 review). That
+  // is the outcome the user asked for: refresh the list, no error cue. When
+  // the connected host is some OTHER row, name the refusal like every other
+  // (never a silent no-op — the modeLockedPage lesson).
+  if (decision == LSHOST_REFUSE_ALREADY_ACTIVE) {
+    char active13[LSHOST_MAC_CHARS + 1];
+    if (lsHostActiveMac(active13) && _btSwitchTargetMac.length() == LSHOST_MAC_CHARS
+        && _btSwitchTargetMac.equalsIgnoreCase(String(active13))) {
+      btHostsMenu();
+      return;
+    }
   }
   buzzerErrorCue();
   btNoteForReason(decision);
@@ -3215,45 +3417,8 @@ void LSScreen::infoMenu(void) {
   displayMenu();  //  Print items in current menu
 }
 
-//*********************************//
-// Function   : testPage
-//
-// Description: Format and display a test page that shows the operating mode and number of times this function has been called
-//
-// Arguments :  void
-//
-// Return     : void
-//*********************************//
-void LSScreen::testPage(unsigned int usbConnectDelay) {
-  if (!_begun) return;
-  if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::testPage()"); }
-
-  setupDisplay();
-  _testScreenAttempt++;
-
-  switch (_operatingMode) {
-    case CONF_OPERATING_MODE_MOUSE:
-      switch (_communicationMode) {
-        case CONF_COM_MODE_USB:
-          _display.println("USB Mouse");
-          break;
-        case CONF_COM_MODE_BLE:
-          _display.println("BT Mouse");
-          break;
-      }
-      break;
-    case CONF_OPERATING_MODE_GAMEPAD:
-      _display.println("Gamepad");
-      break;
-    default:
-      _display.println("Error");
-  }
-  _display.print("Attempt:");
-  _display.println(_testScreenAttempt);
-
-  _display.println(usbConnectDelay);
-  flushDisplay();
-}
+// (4.9.0 review) testPage definition removed with its declaration —
+// zero call sites anywhere in the tree (a v4.0-era leftover).
 
 //*********************************//
 // Function   : noUsbPage

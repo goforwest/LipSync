@@ -106,8 +106,8 @@ int getJoystickAcceleration(bool responseEnabled, bool apiEnabled);
 void getJoystickAcceleration(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void setJoystickAcceleration(bool responseEnabled, bool apiEnabled, int inputAccelerationLevel);
 void setJoystickAcceleration(bool responseEnabled, bool apiEnabled, String optionalParameter);
-void increaseJoystickAcceleration(bool responseEnabled, bool apiEnabled);
-void decreaseJoystickAcceleration(bool responseEnabled, bool apiEnabled);
+// (4.9.0 review) increaseJoystickAcceleration/decreaseJoystickAcceleration
+// declarations removed with their dead definitions (zero call sites).
 
 // Joystick geometry: initialization, calibration and deadzones
 void getJoystickInitialization(bool responseEnabled, bool apiEnabled);
@@ -223,11 +223,40 @@ bool lsBleStackReady();  // !needsInitialization — every BT call site gates on
 uint8_t lsHostEnumerate(lsHostRow* rows, uint8_t cap);  // MAC-sorted bond rows; returns the exposed (capped) row count
 bool lsHostActiveMac(char* out13);  // 12-hex bond address of the connected host, false when none/unbonded
 bool lsHostDisconnectCurrent();     // disconnect the connected host, true when nothing to do
-void lsHostEnsureAdvertising();     // (re)start open advertising if the set is not running
+bool lsHostEnsureAdvertising();     // (re)start open advertising if the set is not running; returns whether advertising IS running (4.9.0 — callers that promise pair-new must check it)
+// (4.9.0) lsHostAddrIsRpa / lsHostRpaHashMatches live in LSHostSwitch.h (the
+// pure, host-tested layer); lsHostRpaResolvesIrk is internal to LSBLE.h
+// (the only caller is the tick in the same translation unit).
+bool lsHostArmSwitchWindow(const char* targetMac12, int* outAddrType = NULL, int* outHasIrk = NULL);   // switch window: read+coerce the target identity for the DIRECTED advertise (call BEFORE the disconnect; false = fallback to open advertising; reports the identity's addr type and IRK presence for the wire INFO line)
+uint32_t lsHostBeginSwitchWindow(void); // switch window: start the DIRECTED advertise at the target identity (call AFTER the disconnect; returns NRF_SUCCESS or the SD error code; failure = disarmed + open advertising)
+void lsHostDisarmSwitchWindow(void);                   // clear the SD whitelist + identity list (stock empty state; no-op storage after 4.8.8 — the directed mechanism arms neither)
+void lsHostCloseSwitchWindow(void); // close an open window: stop the window advertise, disarm, restore auto-restart, resume open advertising when no host is connected
+void lsHostCancelSwitchWindow(void); // cancel an open window without owning the final radio state (a second switch re-owns the radio from its own arm/begin/fallback)
+int  lsHostSwitchWindowTick(void);  // poll an open window: 1 = armed target connected, 0 = waiting (directed set re-armed), -1 = bound elapsed / re-arm failed, -2 = NON-TARGET connected (switch NOT confirmed; named on the wire)
+void lsHostServiceSwitchWindow(void);  // per-loop-pass window service (millisecond-granularity directed re-arms); no-op when no window is open
+bool lsHostSwitchWindowOpen(void);     // 4.9.0: is a switch window open? (the BT,3 gate — the bouncer would drop the peer pair-new admits)
+void lsHidWatchdogLoop(void);  // HID-subscription watchdog (btFeedbackLoop, 1 s): cycle a bonded link whose mouse CCCD never enables (bounded 3, grace 5 s); no-op unless BLE is up and no window is open
+extern int g_comMode;          // 0 = None, 1 = USB, 2 = Wireless (defined in LipSync_Firmware.ino; the watchdog reads it)
 bool lsHostForgetByMac(const char* mac12);  // remove one bond file (explicit InternalFS.remove + absence verification — the lib's void bond_remove_key cannot report failure)
 void lsHostPushState(bool force = false);  // MANUAL,0:BT,4/BT,5 pushes with change-detect + silent boot prime (the CH,5 contract); force skips the prime for the forget paths
 void lsHostRefusalLine(String commandKey, int reason, int row);  // named ERROR line for a refusal
-int lsHostExecuteSwitch(int targetRow, const char* expectedMac12);  // TOCTOU re-check + row-identity check (NULL expected = index contract) + disconnect + re-advertise; ALLOW or a refusal reason
+
+// Switch-window outcome (4.8.7 review): the window's fate travels to the
+// CALLER instead of the executor enqueueing wire lines — the serial BT,1
+// handler emits its INFO lines AFTER its own SUCCESS/FAIL frame (the old
+// executor enqueue order put an unsolicited INFO: ahead of the response),
+// and the Hub-menu path emits no phantom "BT,1" lines at all (the screen
+// already narrates the switch; unsolicited BT,1 telemetry misleads).
+struct lsHostSwitchOutcome {
+  bool windowOpened;
+  bool armFailed;                        // true = the arm refused (begin never attempted)
+  char targetMac12[LSHOST_MAC_CHARS + 1];
+  int addrType;                          // armed identity's SD addr type (post-coercion), -1 when unknown
+  int hasIrk;                            // 1 = the bond carries an IRK (captured for the tick's RPA resolver; no SD identity list exists — bench 4.8.8-4.8.17)
+  uint32_t beginRc;                      // NRF_SUCCESS or the failing SD rc (0x01=configure, 0x02=tx_power, 0x03=adv_start | SD code)
+  char wlText[24];                       // the armed directed target "AA:BB:CC:DD:EE:FF/N" (post-coercion) for the wire INFO line
+};
+int lsHostExecuteSwitch(int targetRow, const char* expectedMac12, lsHostSwitchOutcome* out = NULL);  // TOCTOU re-check + row-identity check (NULL expected = index contract) + disconnect + the whitelist switch window (upstream #16 B4 contingency); ALLOW or a refusal reason. With a non-NULL out, reports the window's fate; every failure path restores stock radio state.
 int lsHostExecuteForget(int targetRow, const char* expectedMac12);  // TOCTOU re-check + row-identity check + (disconnect) + bond-file removal
 void applyHardBandActionOverrides();  // upstream #58: HA/HB -> live SAP table (initSapActions at boot; the HA/HB setters apply live)
 bool lsHostAnyConnected();               // any central connected (bonded or not) — pair-new gate
@@ -426,8 +455,20 @@ static inline void lipsyncRetentionUpdate(uint32_t id, uint8_t clr, uint8_t set)
     if (clr) (void) sd_power_gpregret_clr(id, clr);
     if (set) (void) sd_power_gpregret_set(id, set);
   } else {
+    // (4.9.0 review) the mask-based argument only holds for the SVC path —
+    // each SVC is atomic on the SD side. The RAW path (USB-only boots, where
+    // the SD is down) is a plain RMW on a memory-mapped register, and the
+    // witness ISR runs at priority 0 there — it can preempt a loop-context
+    // update between its load and store, and the loop's stale-value store
+    // then erases the ISR's marker (a hang forensics stamp lost -> pm=0
+    // "unattributed"). The raw path only ever runs with the SoftDevice down,
+    // so a PRIMASK critical section is safe by construction there (no SVC
+    // can be pending on a dead SD) and closes the interleaving.
     volatile uint32_t* r = (id != 0) ? &NRF_POWER->GPREGRET2 : &NRF_POWER->GPREGRET;
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
     *r = (*r & ~(uint32_t)clr) | (uint32_t)set;
+    if (!primask) __enable_irq();
   }
 }
 // 4.5.20: the previous BLE boot's flash-persisted verdict, consumed at boot
@@ -459,6 +500,8 @@ void screenReturnToMenuTransitionDone();
 void screenFullCalibConfirmTransitionDone();
 void screenFactoryResetConfirm2TransitionDone();
 void screenModeLockedTransitionDone();
+// Destructive hold-gate note continuation (bench 2026-11-06)
+void screenHoldConfirmNoteTransitionDone();
 // Upstream #16: the Bluetooth host pages' dwell continuations
 void screenBtSwitchTransitionDone();
 void screenBtNoteTransitionDone();

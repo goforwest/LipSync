@@ -592,6 +592,34 @@ static void test_nested_run_cannot_double_fire_final_callback() {
   s_nestedFinalPool = nullptr;
 }
 
+// (4.9.0 review) a nested run() must also preserve OTHER slots' pending
+// dispositions, not just the executing callback's: two RUN_ONCE slots due on
+// the same pass, and slot A's callback runs a nested pass BEFORE the outer
+// second loop reaches slot B — the nested pass used to reset B's RUNANDDEL
+// to DONTRUN (its previousTime was already advanced, so nothing re-marked
+// it) and B silently deferred a full interval.
+static LSTimer<void>* s_multiNestedPool = nullptr;
+static int s_multiBfires = 0;
+static void multiNestedACb() {
+  s_multiNestedPool->run();  // nested pass while slot B's disposition is still pending
+}
+static void multiNestedBCb() { s_multiBfires++; }
+
+static void test_nested_run_preserves_other_slots_dispositions() {
+  resetCounters();
+  LSTimer<void> pool;
+  s_multiNestedPool = &pool;
+  s_multiBfires = 0;
+  int a = pool.setTimeout(0, multiNestedACb);
+  int b = pool.setTimeout(0, multiNestedBCb);
+  CHECK(a >= 0);
+  CHECK(b >= 0);
+  advanceMs(1);
+  pool.run();
+  CHECK_EQ(s_multiBfires, 1);  // B fired on the SAME pass (old code: deferred a full interval)
+  s_multiNestedPool = nullptr;
+}
+
 // (4.5.7 review) numRuns saturates at MAX_INT instead of wrapping to 1, so
 // a maxNumRuns of 65535 terminates (the old wrap silently made it
 // RUN_FOREVER).
@@ -683,6 +711,7 @@ int main() {
   test_callback_may_delete_another_timer_mid_run();
   test_nested_run_cannot_double_fire();
   test_nested_run_cannot_double_fire_final_callback();
+  test_nested_run_preserves_other_slots_dispositions();
   test_numruns_saturation_terminates_max_count();
   test_maxNumRuns_above_saturation_ceiling_clamps();
   test_anchorAllToNow_clears_catchup_debt();

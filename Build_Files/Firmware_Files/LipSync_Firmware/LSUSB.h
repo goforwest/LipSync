@@ -93,7 +93,9 @@ class LSUSBMouse {
     uint32_t nonzeroReports = 0;      // Reports that carried actual movement (x or y != 0)
     int16_t maxAbsReport = 0;         // Largest |x|/y| ever sent — 0 forever means the report PIPELINE sends zeros
     uint8_t consecutiveSkips = 0;     // Not-ready ticks in a row — persistence separates a transient busy endpoint from a real outage
-    unsigned long _lastReportAttemptMs = 0;
+    // (4.8.7 review) _lastReportAttemptMs removed here: write-only since it
+    // was added — no reader anywhere in the tree (the same class the 4.5.7
+    // review removed showTestPage for). The BH counters above ARE consumed.
   protected:
     uint8_t _buttons;
     bool _begun = false;   // HID interface registered on the USB configuration — must happen exactly once (see begin())
@@ -269,7 +271,6 @@ bool LSUSBMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t 
   // improvements item 2). Skipping the report costs one lost cursor update
   // while the connect machinery recovers the interface.
 	wakeup();
-  _lastReportAttemptMs = millis();
   reportAttempts++;
   if (!isReady()) {
     // A not-ready endpoint is not always an outage: a report still in flight

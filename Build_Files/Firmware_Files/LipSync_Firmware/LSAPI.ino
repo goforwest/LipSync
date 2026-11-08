@@ -296,7 +296,18 @@ bool processSerialMessage(String commandString, bool settingsFlag) {
 
   // Unrecognized input in either mode
   bootTrailStamp(7);  // witness v7: an actual serial message is being dispatched (unrecognized shape, but a dispatch)
-  printResponseInt(true, true, false, 0, commandString, false, 0);
+  if (settingsFlag == true) {
+    // 4.8.7 review: in-settings-mode garbage used to answer the SUCCESS
+    // errno (FAIL,0) — the same numeral the not-in-settings-mode signal uses
+    // — so the refusal class depended on message length (an 11-char bad
+    // value got FAIL,3 from the setter's range check; a 12-char one got
+    // FAIL,0 here). Answer the unknown-command errno instead. The mode still
+    // exits (the deliberate recovery — a garbage flood ends the mode, and
+    // the app's per-command SETTINGS handshake re-enters cleanly).
+    printResponseInt(true, true, false, 1, commandString, false, 0);
+  } else {
+    printResponseInt(true, true, false, 0, commandString, false, 0);
+  }
   return false;
 }
 
@@ -326,10 +337,13 @@ bool serialSettings(bool enabled) {
     } else {
       serialRxBuf += c;
       if (serialRxBuf.length() > SERIAL_RX_MAX_LEN) {
-        // A flood with no terminator: discard and answer once (echo truncated)
+        // A flood with no terminator: discard and answer once (echo truncated).
+        // 4.8.7 review: the unknown-command errno, not the SUCCESS errno —
+        // an over-length line is a malformed command, not the "settings mode
+        // not enabled" signal.
         String overflow = serialRxBuf.substring(0, SERIAL_RX_MAX_LEN);
         serialRxBuf = "";
-        printResponseInt(true, true, false, 0, overflow, false, 0);
+        printResponseInt(true, true, false, 1, overflow, false, 0);
         settingsFlag = false;
       }
     }
@@ -592,6 +606,18 @@ void getVersionNumber(bool responseEnabled, bool apiEnabled) {
   int tempMajorVersionNumber = mem.readInt(CONF_SETTINGS_FILE, "VN1");
   int tempMinorVersionNumber = mem.readInt(CONF_SETTINGS_FILE, "VN2");
   int tempRevVersionNumber   = mem.readInt(CONF_SETTINGS_FILE, "VN3");
+
+  // (4.9.0 review) These heal-writes are deliberately NOT wrapped in an
+  // extra isLastReadOk gate of their own — the one exemption to pin, with
+  // its argument: the only legal stored values for VN1/2/3 ARE the compiled
+  // constants, so even on a transient failed read (which yields 0) the
+  // local assignments above restore the true constants and VN,0 answers
+  // correctly; the writer family's own read-truth refusal skips the file
+  // write on the failed read (harmless — the next good read heals it), and
+  // a truly corrupt file is initialize()'s re-seed at the next boot.
+  // Gating the LOCAL assignments instead would answer VN,0:0 on a transient
+  // read failure and desync the app's version detection for nothing. Any
+  // future key added to this path must re-derive this argument.
   
   if (tempMajorVersionNumber != CONF_LIPSYNC_VERSION_MAJOR) {                          // If the previous firmware was different version then reset the settings
     // could add factory reset here if version number saved in memory is different
@@ -662,6 +688,11 @@ void getDeviceID(bool responseEnabled, bool apiEnabled) {
   if (tempDeviceID != deviceID) {  // If string doesn't match, store to memory
     mem.writeString(CONF_SETTINGS_FILE, commandKey, deviceID);
   }
+  // (4.9.0 review) Deliberately NOT wrapped in its own isLastReadOk gate —
+  // the same pinned exemption as getVersionNumber: the answer is the chip's
+  // live UID (always the truth), and the write family's read-truth refusal
+  // skips the file write on a failed read (harmless — the next good read
+  // heals the file).
   if (deviceID.length() > 0) {
     g_deviceUID = deviceID; // Update global variable
   }
@@ -1435,7 +1466,11 @@ void loadJoystickDeadzonePair(float &innerDeadzone, float &outerDeadzone) {
   if (!valid) {
     innerDeadzone = CONF_JOY_DEADZONE_INNER_DEFAULT;
     outerDeadzone = CONF_JOY_DEADZONE_OUTER_DEFAULT;
-    if (!settings.isNull()) {
+    // (4.9.0 review) the heal write is isLastReadOk-gated like every writer
+    // now is — on a failed read the null-document check alone could pass (a
+    // truncated-but-parseable file is non-null) and persist defaults over a
+    // file the next boot would have re-seeded wholesale.
+    if (!settings.isNull() && mem.isLastReadOk()) {
       settings["IZ"] = innerDeadzone;
       settings["OZ"] = outerDeadzone;
       mem.writeObject(CONF_SETTINGS_FILE, "IZ/OZ", settings);
@@ -2064,7 +2099,8 @@ float getHardSipPressureThreshold(bool responseEnabled, bool apiEnabled) {
 //***GET HARD SIP PRESSURE THRESHOLD API FUNCTION***//
 // Function   : getHardSipPressureThreshold (overload)
 //
-// Description: API entry point for HS,0 (returns the value without writing).
+// Description: API entry point for HS,0 — the getter's contract (the heal
+//              write of a fresh/invalid stored value included), not a pure read.
 //
 // Parameters :  responseEnabled, apiEnabled, optionalParameter
 //
@@ -2167,7 +2203,8 @@ float getHardPuffPressureThreshold(bool responseEnabled, bool apiEnabled) {
 //***GET HARD PUFF PRESSURE THRESHOLD API FUNCTION***//
 // Function   : getHardPuffPressureThreshold (overload)
 //
-// Description: API entry point for HP,0 (returns the value without writing).
+// Description: API entry point for HP,0 — the getter's contract (the heal
+//              write of a fresh/invalid stored value included), not a pure read.
 //
 // Parameters :  responseEnabled, apiEnabled, optionalParameter
 //
@@ -2255,7 +2292,14 @@ static int getHardAction(bool responseEnabled, bool apiEnabled, const char* comm
   // Out-of-vocabulary values heal to the compiled default here; the live
   // table additionally applies the caregiver allowlist at load (a stored
   // in-range but disallowed action keeps the compiled row there).
-  if ((tempHardAction < CONF_ACTION_NOTHING) || (tempHardAction > CONF_ACTION_FACTORY_RESET)) {
+  // 4.9.0: the getter's ANSWER is now allowlist-gated too — an in-vocabulary
+  // but disallowed action (e.g. a hand-edited HB=24 FACTORY_RESET, which
+  // switchRemapAllowed refuses) used to be answered with SUCCESS while the
+  // live table kept the compiled row, hiding the divergence from the app.
+  // The answer falls back to the compiled default exactly like the live
+  // load path does, so what the app sees is always what is in force.
+  if ((tempHardAction < CONF_ACTION_NOTHING) || (tempHardAction > CONF_ACTION_FACTORY_RESET)
+      || !switchRemapAllowed(tempHardAction, false)) {
     tempHardAction = compiledDefault;
     if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
       mem.writeInt(CONF_SETTINGS2_FILE, commandKey, tempHardAction);
@@ -2479,41 +2523,10 @@ void setJoystickAcceleration(bool responseEnabled, bool apiEnabled, String optio
 //
 // Return     : void
 //*********************************//
-void increaseJoystickAcceleration(bool responseEnabled, bool apiEnabled) {
-  int tempJoystickAccelerationLevel=acceleration;
-  tempJoystickAccelerationLevel++;
-  if(tempJoystickAccelerationLevel <= CONF_JOY_ACCELERATION_LEVEL_MAX) {
-    setJoystickAcceleration(responseEnabled, apiEnabled, tempJoystickAccelerationLevel);
-  } 
-  else {
-  }
-
-}
-
-//***DECREASE/DECELERATE JOYSTICK MOVEMENT FUNCTION***//
-// Function   : decreaseJoystickAcceleration
-//
-// Description: This function decreases the joystick acceleration level by one.
-//
-// Parameters :  responseEnabled : bool : The response for serial printing is enabled if it's set to true.
-//                                        The serial printing is ignored if it's set to false.
-//               apiEnabled : bool : The api response is sent if it's set to true.
-//                                   Manual response is sent if it's set to false.
-//
-// Return     : void
-//*********************************//
-void decreaseJoystickAcceleration(bool responseEnabled, bool apiEnabled) {
-  int tempJoystickAccelerationLevel=acceleration;
-  tempJoystickAccelerationLevel--;
-  // The old comparison was inverted (<= MIN) — the level could only ever be
-  // decreased once it was already at the bottom; anything above it no-op'd.
-  if(tempJoystickAccelerationLevel >= CONF_JOY_ACCELERATION_LEVEL_MIN){
-    setJoystickAcceleration(responseEnabled, apiEnabled, tempJoystickAccelerationLevel);
-  }
-  else{
-  }
-
-}
+// (4.9.0 review) increaseJoystickAcceleration / decreaseJoystickAcceleration
+// removed here: zero call sites (the dispatch table exposes only AV,0/AV,1
+// and the Hub menu steps acceleration via get/setJoystickAcceleration
+// directly) — the same dead-code class the 4.8.1 round removed.
 
 //***GET COMMUNICATION MODE FUNCTION***//
 // Function   : getCommunicationMode
@@ -3823,13 +3836,34 @@ void switchBluetoothHost(bool responseEnabled, bool apiEnabled, String optionalP
   const int targetRow = optionalParameter.toInt();
   // NULL identity: the serial index contract (the app re-reads BT,0 after
   // every BT,4 push; the menu paths pass the identities they rendered).
-  const int decision = lsHostExecuteSwitch(targetRow, NULL);
+  // For the serial path, open the whitelist window too (bench B4; the menu
+  // path goes through its own confirm flow, which also opens the window).
+  lsHostSwitchOutcome oc;
+  const int decision = lsHostExecuteSwitch(targetRow, NULL, &oc);
   if (decision != LSHOST_ALLOW) {
     printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, targetRow);
     lsHostRefusalLine(commandKey, decision, targetRow);
     return;
   }
   printResponseInt(responseEnabled, apiEnabled, true, 0, commandKey, true, targetRow);
+  // Bench observability (2026-11-07, restructured by the 4.8.7 review): the
+  // window's fate is NAMED on the wire — AFTER the response frame (the old
+  // executor enqueued its INFO lines first, so an unsolicited INFO: preceded
+  // the command's own ack). If the window opened, lsHostSwitchWindowTick
+  // closes it when the target's identity connects or it times out; every
+  // fallback already resumed open advertising. No blocking here — the wire
+  // contract acks first, transitions follow via MANUAL,0:BT,5.
+  if (oc.windowOpened) {
+    serialTxEnqueueLine(String("INFO: BT,1 window opened (target row ") + targetRow
+                        + " target=" + oc.wlText + " irk=" + oc.hasIrk + ")");
+  } else if (oc.armFailed) {
+    serialTxEnqueueLine("INFO: BT,1 window FALLBACK (arm failed) — open advertising");
+  } else {
+    serialTxEnqueueLine(String("INFO: BT,1 window FALLBACK (begin rc=0x")
+                        + String(oc.beginRc, HEX) + " target=" + oc.wlText + " irk=" + oc.hasIrk
+                        + " conn=" + g_switchWindowFailConn + " waited=" + g_switchWindowFailWaitedMs
+                        + "ms) — open advertising");
+  }
 }
 
 //***FORGET BLUETOOTH HOST FUNCTION***//
@@ -3900,7 +3934,25 @@ void pairNewBluetoothHost(bool responseEnabled, bool apiEnabled) {
     serialTxEnqueueLine("ERROR: BT,3 refused — a host is connected; switch away first");
     return;
   }
-  lsHostEnsureAdvertising();
+  // A switch window owns the radio (4.9.0): its bouncer drops every connect
+  // that is not the armed target, so a peer pair-new exists to admit would be
+  // bounced for the window's remainder behind a SUCCESS ack. Refuse with the
+  // named line; pair-new supersedes nothing — the pending switch keeps its
+  // semantics, and the caregiver can retry after the window closes (60 s
+  // bound) or after the switch completes.
+  if (lsHostSwitchWindowOpen()) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, 1);
+    serialTxEnqueueLine("ERROR: BT,3 refused — a switch window is waiting for its target; retry in a moment");
+    return;
+  }
+  // Honest ack (4.9.0): start() can refuse in the post-disconnect SD-teardown
+  // window (bench 4.8.5/4.8.10) — acking SUCCESS while nothing is on air left
+  // a new host with no device to find and the app believing pair-new armed.
+  if (!lsHostEnsureAdvertising()) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, commandKey, true, 2);
+    serialTxEnqueueLine("ERROR: BT,3 refused — the radio would not start advertising (SD busy); retry in a moment");
+    return;
+  }
   printResponseInt(responseEnabled, apiEnabled, true, 0, commandKey, true, 1);
 }
 
@@ -3917,8 +3969,18 @@ void pairNewBluetoothHost(bool responseEnabled, bool apiEnabled, String optional
 // caller captured are re-validated here against fresh enumeration. Returns
 // LSHOST_ALLOW or the refusal reason (the same enum the pure layer uses).
 
-int lsHostExecuteSwitch(int targetRow, const char* expectedMac12) {
+int lsHostExecuteSwitch(int targetRow, const char* expectedMac12,
+                        lsHostSwitchOutcome* out) {
   if (needsInitialization) return LSHOST_REFUSE_NOT_INITIALIZED;
+  if (out != NULL) {
+    out->windowOpened = false;
+    out->armFailed = false;
+    out->targetMac12[0] = '\0';
+    out->addrType = -1;
+    out->hasIrk = 0;
+    out->beginRc = 0;
+    out->wlText[0] = '\0';
+  }
   lsHostRow rows[LSHOST_ENUM_CAP];
   const uint8_t count = lsHostEnumerate(rows, LSHOST_ENUM_CAP);
   int activeRow = 0;
@@ -3949,8 +4011,59 @@ int lsHostExecuteSwitch(int targetRow, const char* expectedMac12) {
   // disconnect entirely — the switch acked SUCCESS while the old host held
   // the link and the target could never take it. The switch's job is to free
   // the radio connection, whatever its bonding state.
-  if (lsHostAnyConnected() && !lsHostDisconnectCurrent()) return LSHOST_REFUSE_RADIO;
-  lsHostEnsureAdvertising();  // belt-and-braces: the disconnect handler re-advertises on its own
+  // Multi-host switching (upstream #16) — whitelist contingency (bench B4):
+  // instead of resuming stock open advertising immediately, open a bounded
+  // whitelist window that admits ONLY the target host (identity address +
+  // IRK, read via the lib's bond loader). The just-disconnected host — which
+  // used to race back in sub-second on macOS (B4: 0/5 away-from-Mac) — cannot
+  // connect while the window is open. Sequence: CANCEL any stale window
+  // (4.8.7 review: a second switch over an open window left the stale flag
+  // armed with the old timestamp — its backstop later stop/restarted live
+  // advertising and could report a phantom "target won"), ARM before the
+  // disconnect, SUSPEND the stock disconnect auto-restart (4.8.7 review: the
+  // DISCONNECTED handler's FP_ANY restart was a sub-second open window the
+  // old host won — with it suspended NOTHING is on air until the window's
+  // directed advertise), then BEGIN after the disconnect. Any SD refusal
+  // disarms, restores the auto-restart and falls back to open advertising —
+  // the pre-contingency behavior — never a wedge. btFeedbackLoop's
+  // lsHostSwitchWindowTick closes the window only when the ARMED TARGET's
+  // identity connects (a non-target is named on the wire, never reported as
+  // a successful switch) or the bound elapses. The window's fate rides the
+  // outcome struct — the wire INFO lines belong to the serial caller (post-
+  // ack), not to this executor (the menu path emits no phantom BT,1 lines).
+  lsHostCancelSwitchWindow();
+  int wlAddrType = -1, wlHasIrk = 0;
+  // 4.9.0: the arm runs for EVERY switch — the outcome struct is reporting
+  // only. Coupling the arm to out != NULL meant a future caller that omitted
+  // the outcome silently lost the B4 contingency (the pre-4.8.3 wrong-host
+  // race, with no wire line to say so).
+  const bool armed = lsHostArmSwitchWindow(rows[targetRow - 1].mac, &wlAddrType, &wlHasIrk);
+  if (armed) lsHostSuspendAutoRestart();
+  if (lsHostAnyConnected() && !lsHostDisconnectCurrent()) {
+    if (armed) {
+      lsHostRestoreAutoRestart();
+      lsHostDisarmSwitchWindow();
+    }
+    return LSHOST_REFUSE_RADIO;
+  }
+  uint32_t beginRc = 0;
+  const bool opened = armed && ((beginRc = lsHostBeginSwitchWindow()) == NRF_SUCCESS);
+  if (out != NULL) {
+    out->windowOpened = opened;
+    out->armFailed = !armed;
+    out->addrType = wlAddrType;
+    out->hasIrk = wlHasIrk;
+    out->beginRc = beginRc;
+    strncpy(out->wlText, g_switchWlText, sizeof(out->wlText) - 1);
+    out->wlText[sizeof(out->wlText) - 1] = '\0';
+    if (opened) {
+      strncpy(out->targetMac12, rows[targetRow - 1].mac, LSHOST_MAC_CHARS);
+      out->targetMac12[LSHOST_MAC_CHARS] = '\0';
+    }
+  }
+  if (!opened && !armed) {
+    lsHostEnsureAdvertising();  // stock open advertising (idempotent when restartOnDisconnect already runs)
+  }
   return LSHOST_ALLOW;
 }
 
@@ -3977,6 +4090,23 @@ int lsHostExecuteForget(int targetRow, const char* expectedMac12) {
   if (!lsHostRowIdentityMatches(&rows[targetRow - 1], expectedMac12)) {
     return LSHOST_REFUSE_RANGE;
   }
+  // A forget supersedes any in-flight switch window (4.9.0): BT,2 has no
+  // frozen gate and can land mid-window. Left open, the window kept the radio
+  // directed at the just-forgotten bond — pair-new was dead for the window's
+  // remainder (the bouncer dropped every new host), and the forgotten host
+  // (keys intact on ITS side) could reconnect, match the armed bytes, and
+  // close the window reporting a successful "switch" toward a bond that no
+  // longer exists. Cancelling restores the stock radio state; the forget
+  // then owns the world. Deliberately AFTER the decision gates: a REFUSED
+  // forget must not disturb a window its caller never owned.
+  // (4.9.0 review) cancel does NOT resume advertising (its other caller — a
+  // new switch — re-owns the radio), and a forget of an INACTIVE host never
+  // disconnects, so no DISCONNECTED event would restart advertising either:
+  // the radio sat silently non-discoverable with no wire or OLED trace.
+  // Resume open advertising here when nothing is connected — the connected
+  // path keeps restartOnDisconnect's own post-disconnect restart.
+  lsHostCancelSwitchWindow();
+  if (!Bluefruit.connected()) lsHostEnsureAdvertising();
   if (rows[targetRow - 1].active && !lsHostDisconnectCurrent()) return LSHOST_REFUSE_RADIO;
   if (!lsHostForgetByMac(rows[targetRow - 1].mac)) return LSHOST_REFUSE_RADIO;
   return LSHOST_ALLOW;
@@ -4456,6 +4586,28 @@ void enterUpdateMode(bool responseEnabled, bool apiEnabled) {
   }
 
   delay(CONF_UPDATE_MODE_DWELL_MS);
+
+  // THE ARMED WATCHDOG SURVIVES THE RESET (4.9.0 — the DFU class): the WDT
+  // cannot be stopped and survives warm resets (the inherited-instance feed
+  // at boot is built on exactly that), and the stock bootloader never feeds
+  // it. Without this reload the bootloader inherited a PARTIALLY-CONSUMED
+  // budget (up to 30 s minus command processing); the reload hands it a
+  // fresh full CONF_WATCHDOG_TIMEOUT_SEC. THE HONEST CEILING (4.9.0 review
+  // correction): the ceiling CANNOT be extended here — nRF52 PS, WDT:
+  // "After it is started, the watchdog's configuration registers, which
+  // comprise registers CRV, RREN, and CONFIG, will be blocked for further
+  // configuration." A CRV write while running is silently ignored, so the
+  // bootloader's budget is at most one full 30 s. That covers the
+  // production update path (LipSync Connect streams the image immediately
+  // after the UM ack + 1200-baud touch; the transfer is a few seconds over
+  // USB CDC); the serial-monitor manual path (SETTINGS + UM,1:1, then a
+  // hand-driven flash) must begin within ~30 s — documented, not silently
+  // claimed. A true extension would need a bootloader-side feed (a separate
+  // vendored binary, out of scope) — do NOT re-add a CRV write assuming it
+  // works.
+  if (NRF_WDT->RUNSTATUS != 0) {
+    NRF_WDT->RR[0] = WDT_RR_RR_Reload;
+  }
 
   // 4.5.27 (Fable 5.1 consult, hazard 1): the core's enterSerialDfu() writes
   // the DFU magic to NRF_POWER->GPREGRET RAW (wiring.c:85) — a POWER write

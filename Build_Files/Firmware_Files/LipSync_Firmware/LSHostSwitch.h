@@ -177,4 +177,31 @@ static inline int lsHostRowIdentityMatches(const lsHostRow* row, const char* exp
   return row->mac[LSHOST_MAC_CHARS] == '\0' && expectedMac12[LSHOST_MAC_CHARS] == '\0';
 }
 
+/* RPA admission for the switch window's bouncer (4.9.0): an iOS-style privacy
+ * target reconnects with a rotating resolvable private address whose bytes
+ * never equal the bond's stored identity — a bytes-only match bounced the
+ * legitimate target for the whole window. Two pure pieces (host-tested):
+ *
+ * - lsHostAddrIsRpa: the two most significant address bits are 01 (Core 5.3
+ *   Vol 6 Part B 1.3.2.2). Nordic byte order: addr[5] carries them.
+ *
+ * - lsHostRpaHashMatches: the byte-order contract of the ah() resolution
+ *   (Core 5.3 Vol 3 Part H 2.2.2, Zephyr/Nordic rpa.c ah()): the RPA is
+ *   prand = addr[3..5] (addr[5] carries the type bits) and hash = addr[0..2];
+ *   hash equals the LE-AES ciphertext's least significant 24 bits, which —
+ *   when the AES core is big-endian (sd_ecb_block_encrypt) — are the BE
+ *   ciphertext's bytes [15], [14], [13]. The firmware computes cipherBe with
+ *   the SD's ECB and passes it here; the host suite pins the byte order with
+ *   a fixed vector (IRK 000102...0f, prand 334455 -> hash ab1f54,
+ *   cipherBe d8343d6d3fc4ae4554475cc121541fab). */
+static inline int lsHostAddrIsRpa(const unsigned char addr[6]) {
+  return (addr[5] & 0xC0) == 0x40;
+}
+
+static inline int lsHostRpaHashMatches(const unsigned char peerAddr[6], const unsigned char cipherBe[16]) {
+  return peerAddr[0] == cipherBe[15]
+      && peerAddr[1] == cipherBe[14]
+      && peerAddr[2] == cipherBe[13];
+}
+
 #endif  // LSHOST_SWITCH_H

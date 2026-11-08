@@ -181,7 +181,17 @@ void LSTimer<T>::run() {
 
         // A nested run() must leave the outer callback's deferred disposition
         // intact (especially RUNANDDEL, which the outer pass still owns).
-        if (callbackActive[i]) continue;
+        // (4.9.0 review) the disposition check covers EVERY slot the outer
+        // pass has already marked, not just the one currently executing: a
+        // nested pass used to reset toBeCalled to DONTRUN for every
+        // non-active slot, erasing RUNANDDEL/RUNONLY marks the outer pass
+        // owns — its second loop then skipped the slot (already advanced
+        // previousTime), silently deferring a due RUN_ONCE fire a full
+        // interval and desynchronising getNumRuns()-keyed chains from their
+        // actual executions. Today's callbacks never run() their own pool
+        // (all nested run() sites are cross-pool), so this is latent — but
+        // the guard now matches the header's own contract.
+        if (callbackActive[i] || timer[i].toBeCalled != DEFCALL_DONTRUN) continue;
         timer[i].toBeCalled = DEFCALL_DONTRUN;  // Default case is not to run
 
         if (timer[i].callback != NULL) {

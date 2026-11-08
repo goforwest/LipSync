@@ -564,3 +564,68 @@ interplay, overflow, power-loss (Q8); factoring + test plan (Q9).
 the wrong-host race (B4 — whitelist trigger); forget self-heal per OS (B6); host-side-forget
 tolerance (B7); real-world overflow feel (B8); Windows-specific quirks we cannot predict
 from docs.
+
+---
+
+## Q12. BENCH OUTCOME (2026-11-07) — the Q4 contingency is superseded
+
+The bench ran the full Q4 ladder plus its contingencies across 15 firmware
+iterations (full record: `Build_Files/bench-16-multi-host-results-2026-11-07.txt`;
+every mechanism bench-proven on the wire, macOS + Windows hosts):
+
+1. **The Q4 whitelist contingency is NOT implementable on S140 6.1.1.**
+   `sd_ble_gap_adv_set_configure` refuses whitelist-filtered connectable
+   advertising with `0x3201 BLE_ERROR_GAP_DISCOVERABLE_WITH_WHITELIST` (the
+   restriction covers the scannable/"discoverable" stock type), legacy PDUs
+   have **no** connectable-non-scannable-undirected type, and the SoftDevice
+   **does not enforce** either the directed target field or a whitelist on
+   directed sets (a non-addressed peer's connect-by-address is accepted).
+   Three sub-mechanisms (whitelist+open, directed alone, directed+whitelist)
+   were each built, flashed, and measured before this was certain.
+2. **Directed advertising also does not attract Windows**: its association
+   stack ignores directed packets addressed to it (macOS ignores
+   directed-to-others — which conveniently suppresses the racer). Fair trial:
+   4.8.17, healthy Windows, full 60 s windows, zero attempts.
+3. **The shipped mechanism is open-advertising + the firmware bouncer**
+   (shipped 4.8.14-4.8.16): the window is the stock `start(0)` open advertise
+   held 60 s; ANY non-target connect is dropped within milliseconds by the
+   firmware (one bounce per connection — the SD needs ~200 ms to tear a link
+   down and a millisecond tick would otherwise spin on the dying handle);
+   the target is admitted the instant it connects; the bound guarantees a
+   target-less window can never strand the radio. The wrong-host race is
+   structurally eliminated without any controller filtering.
+4. **Per-OS contract (bench-proven):** macOS reconnects in ~1 s whenever open
+   advertising exists and is held off trivially during windows (one bounce,
+   then ~60 s of its own backoff). Windows reconnects sub-second **only**
+   while its pairing state is fresh, and otherwise requires the documented
+   one-click nudge (its association stack ignores both open and directed
+   invitations when stale — with Advanced discovery and Best-performance
+   power mode set; the Power Management tab is absent on the bench adapter's
+   driver). The Q4 per-OS table's "toggle the device in Settings" fallback is
+   therefore the shipping behavior for Windows-ward switches, now
+   bench-proven rather than predicted.
+5. **Host staleness class (new, open):** heavy connect/drop churn (far beyond
+   real usage) leaves hosts "connected but HID-dead" (live view healthy, no
+   reports); a host-side toggle/reboot/re-pair clears it. A device-side
+   self-heal is designed but unimplemented: if a connection's HID
+   subscription does not enable within a few seconds, cycle the link.
+   **Update (4.8.18): implemented** — the HID-subscription watchdog
+   (btFeedbackLoop, 1 s): a bonded peer whose mouse-input CCCD is not
+   enabled after a 5 s grace gets its link disconnected once (bounded 3
+   cycles/session; the host's own retry re-subscribes cleanly).
+6. **Q4 addendum (the contingency is not implementable as specced):** the
+   design's SoftDevice-filter window — whitelist and/or directed with
+   BLE_GAP_ADV_FP_FILTER_CONNREQ — cannot be built on S140 6.1.1:
+   whitelist+discoverable is 0x3201-forbidden, no legacy
+   connectable-non-scannable PDU type exists, and the directed target field
+   AND the whitelist filter are not enforced on a directed set (measured
+   4.8.8-4.8.11). The shipped mechanism is the device-side bouncer over
+   directed (4.8.17 trial) or open (4.8.14-16, proven) advertising.
+7. **RPA addendum (4.9.0):** the bouncer's identity match is RPA-aware — a
+   privacy host (iOS default) reconnects with a rotating resolvable address
+   whose bytes never equal the bond's stored identity; the tick resolves it
+   against the armed bond's IRK (Core 5.3 ah(), sd_ecb_block_encrypt with
+   the LE/BE byte order host-pinned), and IRK-less bonds get a 3 s
+   bond-decision grace. The 4.9.0 review also closed the refused-disconnect
+   lockout surrender, the mid-window forget interaction, and the BT,3
+   honesty/window guards.

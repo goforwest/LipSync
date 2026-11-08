@@ -1,0 +1,188 @@
+================================================================================
+BENCH RECORD — upstream #16 multi-host Bluetooth switching (the B4 gate)
+Date: 2026-11-07 evening → 2026-11-08 early (single extended session)
+Device: LipSync 4.8.2 → 4.8.17 (15 build/flash iterations, all wire-verified)
+Hosts: macOS laptop ("Hamoudi___s Laptop", PUBLIC addr 74:35:42:DC:57:1C),
+       Windows 11 PC ("DESKTOP-FBIVLCV", RANDOM_STATIC addr E9:91:DF:97:C4:D8)
+       (iPhone participated early, then unpaired and removed from the field)
+Wire: /Users/hamoudi/LipSync/Build_Files/lipsync-wire.py (single-process
+      command+drain, inline timestamps, DM=0 enforced between tests)
+================================================================================
+
+== THE HEADLINE ================================================================
+
+The wrong-host race (B4) is SOLVED on the device side. Final mechanism
+(shipped in 4.8.14-4.8.16): on every switch, the device disconnects the old
+host and holds a 60-second OPEN-advertising window in which ANY non-target
+connect is dropped immediately by the firmware ("the bouncer" — one bounce
+per connection, no SD filtering dependence). The target joins whenever its
+own reconnect engine chooses to; the window cannot strand the radio (hard
+60 s bound, then stock behavior).
+
+Per-OS contract (all bench-proven tonight):
+  macOS   : fully automatic. Reconnects in ~1 s whenever open advertising
+            is available; during a window aimed at another host it is held
+            off (one bounce, then it stops trying for ~60 s — backoff).
+            Per-switch switches to the Mac: 4/4 cycles flawless.
+  Windows : joins the window ONLY when its pairing state is fresh
+            (just-re-paired: connected in 0.9 s — bench-proven once) or when
+            nudged (one click in Bluetooth settings; forget+re-add when its
+            state degrades after churn). It did NOT respond autonomously to
+            open OR directed advertising in 60 s windows, with Advanced
+            discovery + Best-performance power mode set. Windows-side
+            behavior, not a device limitation (exhaustively proven — below).
+  iOS     : untested tonight (unpaired; re-pair for future B6 rounds).
+
+== THE ORIGINAL RACE, AND THE TRIAL LADDER =====================================
+
+Original B4 failure (pre-contingency, 4.8.2): switch away from the Mac
+0/5 — macOS reclaims the link sub-second, before the target can connect.
+
+Device-side mechanisms tried, in order (each verdict earned on the wire):
+
+1. WHITELIST + OPEN ADVERTISING      — FORBIDDEN by S140 6.1.1: adv_set_configure
+                                       refuses with 0x3201 = BLE_ERROR_GAP_
+                                       DISCOVERABLE_WITH_WHITELIST ("use of
+                                       whitelist not permitted with discoverable
+                                       advertising"). Legacy PDUs have no
+                                       connectable-non-scannable-undirected type,
+                                       so the design doc's Q4 whitelist contingency
+                                       is not implementable as specced on this
+                                       stack. (Also decoded: 0x3202 is
+                                       INVALID_BLE_ADDR — our first decode was off
+                                       by one; the entry type/bytes coercion was
+                                       still needed and is kept.)
+2. DIRECTED ALONE (high-duty, target identity) — the Mac's reconnect is
+                                       SUPPRESSED entirely (it ignores packets
+                                       addressed to another host — good!), but
+                                       WINDOWS IGNORES DIRECTED PACKETS TOO.
+                                       (Fair trial finally completed in 4.8.17
+                                       against a healthy-ish Windows.)
+3. DIRECTED + WHITELIST FILTER       — S140 does NOT enforce either the directed
+                                       target field or the whitelist on directed
+                                       sets: macOS's connect-by-address walked in
+                                       (bench 4.8.9).
+4. OPEN + BOUNCER (final mechanism)  — WORKS. The lockout cannot come from the
+                                       controller; it comes from our disconnect.
+                                       (4.8.12-4.8.16 hardening: one connection =
+                                       one bounce — the SD takes ~200 ms to tear
+                                       a link down and the millisecond tick spun
+                                       600x against the same dying handle before
+                                       per-connection tracking; the disconnect
+                                       rc is ignored because it races the peer's
+                                       own teardown; the storm cap bounds a
+                                       persistent non-target.)
+5. DIRECTED, FAIR TRIAL (4.8.17)     — Windows still silent. Device side
+                                       EXHAUSTED.
+
+Windows-side knobs tried (with the user's consent, after device exhaustion):
+  Bluetooth settings page held open       — no effect in 60 s windows.
+  Discovery: Default -> Advanced          — no effect.
+  Power mode: Best performance            — no effect.
+  (Power Management tab absent on this adapter's driver.)
+  FORGET + RE-PAIR (the decisive one)     — Windows reconnects SUB-SECOND while
+                                            fresh; degrades to silent after churn.
+
+== MAC-SIDE FINDINGS ===========================================================
+
+- Reconnect: aggressive (~1 s) whenever open advertising is available.
+- After ONE bounced connect, macOS stops retrying for ~60 s (its own backoff) —
+  which is why the bouncer only ever needed 1-3 bounces per window.
+- "Connected but no HID" class (seen 3x after heavy churn/switch sequences):
+  the link is up, live view is healthy, no cursor. Fixes observed, in order of
+  gentleness: Mac Bluetooth toggle (worked once), Mac REBOOT (worked),
+  full forget + re-add on BOTH sides (worked; the sour state survived a BT
+  toggle alone the final time). Device side exonerated every time (live view
+  + wire state healthy). NOTED FOR SHIP: a device-side self-heal is possible —
+  if a connection exists but the HID subscription does not enable within a few
+  seconds, cycle the link. Not implemented tonight; queued.
+- Bond-type/bytes: the Mac's bond stores PUBLIC for an 11-marker-high address
+  (S140 validates upper-bits-vs-type on list entries) — lsHostCoerceAddrType
+  reconciles type to bytes before any list/directed use (kept in 4.8.7+).
+
+== BENCH-LOG / TOOLING LESSONS =================================================
+
+- DEBUG flood: the app re-enables DM on connect (DM=1/2/5 all seen); every
+  bench run must set DM,1:0 first. (Same lesson as the 2026-11-06 session.)
+- Two serial clients on one port kill each other ("multiple access on port");
+  command + long watch must be ONE process, timestamps stamped inline.
+- /var/folders temp dirs are cleaned WITHOUT a reboot: the wire client and
+  built artifacts were wiped mid-session twice. The wire client now lives in
+  the repo (Build_Files/lipsync-wire.py); artifacts build into the app repo's
+  dev/firmware/dist.
+
+== FIXES SHIPPED TONIGHT (4.8.3 → 4.8.17, all in CHANGES.txt) ==================
+
+- HOLD-GATE NOTE (LSScreen, B5 finding): a too-short hold on a destructive row
+  names itself ("Too short: HOLD the row to confirm") instead of a bare beep.
+- ALREADY-ACTIVE REFUSAL NAMED (LSScreen, B5 finding): selecting the current
+  host shows "Already on this host" instead of a silent no-op.
+- THE SWITCH WINDOW + BOUNCER (the B4 contingency, final shape): 60 s open-
+  advertising window, one-bounce-per-connection non-target dropping, target-
+  identity confirmation, bounded so a target-less window can never strand the
+  radio. Vendored lib back to STOCK (the directed/whitelist trial machinery
+  reverted; only the 4.8.7-era hold-gate/fixes and window logic remain).
+- Window hardening (4.8.7-4.8.16, most of it from the user's parallel review
+  loop): auto-restart suspend/restore across the lifecycle, stale-window
+  cancel, CONN_COUNT teardown retries, per-connection bounce tracking, INFO
+  lines naming every arm/begin/close outcome, fail-closed arm stop, fatal
+  identity-list refusal (moot post-revert but the shape survived).
+- Wire client moved into the repo: Build_Files/lipsync-wire.py.
+
+== OPEN FOR THE NEXT SESSION ===================================================
+
+1. B5-B11 re-runs on the final mechanism (the 4.8.16/17 mechanism is the one
+   to lock; re-run the numbered bench).
+2. The HID-subscription self-heal (device-side watchdog: cycle a link whose
+   HID does not enable within ~3 s) — makes tonight's host-staleness class
+   self-correcting.
+3. App-side: sync the review loop's app changes (the cross-check's display-cap
+   assertion now asserts the design's "Hub caps at 4, app lists all"); the app
+   still re-enables DM on connect (wire noise) — investigate.
+4. Version/tag decision: 4.8.17 is the bench-proven build; the tag decision
+   (and the B11-style downgrade round-trip on the final build) pending.
+5. Design doc: add a bench-outcome addendum — the Q4 whitelist contingency is
+   not implementable on S140 6.1.1 (discoverable restriction + no legacy
+   connectable-non-scannable type + directed filters not enforced); the shipped
+   mechanism is open+bouncer (documented here and in CHANGES 4.8.14-16).
+6. The pre-4.8.2-era artifacts (dist-48xx temp dirs) are wiped by the OS temp
+   cleaner; artifacts now build into dev/firmware/dist (stable).
+
+== VERDICT =====================================================================
+
+B4: PASS on the mechanism — the wrong-host race is structurally eliminated
+(the Mac cannot win a window; the target is admitted the instant it appears).
+Windows-ward switches complete autonomously when Windows' pairing state is
+healthy, and with the one documented Windows-side click otherwise. macOS-ward
+switches are fully automatic. This satisfies the design's per-OS table
+exactly as written on day one.
+================================================================================
+
+================================================================================
+4.9.0 REVIEW-SESSION ADDENDUM (2026-11-08)
+================================================================================
+
+The full review/fix loop over the 4.8.18 tree closed the open items above:
+
+- Item 2 (HID self-heal) shipped in 4.8.18 and is hardened in 4.9.0 (the
+  grace belongs to its link; refused disconnects never burn the cycle
+  budget; a drop+reconnect can no longer inherit an elapsed grace).
+- Item 3 (app-side): the Hub-remote mirror now renders all seven dwell
+  pages (11/33/34/552/572/623/624) and the transient auto-poll dead-code
+  path is fixed; "DM on connect" investigated: NO connect-time DM write
+  exists — the wire noise is the deliberate, tested auto-live feature
+  (section-change driven, logged as "Live view started").
+- Item 4 (version/tag): the tree is 4.9.0; the tag remains bench-gated on
+  THIS build (B5-B11 re-runs and the B11 downgrade round-trip).
+- Item 5 (design doc): addendum added (Q4 not implementable on S140 6.1.1;
+  the shipped directed+bouncer mechanism; RPA admission).
+- Item 6: source ZIP rebuilt for 4.9.0 (185 files byte-identical).
+
+New bench-relevant behavior in 4.9.0:
+- Switching TO a privacy (RPA) host no longer bounces the legitimate target
+  (IRK resolution pre-bond; a bond-decision grace only when no IRK exists).
+- The DFU path's watchdog inheritance is bounded at a fresh 30 s (CRV is
+  write-locked while the WDT runs — documented in enterUpdateMode); the
+  app-driven flash streams well inside it.
+- A forget during an open switch window cancels the window and resumes
+  advertising; a refused forget never disturbs it.

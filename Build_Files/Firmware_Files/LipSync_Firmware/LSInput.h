@@ -49,6 +49,17 @@ class LSInput {
     inputStateStruct inputPrevState = {0, 0, 0};
     LSTimer <void> inputStateTimer;
     int inputStateTimerId = -1;
+    // 4.8.7 review — the staged stroke-ending confirmation: a stroke-ending
+    // change on a held input is not classified as RELEASED until one extra
+    // poll confirms it. A one-poll dropout (jack wiggle/oxide on a held
+    // external switch — this device's primary input path) used to classify
+    // as a full RELEASED with partial elapsed, firing the short-window
+    // action early, re-arming a spurious fresh hold, and permanently
+    // consuming the long-window action the user earned. While staged, the
+    // buffer still reports the live hold; the timer is NOT restarted, so a
+    // closed dropout continues the hold with its original stopwatch.
+    bool _releaseStaged = false;
+    inputStateStruct _stagedState = {0, 0, 0};
 
 };
 
@@ -98,6 +109,9 @@ void LSInput::clear() {
   inputBuffer.clear();
   inputBuffer.pushElement(initialInputState);
 
+  _releaseStaged = false;  // a clear() (mode switch, calibration, re-begin) discards any staged confirmation
+  _stagedState = {0, 0, 0};
+
   if (inputStateTimerId >= 0) inputStateTimer.deleteTimer(inputStateTimerId);
   inputStateTimerId = inputStateTimer.startTimer();
 }
@@ -117,6 +131,33 @@ void LSInput::update() {
   inputPrevState = inputBuffer.getLastElement();
   const unsigned long currentElapsed = inputStateTimer.elapsedTime(inputStateTimerId);
   
+
+  // 4.8.7 review — confirm a staged stroke-ending change against the LIVE
+  // pin state before classifying it. Runs before the normal branches: while
+  // a confirmation is pending, the buffer still holds the live hold element.
+  if (_releaseStaged) {
+    _releaseStaged = false;
+    if (inputAllState == _stagedState.mainState) {
+      // The dropped input came back within one poll — a transient dropout,
+      // not a release. Continue the hold: refresh the held element's elapsed
+      // (exactly what the same-state branch below would do) and leave the
+      // ORIGINAL timer running, so the hold's true duration survives the
+      // glitch. Nothing is pushed; no restart.
+      inputCurrState = {inputAllState, inputPrevState.secondaryState,
+                        inputStateTimer.elapsedTime(inputStateTimerId)};
+      inputBuffer.updateLastElement(inputCurrState);
+      return;
+    }
+    // Confirmed: the held combination really changed. Emit the staged
+    // RELEASED with the elapsed frozen at staging time (the stroke's true
+    // end), then restart the timer — the same shape the immediate
+    // classification produced, one poll later. The next poll's normal
+    // branches handle the re-arm of any still-held input or the idle anchor.
+    inputCurrState = _stagedState;
+    inputBuffer.pushElement(inputCurrState);
+    inputStateTimer.restartTimer(inputStateTimerId);
+    return;
+  }
 
   // inputAllState = inputState[0] + 2 * inputState[1] + 4 * inputState[2];
  
@@ -154,7 +195,20 @@ void LSInput::update() {
         // elapsed value. At a 20 ms poll the old check made a configured
         // 20 ms minimum effectively ~40 ms and discarded legitimate short
         // Hub-button presses (upstream #39).
-        inputCurrState = {inputPrevState.mainState, INPUT_SEC_STATE_RELEASED, currentElapsed};
+        // 4.8.7 review: this change may be a REAL stroke end — or a one-poll
+        // dropout on a still-held input (jack wiggle/oxide), which the old
+        // shape classified as a full RELEASED with partial elapsed: the
+        // short-window row fired mid-hold, the hold re-armed as a fresh
+        // STARTED, and the long-window row the user was still earning was
+        // consumed (a 2.0 s dropout inside a 3-8 s START_MENU hold fired
+        // DRAG instead, and the true release then matched no row). Stage the
+        // candidate release for one extra poll (see the confirmation block
+        // at the top of update()); the timer keeps running either way.
+        // Return WITHOUT the shared push+restart below: while staged, the
+        // buffer keeps reporting the live hold and the stopwatch is intact.
+        _releaseStaged = true;
+        _stagedState = {inputPrevState.mainState, INPUT_SEC_STATE_RELEASED, currentElapsed};
+        return;
       } // prev: press x,started  current : none or press y, elapsed < reaction time
       // (4.5.7 review — the fall-through that became a latch): a press
       // visible for less than one reaction window used to match NO branch

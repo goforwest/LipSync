@@ -116,34 +116,27 @@ unsigned long g_usbNotReadySinceMs = 0;  // When the current HID-not-ready stret
 unsigned int g_usbReenumCount = 0;        // Forced re-enumerations spent on the current episode
 unsigned long g_watchdogLastFeedMs = 0;   // Loop-liveness witness (bench 2026-10-18): ms timestamp of the last watchdog feed
 volatile bool g_watchdogArmed = false;   // True from initWatchdog() until the retry limit stops re-arming (ISR-read by the TIMER3 witness — 4.5.7 review)
-// The .noinit once-guard for the USB-recovery auto-restart: a full chip reset
-// is the one cure that has cleared every configured-but-HID-dead boot on the
-// bench (2026-10-17: a wedge survived all three forced re-enumerations), but
-// an automatic restart must never loop. This word is written with
-// CONF_USB_RESTART_MAGIC immediately before the reset and checked at the next
-// boot — .noinit survives NVIC_SystemReset (startup clears .bss by symbols,
-// not whole RAM), so a matching magic means the previous boot already spent
-// its one auto-restart this power cycle. Any healthy boot clears it, re-arming
-// the guard for a future incident; a cold power-on reads random garbage, which
-// the magic test simply fails.
+// The USB-recovery auto-restart once-guard: a full chip reset is the one cure
+// that has cleared every configured-but-HID-dead boot on the bench
+// (2026-10-17: a wedge survived all three forced re-enumerations), but an
+// automatic restart must never loop. (4.9.0 review: this block formerly
+// described a .noinit word written with CONF_USB_RESTART_MAGIC — both the
+// macro and the mechanism are GONE: the bench proved .noinit does not
+// survive resets on this platform, and the guard lives in the retention
+// marker CONF_RETENTION_MARKER_USB_RECOVERY / g_usbRecoveryRestartedPrev
+// since witness v5. Do not resurrect the .noinit word.)
 // WITNESS v4 + PLATFORM FIX (bench 2026-10-23): the .noinit section DOES NOT
 // survive resets on this platform — the bench proved it (every soft-reset and
 // watchdog boot read boot#1/ptrail=0 back; the map places the section at
 // 0x20007bac but its content is zeroed by the time the next boot's setup()
 // runs — the bootloader/core scrubs it). Every cross-reset word therefore
 // moves to the nRF52 POWER RETENTION REGISTERS, which survive every warm
-// reset and clear only on cold power-on (the mechanism the 4.2.0 watchdog
-// boot counter has used all along):
-//   GPREGRET2 bits  0- 7 : consecutive-watchdog-boot counter (4.2.0, unchanged)
-//   GPREGRET2 bits  8-15 : witness boot TRAIL — the last milestone stamped
-//                         before a boot died; the next boot prints it as ptrail=
-//   GPREGRET2 bits 16-23 : the USB-recovery once-guard (438643c), MIGRATED
-//                         here from .noinit where it never survived the very
-//                         reset it was armed for — the once-per-power-cycle
-//                         auto-restart contract is restored on hardware
-//   GPREGRET2 bits 24-31 : soft-reset boot counter (witness: counts boots in
-//                         a reset chain; cold power-on re-seeds at 1)
-// The core's own DFU magic lives in GPREGRET (1), not GPREGRET2.
+// reset and clear only on cold power-on. (4.9.0 review: the v4 bit-map block
+// below was removed — it mapped GPREGRET2 bits 8-31 to trail/USB-guard/boot
+// counter, a layout the register does not have; witness v5 corrected it
+// (GPREGRET2 is 8 bits wide) and v7 is the live record of the real layout.
+// A future contributor reading only v4 would have written fields into
+// unimplemented bits and silently lost them.)
 // WITNESS v5 (bench 2026-10-23): the platform offers NO reliable cross-reset
 // storage — the retention register GPREGRET2 is 8 bits wide (SVD: only bits
 // 0-7 implemented; the 4.2.0 watchdog counter lives there), GPREGRET belongs
@@ -279,7 +272,12 @@ extern "C" void TIMER3_IRQHandler(void) {
 
 // Live boot trail (witness v7, 4.5.7 review reconciliation) — ONE table,
 // the one the stamps actually use. 3 bits, codes 1-7:
-//   1  setup complete                (stamped at the end of setup())
+//   1  memory up                     (stamped immediately after initMemory()
+//                                      returns — 4.9.0: the stamp MOVED from
+//                                      the end of setup() and is now
+//                                      unconditional, so a hang in the
+//                                      mount/seed or beginComOpMode names
+//                                      itself instead of reading pt=0)
 //   2  safeModePage drawing           (LSScreen::safeModePage)
 //   3  safe-mode menu registered      (LSScreen::safeModeMenu)
 //   4  LED action running             (performLedAction)
@@ -404,7 +402,8 @@ volatile uint32_t g_bleProbeCode = 0;            // 4.5.14: the failing call's S
 volatile uint32_t g_bleProbeNeed = 0;           // 4.5.14: sd_ble_enable's required app RAM base (on NO_MEM, the smoking gun vs 0x20006000)
 TaskHandle_t g_loopTaskHandle = NULL;             // 4.5.26: the loop task's handle (captured at setup entry — the loop task runs setup) for the stack high-water print
 volatile UBaseType_t g_loopStackHwm = 0;
-bool g_bootReportWorthy = false;                  // 4.5.29: computed at setup — true only when the PREVIOUS boot ended abnormally (witness marker, captured fault page, failed BLE init, or lockup). The first-host-byte BOOT report prints only when this is set; healthy boots are SILENT (the released wire contract, restored)           // 4.5.26: the loop task's minimum-ever free stack (FreeRTOS words, 4 bytes each) — printed as sw= on the wire; near-zero on BLE boots = the 4 KB loop stack is overflowing into the heap
+bool g_bootReportWorthy = false;                  // 4.5.29: computed at setup — true only when the PREVIOUS boot ended abnormally (witness marker, captured fault page, failed BLE init, or lockup). The first-host-byte BOOT report prints only when this is set; healthy boots are SILENT (the released wire contract, restored)
+bool g_comModeHealedThisBoot = false;             // 4.8.7 review: setup's gamepad+Bluetooth heal fired — the correction must reach the wire (the in-place Serial.println ran pre-attach, inside TinyUSB's pre-open-port discard window, so no host ever saw it); the first-host-byte report block emits the named line           // 4.5.26: the loop task's minimum-ever free stack (FreeRTOS words, 4 bytes each) — printed as sw= on the wire; near-zero on BLE boots = the 4 KB loop stack is overflowing into the heap
 volatile uint32_t g_bleInitRc = 0;              // 4.5.19 (expert consult): the RAW err_t from the failing DIS/HID begin — sd_ble_gatts_service_add's own code on the st=2 path (0x4=NO_MEM, 0x7=INVALID_PARAM, 0xF=FORBIDDEN, 0x10=INVALID_ADDR)
 volatile uint32_t g_bleIrqBad1 = 0;              // 4.5.15: pre-demotion mask of enabled IRQs 0-31 found at an SD-reserved priority (< 4) at BLE-init time (bit = IRQ number)
 volatile uint32_t g_bleIrqBad2 = 0;              // 4.5.15: the same mask for IRQs 32-47
@@ -683,7 +682,44 @@ void setup() {
     Serial.println(g_hangMarkerPrev);
   }
 
+  // Arm the hardware watchdog BEFORE the filesystem and third-party device
+  // code runs (4.8.7 review: the arm used to sit after checkSafeMode, so the
+  // historically demonstrated hang phase — the LittleFS mount + settings
+  // seed + persisted-verdict write inside initMemory(), the exact phase the
+  // 4.5.22 incident needed a custom RECOVER build for — was unrescued: a
+  // hang there got no DOG reset, no safe-mode settling, and a power cycle
+  // cleared the streak). The arm decision keys on state computed in
+  // checkResetReason() above, so the earlier arm is decision-identical;
+  // checkSafeMode() below still runs under the same armed (or inherited)
+  // watchdog, and the pinned Adafruit pressure drivers' unbounded
+  // software-reset-bit loops stay covered exactly as before: on an I2C
+  // failure their BusIO read returns all ones, which those loops interpret
+  // as "still resetting" forever. A normal boot can now lose at most one
+  // watchdog interval, and its watchdog-safe successor skips the suspect
+  // sensor initialization below and remains recoverable over CDC.
+  if (CONF_ENABLE_WATCHDOG && g_watchdogBootCount < CONF_WATCHDOG_BOOT_RETRY_LIMIT) {
+    initWatchdog();
+  } else if (NRF_WDT->RUNSTATUS != 0) {
+    // nRF52 WDT cannot be stopped once started and survives warm resets.
+    // The settled safe boot (or a developer build that disables future WDT
+    // starts) must keep feeding an inherited instance even though it does not
+    // arm another hang-witness cycle.
+    g_watchdogArmed = true;
+    watchdogLoop();
+  }
+
   initMemory();  // Initialize Memory
+  // (4.9.0 review) the trail's mid-boot milestone: writeTrailByte(0) means
+  // "pre-setup death", so a hang inside initMemory's mount/seed or in
+  // beginComOpMode below — the historically demonstrated hang phase (the
+  // LittleFS mount + settings seed, the exact reason the WDT arm moved
+  // earlier) — reported pt=0, indistinguishable from a death before setup()
+  // ever ran. Trail codes 0-7 are all assigned (v7), so this milestone REUSES
+  // code 1 with a narrowed meaning: pt=1 now reads "memory up" (stamped
+  // unconditionally — the old stamp sat behind the witness gate, so a settled
+  // safe boot never stamped anything either), and pt=0 really does mean
+  // pre-initMemory. Deaths after this point are loop-phase as before.
+  bootTrailStamp(1);
 
   // bleVerdictConsume() runs inside initMemory(), so only now can a failed
   // previous BLE initialization contribute to the abnormal-boot report.
@@ -716,23 +752,6 @@ void setup() {
   // inert-but-present mouse HID on a safe boot and BLE advertising on a
   // CM=2 safe boot).
   checkSafeMode();
-
-  // Arm the hardware watchdog BEFORE third-party device begin() calls. The
-  // pinned Adafruit pressure drivers contain unbounded software-reset-bit
-  // loops; on an I2C failure their BusIO read returns all ones, which those
-  // loops interpret as "still resetting" forever. A normal boot can now lose
-  // at most one watchdog interval, and its watchdog-safe successor skips the
-  // suspect sensor initialization below and remains recoverable over CDC.
-  if (CONF_ENABLE_WATCHDOG && g_watchdogBootCount < CONF_WATCHDOG_BOOT_RETRY_LIMIT) {
-    initWatchdog();
-  } else if (NRF_WDT->RUNSTATUS != 0) {
-    // nRF52 WDT cannot be stopped once started and survives warm resets.
-    // The settled safe boot (or a developer build that disables future WDT
-    // starts) must keep feeding an inherited instance even though it does not
-    // arm another hang-witness cycle.
-    g_watchdogArmed = true;
-    watchdogLoop();
-  }
 
   // Missing required hardware is also a safe-mode DECISION and must land
   // before beginComOpMode() registers HID or defers a BLE initialization
@@ -904,7 +923,9 @@ void setup() {
   // witness SREQ is allowed to extend the reset chain.
   if (CONF_ENABLE_WATCHDOG && g_watchdogArmed && g_watchdogBootCount < CONF_WATCHDOG_BOOT_RETRY_LIMIT) {
     initHangWitness();  // witness v8: the TIMER3 hang witness — converts a loop hang into an SREQ that preserves the trail
-    bootTrailStamp(1);  // witness v7: setup complete (the only boot-phase code; deaths are all loop-phase)
+    // (4.9.0 review: the pt=1 trail stamp moved to immediately after
+    // initMemory() and is unconditional there — see the milestone comment.
+    // This gate now arms only the witness.)
   }
 
   // 4.5.10: the BLE init task starts LAST — after every sensor, screen and
@@ -1009,9 +1030,24 @@ void loop() {
   // latch is deliberately NOT ended here: a scroll hold carries no wire
   // button state — see LSUSBMouse::service's unmount comment — and ends at
   // the input release as usual.)
+  // 4.9.0: routed through cancelSapOutputHold() — the mirror paths (the
+  // sensor-fault hold-cancel, the hold-cancel branch) pair the release with
+  // setLedDefault(), and the USB-bounce consumer used to leave the hold's
+  // window color on the LEDs until the next input event repainted.
   if (usbmouse.takeUnmountedWithButtonState()
       && (outputAction == CONF_ACTION_DRAG || outputAction == CONF_ACTION_SCROLL)) {
-    releaseOutputAction();
+    cancelSapOutputHold();
+  }
+
+  // 4.9.0: the exact BLE mirror — a drop→sub-second-reconnect inside
+  // btFeedbackLoop's 1 s disconnected-observation (bench 4.8.14: macOS
+  // reclaims the link sub-second) left the DRAG latch alive with the wire
+  // button already cleared by LSBLEMouse::service's disconnect cleanup.
+  // The flag bridges the gap; same scroll-latch caveat and same
+  // no-action-bearing-event rule as the USB twin above.
+  if (btmouse.takeDisconnectedWithButtonState()
+      && (outputAction == CONF_ACTION_DRAG || outputAction == CONF_ACTION_SCROLL)) {
+    cancelSapOutputHold();
   }
 
   // Degraded-state heartbeat (bench 2026-10-18, boot-with-unseated-cable
@@ -1142,8 +1178,23 @@ void loop() {
     if (bootLen > 0 && bootLen < (int)sizeof(bootLine)) {
       serialTxEnqueueLine(bootLine, (size_t)bootLen);
     }
+    // 4.8.7 review: setup's gamepad+Bluetooth heal fired — name the
+    // correction here, post-attach, where a host can actually read it (the
+    // heal's own println ran in the pre-attach discard window).
+    if (g_comModeHealedThisBoot) {
+      serialTxEnqueueLine("ERROR: stored gamepad+Bluetooth is not a supported combination -- communication mode reset to USB");
+    }
   }
   serialTxService();
+
+  // Multi-host switch window (upstream #16, 4.8.8): the directed advertise
+  // self-terminates about every second (high-duty directed spec limit), so
+  // the window needs millisecond-granularity re-arms — the 1 s btFeedbackLoop
+  // tick alone left the target's background scan too sparse a duty cycle.
+  // This service is a no-op unless a window is open; single-threaded with
+  // every other window path (all on the loop task).
+  lsHostServiceSwitchWindow();
+
   //yield();
 }
 
@@ -1504,6 +1555,14 @@ void initMemory() {
   delay(2);
 #endif
   mem.begin();  // Begin memory
+  // (4.9.0 review) orphaned temp files: every writer pre-removes its temp
+  // before writing, so a power cut between that remove and the rename leaves
+  // /settings.tmp (and /bleverdict.tmp) on flash until that module's next
+  // successful write. Nothing reads a stale temp as settings (the writers
+  // own the tmp name), but a unit that crashes mid-write and never writes
+  // again carried the orphaned block indefinitely — sweep both at boot.
+  InternalFS.remove(CONF_SETTINGS_TMP_FILE);
+  InternalFS.remove(BLE_VERDICT_TMP_FILE);
   bleVerdictConsume();  // 4.5.20: consume the previous BLE boot's flash-persisted verdict (pst=/prc= on the wire) — after the FS is up, before any header prints it
   
   // Open settings file (CONF_SETTINGS_FILE) from flash memory.
@@ -1638,6 +1697,12 @@ void screenFactoryResetConfirm2TransitionDone() {
 
 void screenModeLockedTransitionDone() {
   screen.finishModeLocked();
+}
+
+// Destructive hold-gate note continuation (bench 2026-11-06): redraw the page
+// the too-short hold came from (see finishHoldConfirmNote's dispatch).
+void screenHoldConfirmNoteTransitionDone() {
+  screen.finishHoldConfirmNote();
 }
 
 // Upstream #16: the Bluetooth host pages' dwell continuations (the switch
@@ -2140,7 +2205,12 @@ void beginComOpMode() {
   if ((g_operatingMode == CONF_OPERATING_MODE_GAMEPAD) && (g_comMode == CONF_COM_MODE_BLE)) {
     g_comMode = CONF_COM_MODE_USB;
     mem.writeInt(CONF_SETTINGS_FILE, "CM", CONF_COM_MODE_USB);
-    Serial.println("ERROR: stored gamepad+Bluetooth is not a supported combination -- communication mode reset to USB");
+    // 4.8.7 review: this in-place Serial.println ran BEFORE the USB attach —
+    // inside TinyUSB's pre-open-port discard window — so the correction was
+    // invisible to every host. The first-host-byte report block (which the
+    // flag below arms) now carries the named line instead.
+    g_comModeHealedThisBoot = true;
+    g_bootReportWorthy = true;
   }
 
   // Bus up only after the selected interface is registered: setup() detached
@@ -2638,14 +2708,26 @@ void initSipAndPuff() {
   // the hard band must stay a clearly distinct gesture (LSPressure.h). A
   // floor above CONF_PRESS_MAX_THRESHOLD leaves the live value untouched and
   // the hard band simply inert (the classifier's fail-safe).
+  // 4.8.7 review: the heal must never fire from a FABRICATED value. On a
+  // failed settings2 read the getter returns the compiled default (10.0)
+  // without writing — but the old shape fed that default straight into the
+  // floor comparison, so one transient LittleFS failure on a user whose
+  // regular threshold is ≥ 10 hPa (menu levels 6-10: 10/15/22/32/45 hPa)
+  // silently PERSISTED ST+1.0 over their stored hard threshold — a real,
+  // permanent settings change with no wire trace (both response flags are
+  // false here). Each read verdict is captured before the next read clobbers
+  // the shared flag; a failed read keeps the compiled default for the
+  // session only and persists nothing.
   float storedHardSip = getHardSipPressureThreshold(false, false);
+  const bool hsReadOk = mem.isLastReadOk();
   float storedHardPuff = getHardPuffPressureThreshold(false, false);
+  const bool hpReadOk = mem.isLastReadOk();
   float sipFloor = ps.getSipPressureThreshold() + CONF_PRESS_HARD_MARGIN_HPA;
   float puffFloor = ps.getPuffPressureThreshold() + CONF_PRESS_HARD_MARGIN_HPA;
-  if (storedHardSip < sipFloor) {
+  if (hsReadOk && storedHardSip < sipFloor) {
     setHardSipPressureThreshold(false, false, sipFloor);
   }
-  if (storedHardPuff < puffFloor) {
+  if (hpReadOk && storedHardPuff < puffFloor) {
     setHardPuffPressureThreshold(false, false, puffFloor);
   }
   sapActionSize = sizeof(sapActionProperty) / sizeof(inputActionStruct);  // Size of total available sip and puff actions
@@ -4578,6 +4660,19 @@ void btFeedbackLoop() {
   // pass after it silent until something actually changes (the 4.5.29
   // healthy-boots-print-nothing contract; the CH,5 pattern).
   lsHostPushState();
+
+  // HID-subscription watchdog (4.8.18, the bench 2026-11-07 "connected but
+  // deaf" class): a bonded link whose HID subscription never re-enables is
+  // cycled (bounded) so the state self-corrects instead of needing a host
+  // toggle/reboot/re-pair. No-op unless BLE is up and no window is open.
+  lsHidWatchdogLoop();
+
+  // Multi-host switching (upstream #16) — whitelist switch window (bench B4):
+  // drive the window tick in the feedback loop so the window can close
+  // (target connected or timeout) even while no page is actively polling.
+  // Window state (g_switchWindowOpen) is guarded by the loop task only.
+  int w = lsHostSwitchWindowTick();
+  (void)w;
 
   //if (USB_DEBUG) { Serial.println("USBDEBUG: end of btFeedbackLoop"); }
 }

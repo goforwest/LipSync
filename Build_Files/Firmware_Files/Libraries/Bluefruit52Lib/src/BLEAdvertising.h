@@ -136,6 +136,21 @@ public:
 
   bool isRunning(void);
 
+  /* LipSync switch-window trial (upstream #16, bench 2026-11-07): DIRECTED
+   * high-duty advertising at ONE peer identity. The spec's fast-reconnect
+   * mechanism; Windows' association stack nominally supports it (the
+   * device-side lever being tested before any Windows-side changes). No data
+   * (directed sets cannot carry any); no whitelist (S140 does not enforce
+   * filters on directed sets — bench-proven; the address in the packet must
+   * do the work, with the firmware's bouncer as the keeper). The set
+   * self-terminates by spec (<=1.28 s); the firmware re-arms it each tick.
+   * Returns NRF_SUCCESS or the failing SoftDevice error code (step-tagged:
+   * 0x01=configure, 0x02=tx_power, 0x03=adv_start). _peer_adv_active marks
+   * the set so its termination does NOT trigger the stock open-advertising
+   * restart (the window owns the radio until stop/close).
+   */
+  uint32_t startDirected(ble_gap_addr_t const* peer_addr, uint16_t timeout);
+
   void restartOnDisconnect(bool enable);
   bool start(uint16_t timeout = 0);
   bool stop (void);
@@ -152,6 +167,7 @@ private:
   uint8_t  _type;
   bool     _start_if_disconnect;
   bool     _runnning;
+  bool     _peer_adv_active;  // LipSync: a directed switch-window set is on air
 
   uint32_t _conn_mask;
 

@@ -29,8 +29,8 @@
 #define CONF_LIPSYNC_MODEL 1                // 1: Lipsync w/ Hub
 
 #define CONF_LIPSYNC_VERSION_MAJOR  4
-#define CONF_LIPSYNC_VERSION_MINOR  8
-#define CONF_LIPSYNC_VERSION_REV    2
+#define CONF_LIPSYNC_VERSION_MINOR  9
+#define CONF_LIPSYNC_VERSION_REV    0
 
 // 4.5.22 RESCUE-BUILD SWITCH (bench round 15): the device's settings
 // filesystem was left corrupted by the 4.5.20 race + the zombie phase's
@@ -70,10 +70,9 @@ const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + 
 #define CONF_LED_MIDDLE_PIN 8               // middle
 #define CONF_LED_RIGHT_PIN 6                // right
 
-// Onboard LEDs
-#define CONF_LED_MICRO_RED LED_RED          // Xiao NRF52840 User LED Red
-#define CONF_LED_MICRO_GREEN LED_GREEN      // Xiao NRF52840 User LED Green
-#define CONF_LED_MICRO_BLUE LED_BLUE        // Xiao NRF52840 User LED Blue
+// (4.8.7 review) CONF_LED_MICRO_RED/GREEN/BLUE removed here: the Xiao
+// onboard RGB pins had zero references — a dead knob block naming hardware
+// nothing reads (the same class 4.8.2's dead-knob removal cleaned once).
 
 // Output Buzzer
 #define CONF_BUZZER_PIN 10
@@ -90,7 +89,9 @@ const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + 
 #define CONF_OPERATING_MODE_MOUSE 1
 #define CONF_OPERATING_MODE_GAMEPAD 2
 #define CONF_OPERATING_MODE_SAFE 3
-#define CONF_OPERATING_MODE_MAX 3
+// (4.8.7 review) CONF_OPERATING_MODE_MAX removed here: nothing read the
+// MAX alias — the storable range is validated against
+// CONF_OPERATING_MODE_GAMEPAD directly.
 // The highest USER-SETTABLE / STORABLE operating mode (4.5.7 review): SAFE
 // (3) is an internal runtime state set by checkSafeMode/toggleSafeMode and
 // is NEVER a valid stored value — beginComOpMode has no SAFE case on a
@@ -121,8 +122,9 @@ const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + 
 #define CONF_MODE_PRESET_MOUSE_USB     1
 #define CONF_MODE_PRESET_MOUSE_BLE     2
 #define CONF_MODE_PRESET_GAMEPAD_USB   3
-#define CONF_MODE_PRESET_MIN           CONF_MODE_PRESET_MOUSE_USB
-#define CONF_MODE_PRESET_MAX           CONF_MODE_PRESET_GAMEPAD_USB
+// (4.8.7 review) CONF_MODE_PRESET_MIN/MAX removed here: the MP setter
+// validates the preset against the three named values directly; nothing
+// read the MIN/MAX aliases.
 
 #define CONF_LED_NONE 0
 #define CONF_LED_LEFT 1
@@ -153,7 +155,9 @@ const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + 
 #define LED_ACTION_BLINKFAST 4
 
 // Display
-#define CONF_DISPLAY_ENABLED false
+// (4.8.7 review) CONF_DISPLAY_ENABLED removed here: it read as a display
+// kill-switch but LSScreen keys off the g_displayConnected I2C probe — the
+// knob changed nothing and would have silently lied to a future reader.
 
 // Button Input States
 #define INPUT_MAIN_STATE_NONE           0
@@ -162,8 +166,9 @@ const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + 
 #define INPUT_MAIN_STATE_S12_PRESSED    3
 #define INPUT_MAIN_STATE_S3_PRESSED     4
 #define INPUT_MAIN_STATE_S13_PRESSED    5
-#define INPUT_MAIN_STATE_S23_PRESSED    6
-#define INPUT_MAIN_STATE_S123_PRESSED   7
+// (4.8.7 review) INPUT_MAIN_STATE_S23_PRESSED/S123_PRESSED removed here:
+// no action table contains an S23 or S123 combination row (the combo table
+// ends at S13), so the constants advertised states no input path evaluates.
 
 
 // Output action numbers
@@ -354,8 +359,11 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
                                              // enough for the host to tear the old configuration down (bench 2026-10-17:
                                              // a wedge survived three 100 ms cycles), while a real restart's ~4 s always
                                              // heals; this borrows part of that margin without the reboot cost
-#define CONF_USB_RESTART_MAGIC 0x4C535255    // "LSRU" — the .noinit once-guard value: set right before the USB-recovery
-                                             // restart, checked at the next boot so the auto-restart can never loop
+// (4.9.0 review) CONF_USB_RESTART_MAGIC removed here: a dead knob since the
+// witness-v5 discovery that .noinit does not survive resets on this platform
+// — the USB-recovery once-guard has lived in the retention marker
+// (CONF_RETENTION_MARKER_USB_RECOVERY) ever since; nothing read or wrote this
+// value, and the comment described a mechanism proven not to exist.
 
 #define CONF_UPDATE_MODE_DWELL_MS 500  // Bounded dwell in enterUpdateMode() between the ack, the "Update mode" splash
                                         // and the reset into the bootloader: long enough for the ack to reach the host
@@ -454,8 +462,10 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 // Light Modes
 #define CONF_LIGHT_MODE_OFF     0   // LEDs off
 #define CONF_LIGHT_MODE_BASIC   1   // Minimal LEDs
-#define CONF_LIGHT_MODE_ALL     2   // All LEDs
 #define CONF_LIGHT_MODE_STATE   3   // LEDs keyed to input state, not action (roadmap item 16, upstream #43)
+// (4.8.7 review) CONF_LIGHT_MODE_ALL (2) removed here: the tier's consumers
+// (the setLightMode validator, the buzzer gating) read the literal values —
+// the alias had zero references. Tier 2 stays a valid settable value.
 
 #define CONF_LIGHT_MODE_MIN     0
 #define CONF_LIGHT_MODE_MAX     3
@@ -485,8 +495,9 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 // API
 #define CONF_API_ENABLED true               // Enable or Disable API
 
-// Startup Default settings
-#define CONF_STARTUP_LED_STEP_TIME 500      // Time for each color
+// (4.8.7 review) CONF_STARTUP_LED_STEP_TIME removed here: a leftover of the
+// pre-Neopixel startup color-cycle; nothing has read it in the 4.4+ LED
+// model.
 
 // Joystick Deadzone Default settings
 #define CONF_JOY_DEADZONE_MIN 0.0
@@ -499,6 +510,7 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 #define CONF_JOY_CALIB_START_DELAY 1000              // Number of milliseconds to delay full joystick calibration once triggered
 #define CONF_JOY_CALIB_START_LED_COLOR LED_CLR_RED   // Joystick Calibration process start and end color
 #define CONF_JOY_CALIB_STEP_DELAY 1500               // Number of milliseconds to delay between corner measurements
+#define CONF_JOY_CALIB_ENTRY_FREEZE_MS 2000          // (4.9.0 review) fullCalibrationPage's pre-step-1 input freeze: the first corner prompt lands at STEP_DELAY + 3xSTEP_BLINK_DELAY (~1950 ms); until then the "Follow prompts" page was live to the input poll (a stray Next painted a cursor overlay over the prompt). The flow's own chain re-freezes per step.
 #define CONF_JOY_CALIB_LED_NUMBER CONF_LED_ALL
 #define CONF_JOY_CALIB_LED_COLOR LED_CLR_RED         // LED color for joystick calibration process 
 #define CONF_JOY_CALIB_STEP_BLINK 1
@@ -556,22 +568,19 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 #define CONF_JOY_OUTPUT_XY_MAX  1024
 #define CONF_JOY_OUTPUT_XY_MAX_GAMEPAD  127
 
-// Scroll level change and related LED feedback settings 
-#define CONF_SCROLL_CHANGE_LED_DELAY  150
-#define CONF_SCROLL_CHANGE_LED_BLINK  1
-#define CONF_SCROLL_DEC_LED_NUMBER    CONF_LED_LEFT
-#define CONF_SCROLL_DEC_LED_COLOR     LED_CLR_PURPLE  // Decrease scroll level color
-#define CONF_SCROLL_INC_LED_NUMBER    CONF_LED_RIGHT
-#define CONF_SCROLL_INC_LED_COLOR     LED_CLR_PURPLE  // Increase scroll level color
-#define CONF_SCROLL_LIMIT_LED_DELAY   50
-#define CONF_SCROLL_LIMIT_LED_BLINK   3
-#define CONF_SCROLL_LIMIT_LED_COLOR   LED_CLR_RED // Out of range limit scroll level color
-
+// 4.8.7 review: the scroll-LED feedback block below was written for a
+// per-level LED/color scheme the 4.4+ Neopixel model replaced — every knob
+// in it had zero references. Removed: CONF_SCROLL_CHANGE_LED_DELAY,
+// CONF_SCROLL_CHANGE_LED_BLINK, CONF_SCROLL_DEC_LED_NUMBER,
+// CONF_SCROLL_DEC_LED_COLOR, CONF_SCROLL_INC_LED_NUMBER,
+// CONF_SCROLL_INC_LED_COLOR, CONF_SCROLL_LIMIT_LED_DELAY,
+// CONF_SCROLL_LIMIT_LED_BLINK, CONF_SCROLL_LIMIT_LED_COLOR.
 // Scroll level values 
 #define CONF_SCROLL_LEVEL_DEFAULT 5
 #define CONF_SCROLL_LEVEL_MIN 1
 #define CONF_SCROLL_LEVEL_MAX 10
-#define CONF_SCROLL_MOVE_MIN  1
+// (4.8.7 review) CONF_SCROLL_MOVE_MIN removed here: the scroll setters
+// clamp against CONF_SCROLL_MOVE_BASE/MAX; the MIN alias had no reader.
 #define CONF_SCROLL_MOVE_MAX  16
 #define CONF_SCROLL_MOVE_BASE 1
 
@@ -647,7 +656,9 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 // Error codes
 #define CONF_ERROR_NONE 0
 #define CONF_ERROR_USB  1
-#define CONF_ERROR_I2C  2
+// (4.8.7 review) CONF_ERROR_I2C removed here: error surfacing is named on
+// the wire and by the boot report classes; the numeric I2C alias had no
+// reader.
 
 #define CONF_ERROR_LED_BLINK_DELAY 500
 #define CONF_ERROR_LED_NUMBER CONF_LED_ALL // All LEDs

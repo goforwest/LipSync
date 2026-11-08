@@ -254,6 +254,7 @@ BLEAdvertising::BLEAdvertising(void)
   _type                = BLE_GAP_ADV_TYPE_CONNECTABLE_SCANNABLE_UNDIRECTED;
   _start_if_disconnect = true;
   _runnning            = false;
+  _peer_adv_active     = false;
 
   _conn_mask           = 0;
 
@@ -389,12 +390,50 @@ bool BLEAdvertising::stop(void)
 {
   VERIFY_STATUS( sd_ble_gap_adv_stop(_hdl), false);
 
-  _runnning = false;
+  _runnning        = false;
+  _peer_adv_active = false;  // an explicit stop always ends the window ownership
   Bluefruit._stopConnLed(); // stop blinking
 
   return true;
 }
 
+uint32_t BLEAdvertising::startDirected(ble_gap_addr_t const* peer_addr, uint16_t timeout)
+{
+  // See BLEAdvertising.h. Directed high-duty at the target identity; the
+  // mac's reconnect ignores directed-to-others (bench-proven); this trial
+  // asks whether WINDOWS' association stack responds to directed-to-itself.
+  if (peer_addr == NULL) return NRF_ERROR_NULL;
+  if (peer_addr->addr_type == BLE_GAP_ADDR_TYPE_ANONYMOUS) return BLE_ERROR_GAP_INVALID_BLE_ADDR;
+
+  ble_gap_adv_params_t adv_para =
+  {
+    .properties    = { .type = BLE_GAP_ADV_TYPE_CONNECTABLE_NONSCANNABLE_DIRECTED_HIGH_DUTY_CYCLE, .anonymous = 0 },
+    .p_peer_addr   = peer_addr                ,
+    .interval      = _fast_interval           , // ignored by high-duty directed (kept for form)
+    .duration      = (uint16_t) (timeout*100) , // bounded (10-ms units; within the directed max)
+
+    .max_adv_evts  = 0                        ,
+    .channel_mask  = { 0, 0, 0, 0, 0 }        ,
+    .filter_policy = BLE_GAP_ADV_FP_ANY       , // directed addressing is the filter; S140 ignores FP on directed anyway
+
+    .primary_phy   = BLE_GAP_PHY_AUTO         ,
+    .secondary_phy = BLE_GAP_PHY_AUTO         ,
+  };
+
+  uint32_t rc;
+  rc = sd_ble_gap_adv_set_configure(&_hdl, NULL, &adv_para);  // NULL data: directed sets carry none
+  VERIFY_STATUS(rc, 0x010000UL | rc);   // step 1: adv_set_configure
+  rc = sd_ble_gap_tx_power_set(BLE_GAP_TX_POWER_ROLE_ADV, _hdl, Bluefruit.getTxPower());
+  VERIFY_STATUS(rc, 0x020000UL | rc);   // step 2: tx_power_set
+  rc = sd_ble_gap_adv_start(_hdl, CONN_CFG_PERIPHERAL);
+  VERIFY_STATUS(rc, 0x030000UL | rc);   // step 3: adv_start
+
+  Bluefruit._startConnLed();
+  _runnning        = true;
+  _peer_adv_active = true;
+  _active_interval = _fast_interval;
+  return NRF_SUCCESS;
+}
 
 void BLEAdvertising::_eventHandler(ble_evt_t* evt)
 {
@@ -411,7 +450,8 @@ void BLEAdvertising::_eventHandler(ble_evt_t* evt)
       {
         bitSet(_conn_mask, conn_hdl);
 
-        _runnning = false;
+        _runnning        = false;
+        _peer_adv_active = false;  // a connect ends any directed window set
       }
     }
     break;
@@ -427,6 +467,16 @@ void BLEAdvertising::_eventHandler(ble_evt_t* evt)
     break;
 
     case BLE_GAP_EVT_ADV_SET_TERMINATED:
+      // A directed window set (self-terminates ~1 s by spec) must NOT trigger
+      // the stock restart below — that would put open advertising on air inside
+      // the window. The firmware re-arms while the window holds.
+      if (_peer_adv_active)
+      {
+        _peer_adv_active = false;
+        _runnning        = false;
+        Bluefruit._stopConnLed();
+        break;
+      }
       if (evt->evt.gap_evt.params.adv_set_terminated.reason == BLE_GAP_EVT_ADV_SET_TERMINATED_REASON_TIMEOUT)
       {
         _runnning = false;

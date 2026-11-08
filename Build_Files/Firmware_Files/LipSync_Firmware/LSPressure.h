@@ -75,7 +75,7 @@ enum PressureReadResult : uint8_t {
 #define PRESS_OFFSET_NEUTRAL_FRACTION 0.25 // Established offsets only refresh very near neutral
 #define PRESS_OFFSET_NEUTRAL_MAX_HPA 1.0 // Never treat a large pressure shift as neutral just because thresholds are high
 #define PRESS_OFFSET_INITIAL_MAX_HPA 3.0 // Boot baseline magnitude ceiling: at/under the DEFAULT regular threshold, above the sensor pair's plausible inter-sensor bias (each part is a +/-1 hPa class) — a held gesture this strong can never become "neutral"; see LSPressureOffsetFilter.h for the exact residual with lowered user thresholds
-#define PRESS_OFFSET_RETRY_REPORT_WINDOWS 120 // Consecutive failed boot-baseline windows (~60 s at the 50 ms poll) before one ERROR line names the stuck neutral
+#define PRESS_OFFSET_RETRY_REPORT_MS 60000   // One ERROR line per minute of CONTINUOUS failed offset collection. Time-based on purpose (4.9.0 round-2 review): a WINDOW count advanced once per failed window, and the recovery class fails a window on its FIRST out-of-band sample (~50 ms) — a count-based report fired ~10x faster than this comment claimed. The time base makes both classes (boot baseline and recovery) report on the real minute.
 #define PRESS_UNHEALTHY_REPORT_MIN_INTERVAL_MS 5000UL // Minimum spacing of the "sensors not responding" ERROR line (a flapping cable re-enters the unhealthy state every re-probe cycle)
 
 // Pressure structure 
@@ -100,8 +100,8 @@ class LSPressure {
     float getOffsetPressure();                          // Get Offset pressure: (sapPressureAbs- ambientPressure)
     void setOffsetPressure(float offsetPressure);       // Set Offset pressure: 
     float offsetNeutralLimit();                         // The shared "very near neutral" band (min(ST,PT)*0.25 capped at PRESS_OFFSET_NEUTRAL_MAX_HPA) — one definition for both the collector and the 60 s refresh gate
-    void startOffsetUpdate();                           // Begin a stepped offset measurement: five valid (sap - ambient)
-                                                        // samples gathered one per update() tick, then averaged
+    void startOffsetUpdate();                           // Begin a stepped offset measurement: five valid (sap - ambient)                                                        // samples gathered one per update() tick, then averaged
+    void reportOffsetRetryWindow();                     // One ERROR line per PRESS_OFFSET_RETRY_REPORT_WINDOWS failed offset windows — covers the boot baseline AND the post-recovery loop (4.9.0 review: whichever failure ended the window)
     void setSipThreshold(float s);                      // Set sip threshold
     void setPuffThreshold(float p);                     // Set puff threshold
     void setHardSipThreshold(float t);                  // Set hard sip threshold (upstream #58; validated at the API layer)
@@ -168,7 +168,7 @@ class LSPressure {
       bool _offsetUpdateRunning;                          // Offset measurement in progress (stepped by updatePressure())
       bool _offsetBaselineValid;                          // A complete stable baseline exists; later refreshes must remain neutral relative to it
       bool _offsetRequiredBeforeSensing;                  // Boot/recovery must complete a safe baseline before sip/puff can resume
-      uint8_t _bootOffsetRetryWindows = 0;                // Consecutive failed boot-baseline windows — names a stuck neutral on the wire once per minute instead of failing in silence (the 4.6.6 destroy-in-silence lesson)
+      unsigned long _lastOffsetRetryReportMs = 0;         // 0 = no continuous-failure streak (or streak start); else the last report/streak-arm time. Names a stuck neutral on the wire once per REAL minute across both classes (the 4.6.6 destroy-in-silence lesson)
       unsigned long _lastUnhealthyReportMs = 0;           // Last "sensors not responding" line (rate-limited by PRESS_UNHEALTHY_REPORT_MIN_INTERVAL_MS)
       LSPressureOffsetFilter _offsetFilter{PRESS_BUFF_SIZE, PRESS_OFFSET_ATTEMPT_LIMIT, PRESS_OFFSET_STABILITY_HPA, PRESS_OFFSET_INITIAL_MAX_HPA};
       // (requiredSamples intentionally reuses PRESS_BUFF_SIZE: the offset
@@ -419,6 +419,42 @@ void LSPressure::startOffsetUpdate()
 }
 
 //*********************************//
+// Function   : reportOffsetRetryWindow
+//
+// Description: One ERROR line per PRESS_OFFSET_RETRY_REPORT_WINDOWS
+//              consecutive failed offset-collection windows. Covers BOTH
+//              stuck-neutral classes (4.9.0 review): the never-completing
+//              boot baseline (RETRYING_INITIAL) AND the post-recovery loop
+//              whose retained baseline keeps rejecting the re-seated
+//              mouthpiece's neutral (ACTIVITY_REJECTED / ATTEMPTS_EXHAUSTED
+//              — results only reachable with a baseline, and the only class
+//              the old report condition missed). Without it, a re-seated
+//              mouthpiece whose new neutral sits outside the retained-offset
+//              band held the device's primary input inert with zero wire
+//              trace.
+//
+// Arguments :  void
+//
+// Return :    void
+//*********************************//
+void LSPressure::reportOffsetRetryWindow()
+{
+  const unsigned long nowMs = millis();
+  if (_lastOffsetRetryReportMs == 0) {
+    // First failure of a continuous-failure streak: arm the minute. The line
+    // fires only if failures persist to the minute boundary (0 is never a
+    // real timestamp on this path — the first call runs ~50 ms into the
+    // app's life; even a literal millis()==0 would just restart the streak).
+    _lastOffsetRetryReportMs = (nowMs == 0) ? 1 : nowMs;
+    return;
+  }
+  if (nowMs - _lastOffsetRetryReportMs < PRESS_OFFSET_RETRY_REPORT_MS) return;
+  _lastOffsetRetryReportMs = nowMs;
+  serialTxEnqueueLine("ERROR: pressure neutral not established — release the mouthpiece; sip and puff stay disabled until a resting baseline completes",
+                      sizeof("ERROR: pressure neutral not established — release the mouthpiece; sip and puff stay disabled until a resting baseline completes") - 1);
+}
+
+//*********************************//
 // Function   : markSensorsUnhealthy 
 // 
 // Description: Stop trusting the pressure sensors: disable sip and puff so
@@ -444,6 +480,12 @@ void LSPressure::markSensorsUnhealthy()
   _offsetFilter.cancel();
   _engageFilter.reset();
   _sapEngageElapsedBiasMs = 0;
+  // (4.9.0 review) a fresh reporting window for the recovery class: the
+  // sensor state CHANGED (re-seated cable/mouthpiece), so a partially-run
+  // pre-fault streak must not fire the recovery loop's first ERROR line in
+  // under a minute of post-recovery failure — the fault boundary starts the
+  // minute over, exactly like the rate limiter's own interval below.
+  _lastOffsetRetryReportMs = 0;
   // Bounded reporting (4.8.1 review): a flapping cable re-enters this path
   // every re-probe cycle and used to enqueue the line on EVERY entry. One
   // report per minimum interval keeps the wire honest without spamming the
@@ -654,7 +696,7 @@ void LSPressure::updatePressure()
       _offsetBaselineValid = true;
       _offsetRequiredBeforeSensing = false;
       _offsetUpdateRunning = false;
-      _bootOffsetRetryWindows = 0;
+      _lastOffsetRetryReportMs = 0;
     } else if (offsetResult == LSPressureOffsetFilter::ACTIVITY_REJECTED
                || offsetResult == LSPressureOffsetFilter::ATTEMPTS_EXHAUSTED) {
       // Keep the last complete baseline. A routine 60-second refresh waits
@@ -663,7 +705,18 @@ void LSPressure::updatePressure()
       // post-recovery sample could be interpreted as a real input while the
       // offset is explicitly known to be unresolved.
       _offsetUpdateRunning = false;
-      if (_offsetRequiredBeforeSensing) startOffsetUpdate();
+      if (_offsetRequiredBeforeSensing) {
+        // (4.9.0 review) the recovery loop's failures must name themselves.
+        // With a retained baseline the filter can ONLY return these two
+        // results (RETRYING_INITIAL is gated on _baselineValid == false), so
+        // before this fix a re-seated mouthpiece whose new neutral left the
+        // retained-offset band kept the class's PRIMARY INPUT inert forever
+        // with zero wire trace — the once-a-minute line covered only the
+        // never-completing no-baseline path. The same bounded once-per-N-
+        // windows report now covers every failed recovery window.
+        reportOffsetRetryWindow();
+        startOffsetUpdate();
+      }
     } else if (offsetResult == LSPressureOffsetFilter::RETRYING_INITIAL
                && _offsetRequiredBeforeSensing) {
       // A boot/recovery baseline keeps failing its bounded collection windows.
@@ -673,11 +726,7 @@ void LSPressure::updatePressure()
       // destroy-in-silence lesson). One ERROR line per minute of continuous
       // failure; the counter resets when a baseline completes or the class
       // begins sensing again.
-      if (++_bootOffsetRetryWindows == PRESS_OFFSET_RETRY_REPORT_WINDOWS) {
-        _bootOffsetRetryWindows = 0;
-        serialTxEnqueueLine("ERROR: pressure neutral not established — release the mouthpiece; sip and puff stay disabled until a resting baseline completes",
-                            sizeof("ERROR: pressure neutral not established — release the mouthpiece; sip and puff stay disabled until a resting baseline completes") - 1);
-      }
+      reportOffsetRetryWindow();
     }
   }
 

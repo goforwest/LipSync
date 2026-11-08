@@ -20,6 +20,13 @@
 #ifndef _LSMEMORY_H
 #define _LSMEMORY_H
 
+// (4.9.0 round-2 review) the shared instance, declared here so headers
+// included AFTER LSMemory.h but BEFORE the .ino's definition (LSScreen.h's
+// inline bodies read isLastReadOk for the hard-threshold heal gate) can see
+// it. The definition lives in LipSync_Firmware.ino.
+class LSMemory;
+extern LSMemory mem;
+
 #include <ArduinoJson.h>
 #include <Adafruit_LittleFS.h>
 #include <InternalFileSystem.h>
@@ -664,7 +671,19 @@ bool LSMemory::writeObject(String fileString, String key, JsonObject obj){
 // Return     : bool : true when written, false when refused (see writeObject)
 //*********************************//
 bool LSMemory::writeInt(String fileString, String key, int value){
+  // (4.9.0 review) read-truth: never commit a write built on a FAILED read.
+  // ArduinoJson 7 clears the document then parses, so a TRUNCATED-but-
+  // parseable file leaves the successfully-parsed members in place — the
+  // document is non-null while _lastReadOk is false. The old shape merged
+  // the new key into that partial document and wrote it back: the file then
+  // parses clean, initialize()'s re-seed never fires, and the keys the
+  // truncation destroyed silently became per-key-healed defaults instead of
+  // a named refusal (the storeModePair house rule: refuse on !isLastReadOk).
+  // The gate must sit AFTER readObject: _lastReadOk is refreshed by that
+  // read, and a stale true from a read of the OTHER settings file must not
+  // wave THIS file's failed read through (4.9.0 round-2 review).
   JsonObject obj = readObject(fileString);
+  if (!isLastReadOk()) return false;
   obj[String(key)] = value;
   return writeObject(fileString,key,obj);
 }
@@ -682,6 +701,7 @@ bool LSMemory::writeInt(String fileString, String key, int value){
 //*********************************//
 bool LSMemory::writeFloat(String fileString, String key, float value){
   JsonObject obj = readObject(fileString);
+  if (!isLastReadOk()) return false;  // read-truth — after the read, see writeInt
   obj[String(key)] = value;
   return writeObject(fileString,key,obj);
 }
@@ -699,6 +719,7 @@ bool LSMemory::writeFloat(String fileString, String key, float value){
 //*********************************//
 bool LSMemory::writeString(String fileString, String key, String value){
   JsonObject obj = readObject(fileString);
+  if (!isLastReadOk()) return false;  // read-truth — after the read, see writeInt
   obj[String(key)] = value;
   return writeObject(fileString,key,obj);
 }
@@ -716,6 +737,7 @@ bool LSMemory::writeString(String fileString, String key, String value){
 //*********************************//
 bool LSMemory::writePoint(String fileString, String key, pointFloatType value){
   JsonObject obj = readObject(fileString);
+  if (!isLastReadOk()) return false;  // read-truth — after the read, see writeInt
   // Replace, do not append (4.6.5 review): the seeded defaults already store
   // CA1–CA4 as two-element arrays, and JsonDocument::to<JsonArray>() returns
   // the EXISTING array untouched, so add() appended a third/fourth value on

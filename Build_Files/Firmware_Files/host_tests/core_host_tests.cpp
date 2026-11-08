@@ -459,6 +459,46 @@ static void test_host_forget_decision_allows_active() {
 // it at execution — a stale index must refuse, never hit the wrong host (for a
 // forget that means erasing the wrong bond). NULL/empty expected means the
 // serial index contract: no check.
+static void test_host_rpa_admission_helpers() {
+  // The switch-window bouncer's RPA admission (4.9.0): the pure byte test
+  // and the ah() byte-order contract, pinned with a fixed vector computed
+  // against the Zephyr/Nordic rpa.c reference (IRK 000102...0f, prand
+  // 334455 -> hash ab1f54; cipherBe d8343d6d3fc4ae4554475cc121541fab).
+  {
+    // RPA types: the two MSBs are 01. Nordic byte order: addr[5] carries them.
+    const unsigned char rpa[6] = {0xAB, 0x1F, 0x54, 0x33, 0x44, 0x55};
+    CHECK(lsHostAddrIsRpa(rpa) == 1);
+    const unsigned char pub[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    CHECK(lsHostAddrIsRpa(pub) == 0);                       // 00 = public
+    const unsigned char stat[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0xC0};
+    CHECK(lsHostAddrIsRpa(stat) == 0);                      // 11 = static random
+    const unsigned char res[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x80};
+    CHECK(lsHostAddrIsRpa(res) == 0);                       // 10 = reserved (RRA)
+    const unsigned char rpa2[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x7F};
+    CHECK(lsHostAddrIsRpa(rpa2) == 1);                      // 01 across the byte
+  }
+  {
+    // Hash extraction: the LE ciphertext's least significant 24 bits are the
+    // BE ciphertext's bytes [15],[14],[13] (the byte order the firmware's
+    // sd_ecb_block_encrypt path relies on).
+    unsigned char cipherBe[16] = {0xd8, 0x34, 0x3d, 0x6d, 0x3f, 0xc4, 0xae, 0x45,
+                                  0x54, 0x47, 0x5c, 0xc1, 0x21, 0x54, 0x1f, 0xab};
+    const unsigned char target[6] = {0xAB, 0x1F, 0x54, 0x33, 0x44, 0x55};
+    CHECK(lsHostRpaHashMatches(target, cipherBe) == 1);     // the vector's own RPA
+    const unsigned char wrongHash[6] = {0xAB, 0x1F, 0x55, 0x33, 0x44, 0x55};
+    CHECK(lsHostRpaHashMatches(wrongHash, cipherBe) == 0);  // one hash bit off -> refuse
+    const unsigned char wrongPrand[6] = {0xAB, 0x1F, 0x54, 0x33, 0x44, 0x56};
+    CHECK(lsHostRpaHashMatches(wrongPrand, cipherBe) == 1); // hash compare ignores prand bytes (resolution supplies them)
+    // A permutation that would pass a naive cipherBe[0..2] compare must NOT
+    // pass the real extraction (the byte-order regression guard).
+    unsigned char naiveTrap[16];
+    std::memcpy(naiveTrap, cipherBe, 16);
+    std::memmove(naiveTrap, naiveTrap + 13, 3);  // put the hash at [0..2] reversed? no: [13..15] = 54 1f ab
+    const unsigned char naiveAddr[6] = {0x54, 0x1F, 0xAB, 0x33, 0x44, 0x55};
+    CHECK(lsHostRpaHashMatches(naiveAddr, naiveTrap) == 0); // naive BE[0..2] order is refused
+  }
+}
+
 static void test_host_row_identity_matches() {
   lsHostRow row;
   std::strcpy(row.mac, "A1B2C3D4E5F6");
@@ -507,6 +547,7 @@ int main() {
   test_host_switch_decision_precedence();
   test_host_forget_decision_allows_active();
   test_host_row_identity_matches();
+  test_host_rpa_admission_helpers();
 
   std::printf("%d checks, %d failures\n", checks, failures);
   return failures == 0 ? 0 : 1;

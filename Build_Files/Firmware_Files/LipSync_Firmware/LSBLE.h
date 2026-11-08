@@ -26,6 +26,7 @@
 #define LSBLE_H
 #include <bluefruit.h>
 #include <nrf_sdm.h>
+#include "LSHostSwitch.h"  // the pure host-switch layer: rows, refusals, the 4.9.0 RPA admission helpers
 
 #define MOUSE_LEFT 1
 #define MOUSE_RIGHT 2
@@ -52,6 +53,7 @@ class LSBLEMouse {
     inline void release(uint8_t b = MOUSE_LEFT); // release LEFT by default
     inline bool isPressed(uint8_t b = MOUSE_LEFT); // check LEFT by default
     inline bool isConnected(void);
+    inline bool takeDisconnectedWithButtonState(void);  // take-and-clear: the BLE host went away while this object still held click/drag state (4.9.0 — the 4.8.1 USB-flag mirror)
   protected:
     uint8_t _buttons;
     void buttons(uint8_t b);
@@ -60,6 +62,7 @@ class LSBLEMouse {
     bool _buttonStatePending = false;
     bool _clickPending = false;
     bool _clickPressedSent = false;
+    bool _disconnectedWithButtonState = false;  // raised by service()'s disconnect cleanup, consumed once by the loop
     uint8_t _clickButton = 0;
 };
 
@@ -325,6 +328,14 @@ void LSBLEMouse::service(void)
     // pre-disconnect click OR a settled drag when a different host reconnects
     // later. This check must precede the "nothing pending" fast return: a
     // successfully-sent drag has _buttons set but no pending flag.
+    // (4.9.0) raising the take-and-clear flag when button state was actually
+    // held — the loop ends the DRAG latch with it. btFeedbackLoop's 1 s
+    // disconnected-observation misses a drop→sub-second-reconnect (bench
+    // 4.8.14: macOS reclaims the link sub-second), which used to leave the
+    // latch alive with the wire button already cleared — cursor moves, no
+    // button, until the user's release self-corrected it. The exact mirror
+    // of LSUSBMouse::service's unmount flag; no action-bearing event.
+    if (_buttons != 0) _disconnectedWithButtonState = true;
     _buttons = 0;
     _buttonStatePending = false;
     _clickPending = false;
@@ -398,6 +409,15 @@ bool LSBLEMouse::isConnected(void) {
   // honest "not connected" instead of a dead loop.
   if (needsInitialization) return false;
   return Bluefruit.connected();
+}
+
+bool LSBLEMouse::takeDisconnectedWithButtonState(void) {
+  // Take-and-clear (4.9.0): raised by service()'s disconnect cleanup when
+  // click/drag state was actually held; consumed once by the loop. Mirrors
+  // LSUSBMouse::takeUnmountedWithButtonState.
+  const bool v = _disconnectedWithButtonState;
+  _disconnectedWithButtonState = false;
+  return v;
 }
 
 
@@ -573,16 +593,6 @@ bool lsHostAnyConnected() {
   return Bluefruit.connected() != 0;
 }
 
-void lsHostEnsureAdvertising() {
-  if (needsInitialization) return;
-  // restartOnDisconnect(true) re-advertises after a disconnect (BLEAdvertising
-  // event handler); this covers the paths that bypass a disconnect (pair-new,
-  // a set stopped for any other reason). Same forever-timeout as the boot path.
-  if (!Bluefruit.Advertising.isRunning()) {
-    Bluefruit.Advertising.start(0);
-  }
-}
-
 // Remove one bond file. The filename keying uses the 6 address BYTES only
 // (bonding.cpp get_fname ignores addr_type), so any type builds the right
 // name; the identity bytes come from the enumerated row. 4.8.1: the lib's
@@ -640,6 +650,781 @@ void lsHostPushState(bool force) {  // default lives on the LSApiDeclarations.h 
   if (activeRow != g_btPushedActiveRow) {
     g_btPushedActiveRow = activeRow;
     printResponseInt(true, false, true, 0, "BT,5", true, activeRow);
+  }
+}
+
+/*****************************
+   MULTI-HOST SWITCHING — THE SWITCH WINDOW (upstream #16, bench B4 gate)
+   *****************************
+   The wrong-host race (bench B4, 2026-11-06): when switching AWAY from the
+   just-disconnected host, THAT host reconnects faster than the target — macOS
+   grabs the link back sub-second (0/5 away-from-Mac) and the target never gets
+   a window. Bench trail 4.8.3-4.8.17 (design doc Q4 addendum): the
+   SoftDevice-filter contingency is NOT implementable on S140 6.1.1 —
+   whitelist+discoverable is 0x3201-forbidden, no legacy connectable-
+   non-scannable type exists, and the directed target field AND the whitelist
+   filter are not enforced on a directed set (macOS connect-by-address walked
+   into every filtered window). The shipped mechanism is therefore DEVICE-SIDE:
+   the window advertises DIRECTED at the target identity (the spec's
+   fast-reconnect mechanism, 4.8.17 device-side trial) and the BOUNCER (4.8.12)
+   enforces the lockout in firmware — any non-target connection is dropped
+   within milliseconds and the window keeps waiting (the just-disconnected
+   host's reconnect engine cycles harmlessly; the target's connect is the one
+   that holds). The 4.8.14-16 open-advertising shape is one flag away (begin's
+   comment records the exact substitution) if directed fails the bench trial.
+
+   Window lifetime (all loop-task; g_switchWindowOpen is the single flag):
+   - ARMED before the disconnect (lsHostArmSwitchWindow) — stops any running
+     stock advertising (the window replaces it) and loads the target bond's
+     identity + IRK through the lib's public bond_load_keys. NO SoftDevice
+     whitelist or identity list is armed (see the bench trail above); the IRK
+     is captured for the tick's RPA resolver (an iOS-style privacy target
+     reconnects with a rotating RPA whose bytes never equal the stored
+     identity — the resolution admits it pre-bond).
+   - SUSPENDED auto-restart for the window lifecycle (4.8.7 review): the stock
+     DISCONNECTED handler restarts OPEN (FP_ANY) advertising the moment the
+     disconnect event lands on the BLE event thread — a sub-second window in
+     which the just-disconnected host wins the link back (bench B4: 0/5) and
+     the tick would then report a false "target won". The executor suspends
+     restartOnDisconnect across the switch, so NOTHING is on air between the
+     disconnect and the window's directed advertise; the flag is restored on
+     every window ending (close, cancel, every fallback).
+   - BEGUN after the disconnect (lsHostBeginSwitchWindow) — startDirected aims
+     the high-duty set at the target identity (1 s per arm; the tick re-arms
+     while the window's bound holds). CONN_COUNT during the disconnect
+     teardown is retried bounded (the role is freed milliseconds later).
+   - CLOSED by lsHostSwitchWindowTick (polled from the main loop at
+     millisecond granularity, btFeedbackLoop as the 1 s backstop): a host
+     connected whose identity MATCHES the armed target — by stored identity
+     bytes, or by RPA resolution against the armed IRK, or (IRK-less bonds)
+     after the bond grace flips getPeerAddr to the stored identity — or the
+     millis bound elapsed. Closing restores the stock radio state: auto-
+     restart re-armed, disarm best-effort, open advertising resumed when no
+     host is connected. A non-target connection is bounced (named on the
+     wire) and NEVER reported as a successful switch; past the storm bound
+     the window closes with the named MISMATCH report.
+   Fallback everywhere is OPEN advertising — the pre-contingency behavior —
+   never a wedge: a failed SD call degrades to the race, it does not hang the
+   radio (the B2/B3 evidence shows open advertising still completes many
+   switches; the window exists to make the race structurally impossible).
+
+   Address/IRK source: the lib's public bond_load_keys (bonding.h) — the same
+   path the reconnect crypto uses — NOT hand-parsed bond-file offsets (the
+   first draft parsed offsets and got both the name-read length semantics and
+   the IRK offset wrong; the lib function is RPA-aware and offset-proof).
+*/
+
+#define LSHOST_SWITCH_WINDOW_TIMEOUT_S  60  // window bound (long, on purpose — the device-side trial ladder for Windows' reconnect; the bouncer holds the Mac off, and the bound still guarantees the switch can never strand the radio)
+#define LSHOST_SWITCH_WINDOW_TIMEOUT_MS (LSHOST_SWITCH_WINDOW_TIMEOUT_S * 1000UL)
+#define SWITCH_DIRECTED_ARM_TIMEOUT_S 1 // per-arm directed duration (high-duty directed self-terminates <=1.28 s by spec; the tick re-arms)
+#define LSHOST_TICK_MAX_CONNECTIONS 2  // tick identity check: the peripheral holds ONE link during a window (Bluefruit.begin() runs prph_count=1, so a second link is impossible at the SD level — 2 is defensive headroom for getConnectedHandles, not a real topology)
+#define LSHOST_BOUNCE_DECISION_GRACE_MS 3000UL  // an RPA peer whose identity cannot be decided from the connect bytes (IRK-less bond) gets this long to complete bonding — bond completion flips getPeerAddr to the stored identity; past the grace it is bounced as a non-target
+
+// --- window state + directed target (single instance; loop task only). One
+// switch window at a time is enforced by construction (the executor is the
+// only opener and the tick the only closer).
+static bool g_switchWindowOpen = false;
+static unsigned long g_switchWindowStartMs = 0;
+static ble_gap_addr_t g_switchWlAddr;                 // directed target (the bond's stored identity, coerced to its bytes)
+// (4.9.0 review) the g_switchIdKey identity-list storage is gone with the SD
+// lists themselves (bench 4.8.8-4.8.17: neither list is armable for this
+// advertising class); the IRK lives in g_switchTargetIrk below, captured for
+// the tick's RPA resolver.
+static uint8_t g_switchTargetIrk[BLE_GAP_SEC_KEY_LEN];  // the target's IRK when the bond carries one
+static bool g_switchTargetIrkValid = false;           // true = g_switchTargetIrk is a non-zero IRK the tick may resolve RPAs against
+
+// Ensure open advertising is running; returns whether advertising IS running
+// on return (4.9.0: the rc is checked — the bench trail's adv_start refusals
+// in the post-disconnect SD-teardown window are real, and BT,3 must not ack
+// SUCCESS while nothing is on air). Same forever-timeout as the boot path.
+// (4.9.0 round-2 review) NEVER while a switch window is open: between the
+// directed set's ~1 s arms nothing is on air BY DESIGN, and the old shape
+// would treat that gap as "not running" and start open advertising — the
+// just-disconnected racer's favorite door, and the tick would then skip
+// re-arming the directed set (isRunning stays true). The window owns the
+// radio until it closes; the close path clears the flag before calling this.
+bool lsHostEnsureAdvertising() {
+  if (needsInitialization) return false;
+  if (g_switchWindowOpen) return false;  // the window owns the radio
+  // restartOnDisconnect(true) re-advertises after a disconnect (BLEAdvertising
+  // event handler); this covers the paths that bypass a disconnect (pair-new,
+  // a set stopped for any other reason).
+  if (!Bluefruit.Advertising.isRunning()) {
+    Bluefruit.Advertising.start(0);  // rc checked via the isRunning probe below — start() can refuse in the teardown window
+  }
+  return Bluefruit.Advertising.isRunning();
+}
+
+
+// Auto-restart suspension across the window lifecycle (4.8.7 review). The
+// stock value is true (set once at stack init below); the lib offers no
+// getter, so the suspension saves that known stock value and every window
+// ending restores it. Only this file's window code ever writes the flag.
+static bool g_switchAutoRestartSuspended = false;
+
+// Begin-failure forensics (4.8.11): the connection count and the total
+// CONN_COUNT retry wait at the moment lsHostBeginSwitchWindow gave up — the
+// executor's fallback INFO line appends them so a repeat teardown-race
+// failure names its state on the wire (bench 4.8.10 spent its whole retry
+// budget without saying anything about the connection).
+static int g_switchWindowFailConn = -1;
+static int g_switchWindowFailWaitedMs = 0;
+
+// Bouncer counter (4.8.12): non-target connects dropped during the current
+// window; reset when a window opens/closes. Also the storm bound — past
+// LSHOST_BOUNCE_MAX REAL connections the window closes with the named
+// mismatch report.
+static int g_switchBounceCount = 0;
+// Per-connection bounce tracking (4.8.16 — bench 4.8.15: ONE Mac connection
+// was counted 600x in 200 ms; the tick spun against the same dying handle
+// while the SD tore the link down, tripped the cap, and closed the window).
+// A bounce is counted/logged ONCE per connection: while the same handle is
+// still present it is the SAME connection tearing down (skip quietly); the
+// tracking clears when the link goes empty, so a reconnecting peer (even on
+// a reused handle number) counts as new. 4.9.0: the tracking now ALSO carries
+// the bounce-decision grace — the handle's first observation starts an
+// LSHOST_BOUNCE_DECISION_GRACE_MS window (an undecidable RPA peer gets bond
+// time; a public/static non-target is decided at first sight), and a handle
+// that lingers far past its bounce is treated as a NEW connection (a refused
+// disconnect must never surrender the lockout quietly forever).
+static bool g_switchBouncedActive = false;
+static uint16_t g_switchBouncedHdl = 0xFFFF;
+static unsigned long g_switchBouncedConnectMs = 0;  // first tick observation of the tracked handle
+static bool g_switchBounceCounted = false;          // the tracked handle's bounce already fired (same-handle passes are teardown, not new connections)
+
+// Suspend the stock DISCONNECTED auto-restart (open FP_ANY advertising) for
+// the switch lifecycle: between the disconnect and the window's filtered
+// advertise nothing may be on air, or the just-disconnected host wins the
+// gap (bench B4: sub-second reconnection).
+static void lsHostSuspendAutoRestart(void) {
+  if (!g_switchAutoRestartSuspended) {
+    g_switchAutoRestartSuspended = true;
+    Bluefruit.Advertising.restartOnDisconnect(false);
+  }
+}
+
+// Restore stock auto-restart (every window ending: close, cancel, fallback).
+static void lsHostRestoreAutoRestart(void) {
+  if (g_switchAutoRestartSuspended) {
+    g_switchAutoRestartSuspended = false;
+    Bluefruit.Advertising.restartOnDisconnect(true);
+  }
+}
+
+// Coerce an address type that contradicts the bytes' top two bits — the SD
+// validates "upper two bits correspond to the specified address type" on
+// whitelist and identity-list entries, and a stored BOND type can disagree
+// with the actual bytes (bench 2026-11-07: the Mac's bond stored type=0
+// PUBLIC for bytes carrying the 11 marker of a random static address → the
+// window's adv_set_configure refused with 0x3201
+// BLE_ERROR_GAP_INVALID_BLE_ADDR). Convention: top two bits 0b11 = static
+// random, anything else = public/global for list-entry purposes; RPA/RRA
+// types (caution: those never belong in either list as an identity) coerce
+// by the same byte convention. Coercion keeps the identity list and the
+// whitelist entry CONSISTENT — the SD resolves one against the other.
+static inline void lsHostCoerceAddrType(ble_gap_addr_t* a) {
+  const uint8_t topBits = (uint8_t)(a->addr[5] >> 6);
+  if (a->addr_type == BLE_GAP_ADDR_TYPE_PUBLIC) {
+    if (topBits == 0x03) a->addr_type = BLE_GAP_ADDR_TYPE_RANDOM_STATIC;  // PUBLIC cannot carry the 11 marker
+  } else if (a->addr_type == BLE_GAP_ADDR_TYPE_RANDOM_STATIC) {
+    if (topBits != 0x03) a->addr_type = BLE_GAP_ADDR_TYPE_PUBLIC;         // static random must carry 11
+  } else {
+    a->addr_type = (topBits == 0x03) ? BLE_GAP_ADDR_TYPE_RANDOM_STATIC : BLE_GAP_ADDR_TYPE_PUBLIC;
+  }
+}
+
+// Text form of the armed whitelist entry for the wire INFO line ("AA:BB:..:FF/N").
+static char g_switchWlText[24];
+
+// Read the target bond's identity (address + type + IRK) through the lib's own
+// loader. inMac12 is the 12-hex bond-file stem; the filename lookup ignores
+// addr_type (bonding.cpp get_fname), so the parse below is only the lookup
+// key. The AUTHORITATIVE identity+IRK come from the loaded keyset
+// (bond_keys_t.peer_id = ble_gap_id_key_t) — the bytes the host actually uses
+// on the air, including its real address type (the Mac/Windows bonds are
+// static-address, iOS-style bonds are RPA+IRK). Returns false when the bond is
+// absent or the loader refuses (caller falls back to open advertising).
+static bool lsHostBondReadIdentity(const char* inMac12, ble_gap_id_key_t* outId) {
+  if (inMac12 == NULL || strlen(inMac12) != LSHOST_MAC_CHARS || outId == NULL) return false;
+  ble_gap_addr_t lookup;
+  memset(&lookup, 0, sizeof(lookup));
+  lookup.addr_type = BLE_GAP_ADDR_TYPE_RANDOM_STATIC;  // filename lookup ignores type
+  for (int i = 0; i < 6; i++) {
+    char byteStr[3] = { inMac12[i * 2], inMac12[i * 2 + 1], '\0' };
+    lookup.addr[i] = (uint8_t)strtoul(byteStr, NULL, 16);
+  }
+  bond_keys_t keys;
+  memset(&keys, 0, sizeof(keys));
+  if (!bond_load_keys(BLE_GAP_ROLE_PERIPH, &lookup, &keys)) return false;
+  *outId = keys.peer_id;
+  // Degenerate guard: a keyset whose stored identity is all-zero (never
+  // observed in the lib's writer, but a zero whitelist entry would be a
+  // wildcard-shaped hole). Fall back to the bond-file stem bytes.
+  static const uint8_t zero[6] = { 0 };
+  if (memcmp(outId->id_addr_info.addr, zero, 6) == 0) {
+    outId->id_addr_info = lookup;
+  }
+  return true;
+}
+
+// ARM (call while the old host is still connected, BEFORE disconnecting):
+// stops any running stock advertising (replaced by the window) and loads the
+// target bond's identity + IRK through the lib's bond loader. The identity
+// becomes the directed advertise's target (begin) and the tick's identity
+// match; a non-zero IRK is captured for the tick's RPA resolver (an
+// iOS-style privacy target reconnects with a rotating RPA whose bytes never
+// equal the stored identity — resolution admits it pre-bond). NO SoftDevice
+// whitelist or identity list is armed (bench trail 4.8.3-4.8.17: the SD's
+// filters are not enforceable for this advertising class — the bouncer is
+// the lockout). Any refusal returns false (the executor then uses open
+// advertising). The arm/begin outcomes are NAMED on the wire by the
+// executor's INFO line — bench 2026-11-07: the silent fallback left a failed
+// window indistinguishable from a working one (the B4 prep switch was
+// intercepted by the iPhone and the
+// wire could not say whether the window ever opened).
+bool lsHostArmSwitchWindow(const char* targetMac12, int* outAddrType, int* outHasIrk) {
+  if (needsInitialization) return false;
+  if (outAddrType != NULL) *outAddrType = -1;
+  if (outHasIrk != NULL) *outHasIrk = 0;
+  g_switchTargetIrkValid = false;
+  if (Bluefruit.Advertising.isRunning()) {
+    // Replaced by the window. Fail-closed, enforced (4.8.7 review — the
+    // comment used to CLAIM this without checking the rc): a failed stop
+    // leaves a live adv set this arm cannot reconfigure; refuse the arm so
+    // the caller falls back to open advertising instead of half-arming.
+    if (!Bluefruit.Advertising.stop()) return false;
+  }
+  ble_gap_id_key_t id;
+  if (!lsHostBondReadIdentity(targetMac12, &id)) return false;
+  // The stored type can contradict the bytes (bench 2026-11-07: the Mac's
+  // bond stored PUBLIC for bytes carrying the 11 static-random marker). The
+  // coerced identity is BOTH the directed advertise's p_peer_addr and the
+  // wire INFO line's target= text — coerce once.
+  lsHostCoerceAddrType(&id.id_addr_info);
+  g_switchWlAddr = id.id_addr_info;
+  if (outAddrType != NULL) *outAddrType = (int)g_switchWlAddr.addr_type;
+  snprintf(g_switchWlText, sizeof(g_switchWlText), "%02X:%02X:%02X:%02X:%02X:%02X/%d",
+           g_switchWlAddr.addr[0], g_switchWlAddr.addr[1], g_switchWlAddr.addr[2],
+           g_switchWlAddr.addr[3], g_switchWlAddr.addr[4], g_switchWlAddr.addr[5],
+           (int)g_switchWlAddr.addr_type);
+  // IRK CAPTURE (4.9.0): the target's IRK, when the bond carries one, feeds
+  // the tick's RPA resolver — a privacy host (iOS default) reconnects with a
+  // rotating resolvable address whose bytes never equal the stored identity,
+  // so a bytes-only match would bounce the legitimate target for the whole
+  // window. irk=0 on the INFO line means exactly "the bond carries no IRK"
+  // (4.8.7 review): the tick then falls back to the bond-decision grace for
+  // RPA peers (bond completion flips getPeerAddr to the stored identity).
+  // The IRK is deliberately NOT armed into a SoftDevice identity list — a
+  // p_peer_addr in the identity list makes the SD substitute an RPA as the
+  // directed target address instead of the raw identity, breaking the
+  // packet's target match for hosts that do not resolve RPAs during
+  // reconnect (bench 4.8.9).
+  static const uint8_t zeroIrk[BLE_GAP_SEC_KEY_LEN] = { 0 };
+  const bool hasIrk = (memcmp(id.id_info.irk, zeroIrk, BLE_GAP_SEC_KEY_LEN) != 0);
+  if (hasIrk) {
+    memcpy(g_switchTargetIrk, id.id_info.irk, BLE_GAP_SEC_KEY_LEN);
+    g_switchTargetIrkValid = true;
+  }
+  if (outHasIrk != NULL) *outHasIrk = hasIrk ? 1 : 0;
+  return true;
+}
+
+// DISARM (best-effort restore of the stock SD state — empty whitelist, empty
+// identity list). Called when the window never starts and when it closes.
+void lsHostDisarmSwitchWindow(void) {
+  (void)sd_ble_gap_whitelist_set(NULL, 0);
+  (void)sd_ble_gap_device_identities_set(NULL, NULL, 0);
+}
+
+// BEGIN (call AFTER the disconnect): start the DIRECTED window advertise at
+// the target identity (1 s per arm — high-duty directed self-terminates by
+// spec; the tick re-arms while the window's bound holds). TWO races to close:
+// (1) the stock restartOnDisconnect handler runs on the BLE event thread and
+//     may have ALREADY restarted open advertising (FP_ANY) by the time we get
+//     here — stop it first, deterministically (and the caller suspended the
+//     auto-restart so the disconnect→begin gap has NOTHING on air);
+// (2) the SD may still be TEARING DOWN the just-disconnected connection —
+//     sd_ble_gap_adv_start refuses until the disconnect completes (bench
+//     2026-11-07: begin failed on BOTH attempts, the racer won, and the new
+//     fallback line is what named the cause). Wait, bounded, for
+//     Bluefruit.connected() to reach 0 before starting — a few ms on the loop
+//     task, ordered after the 2 s dwell so nothing user-facing stalls;
+// (3) the same handler can fire between startDirected's configure and its
+//     adv_start (its !_runnning check is still false mid-call) — its
+//     start() then owns the set and our adv_start refuses
+//     (NRF_ERROR_INVALID_STATE). One stop + retry closes it.
+// Returns NRF_SUCCESS (0) on success, else the last SoftDevice error code
+// (the executor's INFO line names it). On final failure: restore the stock
+// auto-restart + disarm + open advertising (the pre-contingency behavior —
+// never a wedge).
+uint32_t lsHostBeginSwitchWindow(void) {
+  if (needsInitialization) return 0xFFFFFFFFUL;
+  // (2) wait out the disconnect teardown — bounded so a wedged SD cannot hang
+  // the loop task (the millis backstop in the tick already bounds the window).
+  // The lib's connected() can read 0 BEFORE the SoftDevice has freed the
+  // peripheral role (bench 2026-11-07: adv_start then refused 0x30012 =
+  // NRF_ERROR_CONN_COUNT — "connectable advertiser cannot be started" while
+  // the old connection's role teardown was still in flight), so the retry
+  // loop below ALSO retries CONN_COUNT specifically: that one error heals in
+  // milliseconds on its own. Non-CONN_COUNT failures do not heal by waiting
+  // and break out immediately (first attempt of the old shape).
+  for (int wait = 0; wait < 100 && Bluefruit.connected() != 0; wait++) delay(2);
+  // 4.8.17 DEVICE-SIDE TRIAL: DIRECTED window (the spec's fast-reconnect
+  // mechanism aimed at the target identity) with the bouncer as the keeper.
+  // The 4.8.14 open-advertising mechanism remains proven and green (the Mac
+  // is admitted post-window; Windows joined in 0.9 s ONLY while freshly
+  // paired and ignored open windows when stale) — this build tests whether
+  // directed-to-itself wakes Windows' association stack where open
+  // advertising did not, BEFORE any Windows-side settings are touched (the
+  // user's rule: exhaust the device end first; attribution stays clean).
+  // Directed sets self-terminate ~1 s; the tick re-arms while the window
+  // holds. CONN_COUNT teardown retry kept (the live-link teardown class).
+  uint32_t rc = 0;
+  int waitedMs = 0;
+  g_switchWindowFailConn = Bluefruit.connected();
+  g_switchWindowFailWaitedMs = 0;
+  for (int attempt = 0; attempt < 60; attempt++) {
+    if (Bluefruit.Advertising.isRunning()) Bluefruit.Advertising.stop();
+    rc = Bluefruit.Advertising.startDirected(&g_switchWlAddr, SWITCH_DIRECTED_ARM_TIMEOUT_S);
+    if (rc == NRF_SUCCESS) break;
+    if ((rc & 0xFFFFUL) != NRF_ERROR_CONN_COUNT) break;  // a real refusal — no amount of waiting fixes it
+    delay(20);
+    waitedMs += 20;
+  }
+  if (rc == NRF_SUCCESS) {
+    g_switchWindowOpen = true;
+    g_switchWindowStartMs = millis();
+    g_switchWindowFailConn = -1;
+    g_switchWindowFailWaitedMs = 0;
+    g_switchBounceCount = 0;
+    g_switchBouncedActive = false;
+    g_switchBouncedHdl = 0xFFFF;
+    g_switchBounceCounted = false;
+    return NRF_SUCCESS;
+  }
+  g_switchWindowFailConn = Bluefruit.connected();
+  g_switchWindowFailWaitedMs = waitedMs;
+  // Final failure: restore the stock radio state — auto-restart FIRST (so
+  // lsHostEnsureAdvertising's open advertising survives future disconnects),
+  // then disarm, then open advertising (the pre-contingency behavior).
+  lsHostRestoreAutoRestart();
+  lsHostDisarmSwitchWindow();
+  lsHostEnsureAdvertising();
+  return rc;
+}
+
+// Cancel an open window WITHOUT owning the final radio state (4.8.7 review —
+// the re-entry hole: a second lsHostExecuteSwitch while window 1 was open
+// armed over it but never cleared its state, so a later failure left a stale
+// flag whose backstop stop/restarted live advertising and could report a
+// phantom "target won"). Clears the state, stops the window advertise,
+// disarms both SD lists and restores the stock auto-restart; what runs next
+// (arm/begin/fallback) owns the radio from here.
+void lsHostCancelSwitchWindow(void) {
+  if (!g_switchWindowOpen) return;
+  g_switchWindowOpen = false;
+  g_switchWindowStartMs = 0;
+  g_switchBounceCount = 0;
+  g_switchBouncedActive = false;
+  g_switchBouncedHdl = 0xFFFF;
+  g_switchBounceCounted = false;
+  g_switchTargetIrkValid = false;
+  (void)Bluefruit.Advertising.stop();
+  lsHostRestoreAutoRestart();
+  lsHostDisarmSwitchWindow();
+}
+
+// CLOSE: stop the window advertise, disarm the SD lists, restore the stock
+// auto-restart and resume stock open advertising when no host is connected
+// (the target IS connected on the success path — starting advertising then
+// would be wrong; restartOnDisconnect owns the post-disconnect advertise as
+// always).
+void lsHostCloseSwitchWindow(void) {
+  if (!g_switchWindowOpen) return;
+  g_switchWindowOpen = false;
+  g_switchWindowStartMs = 0;
+  g_switchBounceCount = 0;
+  g_switchBouncedActive = false;
+  g_switchBouncedHdl = 0xFFFF;
+  g_switchBounceCounted = false;
+  g_switchTargetIrkValid = false;
+  (void)Bluefruit.Advertising.stop();  // window set; harmless if the SD already terminated it
+  lsHostRestoreAutoRestart();
+  lsHostDisarmSwitchWindow();
+  if (!Bluefruit.connected()) lsHostEnsureAdvertising();
+}
+
+// (4.9.0 round-2 review) the window's millis bound must fire on EVERY path —
+// including the non-target early returns (an undecidable-RPA grace cycle, a
+// refused-disconnect teardown wait, a stale-handle re-decide): those used to
+// return before the tail's bound check, so a lingering non-target could keep
+// the window (and the lockout) alive past its documented 60 s worst case —
+// up to the bounce cap's ~30 min. Call before every non-target `return 0`:
+// true = the bound elapsed, the window was closed, the caller returns -1.
+bool lsHostSwitchWindowBoundExpired(void) {
+  if (!g_switchWindowOpen) return false;
+  if (g_switchWindowStartMs == 0) return false;
+  if (millis() - g_switchWindowStartMs < LSHOST_SWITCH_WINDOW_TIMEOUT_MS) return false;
+  lsHostCloseSwitchWindow();
+  return true;
+}
+
+// Per-tick during a switch window (polled from btFeedbackLoop at 1 s):
+// returns 1 = the ARMED TARGET connected (window closed), 0 = still waiting,
+// -1 = millis bound elapsed or re-arm failed (window closed, open advertising
+//      resumed),
+// -2 = a NON-TARGET host is connected (window closed; named on the wire —
+//      possible if a host's stack responds to a directed packet not addressed
+//      to it, or in a race the directed mechanism did not cover).
+// (4.8.8) the directed arm self-terminates ~1 s (spec/SD limit) — this tick
+// RE-ARMS it while the bound holds; between arms NOTHING is on air (the
+// just-disconnected racer stays locked out — the guarantee is the directed
+// addressing, not wall-to-wall advertising). A failed re-arm closes the
+// window (open fallback, never a stuck quiet radio).
+// Identity check (4.8.7 review — the false "target won"): the old shape
+// reported success for ANY connection. The armed target is g_switchWlAddr;
+// a connected peer's identity must match its bytes before the switch may
+// read as done. On the directed mechanism a NON-target connect should be
+// impossible, so a mismatch here is a named anomaly, never a success.
+// (4.9.0) the match is RPA-aware — see lsHostRpaResolvesIrk below.
+
+// (4.9.0) the RPA byte test (lsHostAddrIsRpa) and the hash comparator
+// (lsHostRpaHashMatches) live in LSHostSwitch.h — pure, host-tested. Only
+// the AES-backed resolver stays here, where the SoftDevice call exists.
+
+// Resolve a peer's resolvable address against the armed target's IRK —
+// Bluetooth Core 5.3 Vol 3 Part H 2.2.2: ah(IRK, prand) = e(IRK, r') mod
+// 2^24, with r' = prand in the least-significant 24 bits and zero padding
+// above (Zephyr/Nordic rpa.c ah(): memcpy(res, r, 3) into an otherwise-zero
+// 16-byte block, little-endian AES, output truncated to its least
+// significant 24 bytes-as-array bytes). Byte order, both ends: the RPA is
+// prand = addr[3..5] (addr[5] carries the 01 type bits) and hash =
+// addr[0..2]; a match means this RPA belongs to the identity holding the
+// IRK — the privacy target, admitted pre-bond. sd_ecb_block_encrypt is a
+// big-endian (MSB-first) AES core, so the little-endian block and key are
+// byte-reversed in and the ciphertext byte-reversed out (the exact
+// definition of bt_encrypt_le). Returns false on any SD refusal — a
+// resolution failure reads as "not the target", and the armed IRK only ever
+// comes from the target's own bond file.
+bool lsHostRpaResolvesIrk(const uint8_t irk[16], const uint8_t peerAddr[6]) {
+  if (!lsHostAddrIsRpa(peerAddr)) return false;
+  uint8_t clearLe[16] = { 0 };
+  clearLe[0] = peerAddr[3];
+  clearLe[1] = peerAddr[4];
+  clearLe[2] = peerAddr[5];
+  nrf_ecb_hal_data_t ecb;
+  memset(&ecb, 0, sizeof(ecb));
+  for (int i = 0; i < 16; i++) {
+    ecb.key[i] = irk[15 - i];          // big-endian AES key
+    ecb.cleartext[i] = clearLe[15 - i];  // big-endian block
+  }
+  if (sd_ecb_block_encrypt(&ecb) != NRF_SUCCESS) return false;
+  return lsHostRpaHashMatches(peerAddr, ecb.ciphertext) != 0;
+}
+int lsHostSwitchWindowTick(void) {
+  if (!g_switchWindowOpen) return 0;
+
+  if (Bluefruit.connected()) {
+    uint16_t hdl[LSHOST_TICK_MAX_CONNECTIONS];
+    const uint8_t n = Bluefruit.getConnectedHandles(hdl, LSHOST_TICK_MAX_CONNECTIONS);
+    bool targetConnected = false;
+    uint16_t nonTargetHdl = 0xFFFF;
+    bool nonTargetDecidable = true;  // see the three-tier comment below
+    for (uint8_t i = 0; i < n; i++) {
+      BLEConnection* conn = Bluefruit.Connection(hdl[i]);
+      if (conn == NULL) continue;
+      ble_gap_addr_t peer = conn->getPeerAddr();
+      // IDENTITY MATCH (4.9.0, three tiers):
+      // (1) the stored identity bytes (public/static-address hosts — the
+      //     bench Mac/Windows class);
+      // (2) RPA resolution against the armed IRK — an iOS-style privacy
+      //     target reconnects with a rotating resolvable address whose bytes
+      //     never equal the stored identity, so the bytes-only match bounced
+      //     the legitimate target for the whole window (each retry repeated);
+      //     resolution admits it pre-bond;
+      // (3) an RPA peer the armed bond cannot resolve (irk=0) is UNDECIDED
+      //     at first sight — the bounce-decision grace below gives its
+      //     bonding time to complete, which flips getPeerAddr to the stored
+      //     identity and lets tier (1) admit it.
+      const bool isRpaPeer = lsHostAddrIsRpa(peer.addr);
+      bool match = (memcmp(peer.addr, g_switchWlAddr.addr, 6) == 0);
+      if (!match && isRpaPeer && g_switchTargetIrkValid) {
+        match = lsHostRpaResolvesIrk(g_switchTargetIrk, peer.addr);
+      }
+      if (match) {
+        targetConnected = true;
+      } else {
+        nonTargetHdl = hdl[i];
+        // A non-target is DECIDABLE unless it is an RPA peer whose identity
+        // the armed bond cannot judge at all (no IRK). Decidable includes
+        // an RPA the armed IRK just EXCLUDED (resolution failed = definitive
+        // not-the-target) — those bounce immediately, preserving the
+        // bench-proven millisecond lockout for the public/static racer class
+        // (a grace on every first sight would hand the racer 3 s of link per
+        // cycle and reopen the wrong-host race).
+        nonTargetDecidable = !(isRpaPeer && !g_switchTargetIrkValid);
+      }
+    }
+    if (targetConnected) {
+      lsHostCloseSwitchWindow();
+      return 1;
+    }
+    // THE BOUNCER (4.8.12 — bench 4.8.11's verdict): S140 does NOT enforce
+    // the directed target field NOR the whitelist filter on a directed set —
+    // macOS's connect-by-address retry walked straight into every windowed
+    // attempt. The lockout cannot come from the controller; it comes from US:
+    // a non-target connect is dropped and the window KEEPS WAITING for the
+    // target. The just-disconnected host's reconnect engine cycles (connect →
+    // dropped → retry, macOS at its own backoff cadence) while the target's
+    // connect — whenever it comes — is the one that holds. This is the same
+    // disconnect primitive the whole switch has used all along; it needs no
+    // SD filtering. The bounce count is bounded (a pathological storm closes
+    // the window with the named -2 report instead of spinning forever).
+#define LSHOST_BOUNCE_MAX 600
+    if (nonTargetHdl != 0xFFFF) {
+      const bool knownHandle = (g_switchBouncedActive && nonTargetHdl == g_switchBouncedHdl);
+      if (!knownHandle) {
+        // FIRST OBSERVATION of this handle (4.9.0): record it. A decidable
+        // non-target (public/static bytes, or an RPA the armed IRK already
+        // excluded) proceeds to the bounce in this same pass — the
+        // bench-proven millisecond lockout is untouched. An UNDECIDABLE RPA
+        // peer (no IRK in the bond) gets the bond-decision grace below:
+        // self-advancing passes before the grace ends are this connection
+        // still establishing, and bond completion flips getPeerAddr to the
+        // stored identity so the match branch above can admit the target.
+        g_switchBouncedActive = true;
+        g_switchBouncedHdl = nonTargetHdl;
+        g_switchBouncedConnectMs = millis();
+        g_switchBounceCounted = false;
+      }
+      if (g_switchBounceCounted) {
+        // Already bounced: the same handle still present is this connection
+        // tearing down (the SD needs ~100-200 ms; the tick runs at
+        // milliseconds) — skip quietly, no count, no log, no disconnect spam
+        // (4.8.16). The tracking clears when the link goes empty (below), so
+        // a reconnecting peer counts anew even if the SD reuses the handle
+        // number. 4.9.0: a handle that lingers past the teardown horizon is
+        // NOT trusted as "the same teardown" — a refused disconnect must
+        // never surrender the lockout quietly forever (the connect would hold
+        // the link for the window's remainder). Clear the tracking; the next
+        // pass re-decides it as a fresh connection, still bounded by the
+        // bounce cap.
+        if (millis() - g_switchBouncedConnectMs < LSHOST_BOUNCE_DECISION_GRACE_MS * 4UL) {
+          // teardown in progress — wait it out quietly (the bound still applies)
+          return lsHostSwitchWindowBoundExpired() ? -1 : 0;
+        }
+        g_switchBouncedActive = false;
+        // stale tracked handle — re-decide it as a new connection next pass
+        return lsHostSwitchWindowBoundExpired() ? -1 : 0;
+      }
+      if (!nonTargetDecidable
+          && millis() - g_switchBouncedConnectMs < LSHOST_BOUNCE_DECISION_GRACE_MS) {
+        // undecidable RPA peer — hold through the bond-decision grace (the
+        // bound still applies; a lingered non-target must not extend it)
+        return lsHostSwitchWindowBoundExpired() ? -1 : 0;
+      }
+      // Decision point (a decidable non-target arriving here on its first
+      // pass, or an undecidable one whose grace elapsed without the identity
+      // surfacing). ONE BOUNCE PER CONNECTION (4.8.16): count/log/dispatch
+      // exactly once, then the teardown-skip above owns its same-handle
+      // passes.
+      g_switchBounceCounted = true;
+      if (g_switchBounceCount < LSHOST_BOUNCE_MAX) {
+        g_switchBounceCount++;
+        if (g_switchBounceCount <= 3 || (g_switchBounceCount % 20) == 0) {
+          BLEConnection* conn = Bluefruit.Connection(nonTargetHdl);
+          char peer13[LSHOST_MAC_CHARS + 1] = "????????????";
+          if (conn != NULL) {
+            ble_gap_addr_t peer = conn->getPeerAddr();
+            sprintf(peer13, "%02X%02X%02X%02X%02X%02X",
+                    peer.addr[0], peer.addr[1], peer.addr[2],
+                    peer.addr[3], peer.addr[4], peer.addr[5]);
+          }
+          serialTxEnqueueLine(String("INFO: BT window bouncing non-target ") + peer13
+                              + " (#" + g_switchBounceCount + ") — still waiting for the target");
+        }
+        // The disconnect's rc is DELIBERATELY ignored (bench 4.8.14: it can
+        // race the peer's own mid-teardown retry); the per-connection tracking
+        // above is what keeps the loop honest and bounded.
+        (void)Bluefruit.disconnect(nonTargetHdl);
+        // keep waiting for the target (the bound still applies)
+        return lsHostSwitchWindowBoundExpired() ? -1 : 0;
+      }
+      // Cap reached on a genuinely persistent non-target: close with the
+      // honest NOT-confirmed report (the pre-bouncer behavior).
+      BLEConnection* conn = Bluefruit.Connection(nonTargetHdl);
+      char peer13[LSHOST_MAC_CHARS + 1] = "????????????";
+      if (conn != NULL) {
+        ble_gap_addr_t peer = conn->getPeerAddr();
+        sprintf(peer13, "%02X%02X%02X%02X%02X%02X",
+                peer.addr[0], peer.addr[1], peer.addr[2],
+                peer.addr[3], peer.addr[4], peer.addr[5]);
+      }
+      char target13[LSHOST_MAC_CHARS + 1];
+      sprintf(target13, "%02X%02X%02X%02X%02X%02X",
+              g_switchWlAddr.addr[0], g_switchWlAddr.addr[1], g_switchWlAddr.addr[2],
+              g_switchWlAddr.addr[3], g_switchWlAddr.addr[4], g_switchWlAddr.addr[5]);
+      serialTxEnqueueLine(String("INFO: BT window MISMATCH (connected ") + peer13
+                          + " != target " + target13 + ") — switch NOT confirmed");
+      lsHostCloseSwitchWindow();
+      return -2;
+    }
+  } else {
+    g_switchBouncedActive = false;  // link empty — the next connect is a NEW connection
+    g_switchBounceCounted = false;
+  }
+
+  if (g_switchWindowStartMs != 0
+      && millis() - g_switchWindowStartMs >= LSHOST_SWITCH_WINDOW_TIMEOUT_MS) {
+    lsHostCloseSwitchWindow();
+    return -1;  // timed out — open advertising resumed by the close
+  }
+  // Directed re-arm (4.8.17): the per-arm set self-terminates ~1 s; keep the
+  // directed invitation alive while the window holds. CONN_COUNT means a
+  // connection is being established this millisecond (the next pass sees it
+  // in the connected branch); any other refusal closes the window NAMED.
+  if (!Bluefruit.Advertising.isRunning()) {
+    uint32_t rc = Bluefruit.Advertising.startDirected(&g_switchWlAddr, SWITCH_DIRECTED_ARM_TIMEOUT_S);
+    if (rc != NRF_SUCCESS && (rc & 0xFFFFUL) != NRF_ERROR_CONN_COUNT) {
+      serialTxEnqueueLine(String("INFO: BT window closed (re-arm rc=0x")
+                          + String(rc, HEX) + ") — open advertising");
+      lsHostCloseSwitchWindow();
+      return -1;
+    }
+  }
+  return 0;  // still waiting
+}
+
+// Per-loop-pass window service (4.8.8; 4.8.14 open-advertising shape): runs
+// the tick at millisecond granularity so the bouncer drops a non-target
+// connect as fast as possible while a window holds; no-op otherwise. Called
+// from the main loop; the btFeedbackLoop tick call remains as the 1 s
+// backstop (idempotent).
+void lsHostServiceSwitchWindow(void) {
+  if (g_switchWindowOpen) (void)lsHostSwitchWindowTick();
+}
+
+// Is a switch window open? (4.9.0 — the BT,3 pair-new gate: the window's
+// bouncer owns the radio and would drop the peer pair-new exists to admit.)
+bool lsHostSwitchWindowOpen(void) {
+  return g_switchWindowOpen;
+}
+
+
+
+/*****************************
+   HID-SUBSCRIPTION WATCHDOG (4.8.18 — the bench 2026-11-07 "connected but
+   deaf" class)
+   *****************************
+   After heavy connect/drop churn a host's HID stack can hold a link whose
+   notification subscription never re-enables: the device shows CONNECTED,
+   live view is healthy, and no cursor moves (the SoftDevice refuses every
+   report with NRF_ERROR_INVALID_STATE while the CCCD is off — quoted from the
+   S140 hvx contract). Tonight's fixes were all host-side (Bluetooth toggle,
+   reboot, remove+re-add).
+
+   The watchdog makes that state self-correcting: while a BONDED peer holds a
+   link whose mouse-input CCCD is not enabled, after a 5 s grace (pairing/
+   encryption/CCCD restore take a moment), the link is DISCONNECTED — the
+   host's own retry then re-establishes and re-subscribes cleanly (the fix
+   that worked all night, driven by us). Bounded: 3 cycles max per session
+   (the counter resets only when a subscription is actually seen — a
+   persistent non-subscriber cannot be cycled forever); past the bound the
+   link is left to the host with one named INFO line. A subscribed link
+   resets everything.
+
+   Guards: BONDED peers only (a BLE-DFU session is conventionally unbonded
+   and is never cycled; USB DFU is the documented update path regardless);
+   suppressed while a switch window is open (the window's own tick owns the
+   radio then). The report index is BLEHidAdafruit's REPORT_ID_MOUSE = 3
+   (private enum, read via the bounded lib accessor inputNotifyEnabled()).
+*/
+
+#define LSHOST_HID_WD_GRACE_MS    5000
+#define LSHOST_HID_WD_MAX_CYCLES  3
+#define LSHOST_HID_WD_MAX_REFUSED 5
+#define HID_REPORT_ID_MOUSE       3
+
+static unsigned long g_hidWdConnectMs = 0;  // 0 = not tracking an unsubscribed link
+static uint16_t g_hidWdHdl = 0xFFFF;        // the link the grace timer belongs to (4.9.0)
+static int g_hidWdCycles = 0;
+static int g_hidWdRefused = 0;
+static bool g_hidWdCappedLogged = false;
+
+void lsHidWatchdogLoop(void) {
+  if (needsInitialization) return;
+  if (g_comMode != CONF_COM_MODE_BLE) return;
+  if (g_switchWindowOpen) return;  // the window's tick owns the radio
+
+  if (!Bluefruit.connected()) {
+    g_hidWdConnectMs = 0;
+    g_hidWdHdl = 0xFFFF;
+    // NOTE: g_hidWdCycles deliberately persists across link-less passes — the
+    // cap is per SESSION (a persistent non-subscriber must not be cycled
+    // forever); it resets only when a subscription is actually observed.
+    return;
+  }
+
+  uint16_t hdl[1];
+  if (Bluefruit.getConnectedHandles(hdl, 1) == 0) return;
+  BLEConnection* conn = Bluefruit.Connection(hdl[0]);
+  if (conn == NULL || !conn->bonded()) { g_hidWdConnectMs = 0; g_hidWdHdl = 0xFFFF; return; }  // DFU guard
+
+  if (blehid.inputNotifyEnabled(HID_REPORT_ID_MOUSE)) {
+    // Subscribed — healthy. Reset the session counters.
+    g_hidWdConnectMs = 0;
+    g_hidWdHdl = 0xFFFF;
+    g_hidWdCycles = 0;
+    g_hidWdRefused = 0;
+    g_hidWdCappedLogged = false;
+    return;
+  }
+
+  // The grace belongs to the link it started on (4.9.0): a drop+reconnect the
+  // 1 s pass never observed as link-less must not hand the new link the old
+  // link's elapsed grace — the new CCCD restore legitimately needs its own
+  // 5 s, and inheriting the elapsed timer bounced it mid-restore.
+  if (g_hidWdHdl != hdl[0]) {
+    g_hidWdHdl = hdl[0];
+    g_hidWdConnectMs = millis();
+    return;
+  }
+  if (g_hidWdConnectMs == 0) { g_hidWdConnectMs = millis(); return; }  // grace begins
+  if (millis() - g_hidWdConnectMs < LSHOST_HID_WD_GRACE_MS) return;
+
+  if (g_hidWdCycles < LSHOST_HID_WD_MAX_CYCLES) {
+    // A cycle is consumed only when the disconnect actually dispatched —
+    // a refusal (the SD mid-teardown a race left behind, bench 4.8.15's
+    // class) must not burn the session budget without cycling anything.
+    // (4.9.0 round-2 precision note: the lib's disconnect() returns true
+    // when the handle is already gone, so a raced teardown still consumes a
+    // cycle — negligible, the counters reset on the next observed
+    // subscription. What this guard really prevents is the REFUSED call
+    // (NRF_ERROR_INVALID_STATE-class) burning the budget.)
+    if (!Bluefruit.disconnect(hdl[0])) {
+      if (++g_hidWdRefused >= LSHOST_HID_WD_MAX_REFUSED) {
+        g_hidWdRefused = 0;
+        if (!g_hidWdCappedLogged) {
+          g_hidWdCappedLogged = true;
+          serialTxEnqueueLine("INFO: HID watchdog capped (disconnects refused) — leaving the link to the host");
+        }
+        return;
+      }
+      // Retry on the next pass without consuming a cycle; a short re-grace
+      // keeps the retry cadence at the 1 s pass instead of the grace.
+      g_hidWdConnectMs = millis() - LSHOST_HID_WD_GRACE_MS + 500UL;
+      return;
+    }
+    g_hidWdCycles++;
+    g_hidWdRefused = 0;
+    g_hidWdConnectMs = 0;  // re-grace after the cycle
+    serialTxEnqueueLine(String("INFO: HID watchdog cycling a subscription-less link (cycle ")
+                        + g_hidWdCycles + ")");
+    return;
+  }
+  if (!g_hidWdCappedLogged) {
+    g_hidWdCappedLogged = true;
+    serialTxEnqueueLine("INFO: HID watchdog capped (3 cycles without recovery) — leaving the link to the host");
   }
 }
 
