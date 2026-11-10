@@ -692,10 +692,10 @@ void lsHostPushState(bool force) {  // default lives on the LSApiDeclarations.h 
      restartOnDisconnect across the switch, so NOTHING is on air between the
      disconnect and the window's directed advertise; the flag is restored on
      every window ending (close, cancel, every fallback).
-   - BEGUN after the disconnect (lsHostBeginSwitchWindow) — startDirected aims
-     the high-duty set at the target identity (1 s per arm; the tick re-arms
-     while the window's bound holds). CONN_COUNT during the disconnect
-     teardown is retried bounded (the role is freed milliseconds later).
+   - BEGUN after the disconnect (lsHostBeginSwitchWindow) — stock open
+     advertising (start(0)) is (re)started, held for the window's bound with
+     the tick's keep-open ensure; CONN_COUNT during the disconnect teardown is
+     retried bounded (the role is freed milliseconds later).
    - CLOSED by lsHostSwitchWindowTick (polled from the main loop at
      millisecond granularity, btFeedbackLoop as the 1 s backstop): a host
      connected whose identity MATCHES the armed target — by stored identity
@@ -719,7 +719,6 @@ void lsHostPushState(bool force) {  // default lives on the LSApiDeclarations.h 
 
 #define LSHOST_SWITCH_WINDOW_TIMEOUT_S  60  // window bound (long, on purpose — the device-side trial ladder for Windows' reconnect; the bouncer holds the Mac off, and the bound still guarantees the switch can never strand the radio)
 #define LSHOST_SWITCH_WINDOW_TIMEOUT_MS (LSHOST_SWITCH_WINDOW_TIMEOUT_S * 1000UL)
-#define SWITCH_DIRECTED_ARM_TIMEOUT_S 1 // per-arm directed duration (high-duty directed self-terminates <=1.28 s by spec; the tick re-arms)
 #define LSHOST_TICK_MAX_CONNECTIONS 2  // tick identity check: the peripheral holds ONE link during a window (Bluefruit.begin() runs prph_count=1, so a second link is impossible at the SD level — 2 is defensive headroom for getConnectedHandles, not a real topology)
 #define LSHOST_BOUNCE_DECISION_GRACE_MS 3000UL  // an RPA peer whose identity cannot be decided from the connect bytes (IRK-less bond) gets this long to complete bonding — bond completion flips getPeerAddr to the stored identity; past the grace it is bounced as a non-target
 
@@ -985,7 +984,7 @@ void lsHostDisarmSwitchWindow(void) {
 //     fallback line is what named the cause). Wait, bounded, for
 //     Bluefruit.connected() to reach 0 before starting — a few ms on the loop
 //     task, ordered after the 2 s dwell so nothing user-facing stalls;
-// (3) the same handler can fire between startDirected's configure and its
+// (3) the same handler can fire between start()'s configure and its
 //     adv_start (its !_runnning check is still false mid-call) — its
 //     start() then owns the set and our adv_start refuses
 //     (NRF_ERROR_INVALID_STATE). One stop + retry closes it.
@@ -1005,27 +1004,33 @@ uint32_t lsHostBeginSwitchWindow(void) {
   // milliseconds on its own. Non-CONN_COUNT failures do not heal by waiting
   // and break out immediately (first attempt of the old shape).
   for (int wait = 0; wait < 100 && Bluefruit.connected() != 0; wait++) delay(2);
-  // 4.8.17 DEVICE-SIDE TRIAL: DIRECTED window (the spec's fast-reconnect
-  // mechanism aimed at the target identity) with the bouncer as the keeper.
-  // The 4.8.14 open-advertising mechanism remains proven and green (the Mac
-  // is admitted post-window; Windows joined in 0.9 s ONLY while freshly
-  // paired and ignored open windows when stale) — this build tests whether
-  // directed-to-itself wakes Windows' association stack where open
-  // advertising did not, BEFORE any Windows-side settings are touched (the
-  // user's rule: exhaust the device end first; attribution stays clean).
-  // Directed sets self-terminate ~1 s; the tick re-arms while the window
-  // holds. CONN_COUNT teardown retry kept (the live-link teardown class).
+  // OPEN-ADVERTISING WINDOW, RESTORED (4.9.3 — the directed trial's final
+  // verdict, on the wire): the 4.8.17 directed trial FAILED with both hosts —
+  // Windows silently ignores directed packets (bench 2026-11-07), and the
+  // iPhone's connect attempts cannot establish through a directed set either
+  // (bench 2026-11-09: "connection attempts fail" while the only live arm is
+  // the ~1 s one; the Mac's preps only ever worked inside that first second).
+  // The 4.8.14-16 OPEN door — every host's reconnect has always ridden open
+  // advertising — with the 4.8.12 bouncer as the keeper and 4.9.0's RPA
+  // resolution as the target decision is the combination where a privacy
+  // host's connect can actually REACH the decision logic. CONN_COUNT teardown
+  // retry kept (the live-link teardown class).
   uint32_t rc = 0;
   int waitedMs = 0;
   g_switchWindowFailConn = Bluefruit.connected();
   g_switchWindowFailWaitedMs = 0;
   for (int attempt = 0; attempt < 60; attempt++) {
-    if (Bluefruit.Advertising.isRunning()) Bluefruit.Advertising.stop();
-    rc = Bluefruit.Advertising.startDirected(&g_switchWlAddr, SWITCH_DIRECTED_ARM_TIMEOUT_S);
-    if (rc == NRF_SUCCESS) break;
-    if ((rc & 0xFFFFUL) != NRF_ERROR_CONN_COUNT) break;  // a real refusal — no amount of waiting fixes it
-    delay(20);
-    waitedMs += 20;
+    // Already live (the stock auto-restart handler can race us here) — the
+    // window simply owns the running open advertise.
+    if (Bluefruit.Advertising.isRunning()) { rc = NRF_SUCCESS; break; }
+    if (Bluefruit.Advertising.start(0) || Bluefruit.Advertising.isRunning()) { rc = NRF_SUCCESS; break; }
+    rc = 0xFFFFFFFFUL;  // start() refused
+    if (Bluefruit.connected() != 0) {  // role teardown in flight — CONN_COUNT class
+      delay(20);
+      waitedMs += 20;
+      continue;
+    }
+    break;  // refused for a reason waiting cannot fix
   }
   if (rc == NRF_SUCCESS) {
     g_switchWindowOpen = true;
@@ -1357,18 +1362,11 @@ int lsHostSwitchWindowTick(void) {
     lsHostCloseSwitchWindow();
     return -1;  // timed out — open advertising resumed by the close
   }
-  // Directed re-arm (4.8.17): the per-arm set self-terminates ~1 s; keep the
-  // directed invitation alive while the window holds. CONN_COUNT means a
-  // connection is being established this millisecond (the next pass sees it
-  // in the connected branch); any other refusal closes the window NAMED.
-  if (!Bluefruit.Advertising.isRunning()) {
-    uint32_t rc = Bluefruit.Advertising.startDirected(&g_switchWlAddr, SWITCH_DIRECTED_ARM_TIMEOUT_S);
-    if (rc != NRF_SUCCESS && (rc & 0xFFFFUL) != NRF_ERROR_CONN_COUNT) {
-      serialTxEnqueueLine(String("INFO: BT window closed (re-arm rc=0x")
-                          + String(rc, HEX) + ") — open advertising");
-      lsHostCloseSwitchWindow();
-      return -1;
-    }
+  // Keep-open (4.9.3): the window IS stock open advertising (start(0) runs
+  // forever) — this re-ensures it if anything stopped it mid-window (an
+  // FP_ANY handler restart, a close race). Idempotent; no directed re-arms.
+  if (!Bluefruit.Advertising.isRunning() && !Bluefruit.connected()) {
+    lsHostEnsureAdvertising();
   }
   return 0;  // still waiting
 }

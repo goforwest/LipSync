@@ -385,6 +385,7 @@ private:
   int _btHostCount = 0;   // exposed bond count at the last enumeration (capped at LSHOST_ENUM_CAP)
   int _btTargetRow = 0;   // pending switch target (1-based enumeration row)
   String _btSwitchTargetMac = "";  // the target's identity captured at confirm-render — finishBtSwitch verifies the executed row still IS the one the page named (MAC-sorted rows renumber in-range when the bond set changes)
+  bool _btSwitchTargetWasActive = false;  // bench 2026-11-09: was the target ALREADY the active host when this confirm page rendered? Distinguishes the blatant "you picked the connected host" (name the refusal) from the benign "the target claimed the link during the dwell" (silent refresh — the outcome the user asked for). The two are identical at execution time; only the render-time capture can tell them apart.
   int _btForgetHostRows = 0;  // selectable host rows the forget list rendered with (the destructive-hold gate reads it)
   String _btForgetRowMacs[LSHOST_ENUM_CAP];  // per-row identity captured at forget-list render (lsHostExecuteForget refuses a renumbered match — the wrong host must never be erased)
   String _soundMenuText[4] = { "Sound:", "<>", "Turn <>", "... Back" };
@@ -3231,6 +3232,11 @@ void LSScreen::btSwitchConfirmPage() {
     // pairs while advertising, a forget lands over serial). finishBtSwitch
     // verifies the executed row still IS the one this page named.
     _btSwitchTargetMac = rows[_btTargetRow - 1].mac;
+    // Also capture whether it was ALREADY the active host (bench 2026-11-09):
+    // finishBtSwitch's ALREADY_ACTIVE gate needs to know whether the refusal
+    // is "you picked the connected host" (name it) or "the target claimed the
+    // link during the dwell" (silently refresh — the user got what they asked).
+    _btSwitchTargetWasActive = (rows[_btTargetRow - 1].active != 0);
   } else {
     // The row this page was opened for no longer exists (a serial BT,2
     // landed between list-render and confirm-open). Force a range refusal at
@@ -3240,6 +3246,7 @@ void LSScreen::btSwitchConfirmPage() {
     // cannot cover it with no identity to check).
     _btTargetRow = 0;
     _btSwitchTargetMac = "";
+    _btSwitchTargetWasActive = false;
   }
   _btConfirmText[0] = "Switch to";
   _btConfirmText[1] = label;
@@ -3417,14 +3424,19 @@ void LSScreen::finishBtSwitch() {
     btHostsMenu();  // switch executed (window open or open-advertising fallback) — show the fresh list
     return;
   }
-  // ALREADY_ACTIVE: a refusal like any other EXCEPT when the connected host
-  // IS the one this page captured — the target can legitimately take the link
-  // during the confirm dwell when the switch flow started with NO active host
-  // (the host list is reachable while open-advertising; 4.8.7 review). That
-  // is the outcome the user asked for: refresh the list, no error cue. When
-  // the connected host is some OTHER row, name the refusal like every other
-  // (never a silent no-op — the modeLockedPage lesson).
-  if (decision == LSHOST_REFUSE_ALREADY_ACTIVE) {
+  // ALREADY_ACTIVE has TWO causes that are identical at execution time (bench
+  // 2026-11-09 — the 4.9.0 mute swallowed the blatant one):
+  //  - BENIGN: no host was active when this page rendered; the TARGET claimed
+  //    the link during the 2 s dwell (the host list is reachable while
+  //    open-advertising). That is the outcome the user asked for — silent
+  //    refresh, no error cue.
+  //  - BLATANT: the target was ALREADY the connected host when the user chose
+  //    it. The bench's original finding ("2- no refusal"): the user picked
+  //    their own host expecting feedback. Name the refusal like every other
+  //    (never a silent no-op — the modeLockedPage lesson).
+  // The render-time capture (_btSwitchTargetWasActive) is the only datum that
+  // separates them; an active-now comparison alone cannot.
+  if (decision == LSHOST_REFUSE_ALREADY_ACTIVE && !_btSwitchTargetWasActive) {
     char active13[LSHOST_MAC_CHARS + 1];
     if (lsHostActiveMac(active13) && _btSwitchTargetMac.length() == LSHOST_MAC_CHARS
         && _btSwitchTargetMac.equalsIgnoreCase(String(active13))) {
