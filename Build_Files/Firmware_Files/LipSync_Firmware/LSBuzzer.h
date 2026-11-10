@@ -178,7 +178,15 @@ void LSBuzzer::begin(){
 //*********************************//
 // Function   : update
 // 
-// Description: Updates buzzer (currently not implemented)
+// Description: Service the note queue — fire one due note per pass (the
+//              one-note-per-pass firing policy keeps a note queue from
+//              monopolizing a pass), reschedule a tone that was requested
+//              with a duration but fired late (a late fire pushed the due
+//              silences past its finish, cutting the ready cue's second
+//              note to zero), and release a duration-0 tone that already
+//              played. 4.9.1 docstring fix: this method is implemented and
+//              LOAD-BEARING — the ready cue and every queued melody die
+//              silently if the main loop stops calling it.
 // 
 // Arguments :  void
 // 
@@ -250,7 +258,12 @@ void LSBuzzer::queueNote(unsigned long delayMs, unsigned int frequency, unsigned
 //*********************************//
 // Function   : clear function 
 // 
-// Description: Clears buzzer (currently no implemented) 
+// Description: Kill switch for the queued notes — empties the note queue
+//              and silences the pin. 4.9.1 docstring fix: implemented and
+//              load-bearing (playReadySound and setSoundModeLevel call it
+//              to cancel a stale cue before queueing their own notes); a
+//              maintainer trusting the old "not implemented" note could
+//              skip it and leave a tone held indefinitely.
 // 
 // Arguments :  void
 // 

@@ -852,18 +852,27 @@ void setOperatingMode(bool responseEnabled, bool apiEnabled, String optionalPara
 //*********************************//
 int getCursorSpeed(bool responseEnabled, bool apiEnabled) {
   String commandKey = "SS";
-  int tempCursorSpeedLevel = CONF_JOY_CURSOR_SPEED_LEVEL_DEFAULT;
+  // 4.9.1 read-truth doctrine (see getSapDisabled): a failed read must not
+  // re-apply the compiled default to the live joystick (the old shape
+  // silently rescaled every user's cursor on a transient read failure);
+  // the answer is the in-force level instead.
+  int tempCursorSpeedLevel;
   if (CONF_API_ENABLED) {
-    tempCursorSpeedLevel = mem.readInt(CONF_SETTINGS_FILE, commandKey);
-    if ((tempCursorSpeedLevel < CONF_JOY_CURSOR_SPEED_LEVEL_MIN) || (tempCursorSpeedLevel > CONF_JOY_CURSOR_SPEED_LEVEL_MAX)) {
-      tempCursorSpeedLevel = CONF_JOY_CURSOR_SPEED_LEVEL_DEFAULT;
-      if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
-        mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempCursorSpeedLevel);
+    int stored = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+    if (mem.isLastReadOk()) {
+      if ((stored < CONF_JOY_CURSOR_SPEED_LEVEL_MIN) || (stored > CONF_JOY_CURSOR_SPEED_LEVEL_MAX)) {
+        stored = CONF_JOY_CURSOR_SPEED_LEVEL_DEFAULT;
+        mem.writeInt(CONF_SETTINGS_FILE, commandKey, stored);
       }
+      js.setOutputRange(stored);
+      tempCursorSpeedLevel = stored;
+    } else {
+      tempCursorSpeedLevel = js.getOutputRange();  // the in-force level, not a readback
     }
-    
+  } else {
+    tempCursorSpeedLevel = CONF_JOY_CURSOR_SPEED_LEVEL_DEFAULT;
+    js.setOutputRange(tempCursorSpeedLevel);
   }
-  js.setOutputRange(tempCursorSpeedLevel);
   printResponseInt(responseEnabled, apiEnabled, true, 0, "SS,0", true, tempCursorSpeedLevel);
 
   return tempCursorSpeedLevel;
@@ -1155,6 +1164,17 @@ void decreaseCursorSpeed(bool responseEnabled, bool apiEnabled) {
 // Return     : void
 //*********************************//
 void getJoystickInitialization(bool responseEnabled, bool apiEnabled) {
+  // 4.9.1: the sensorless gate its sibling CA,0 pins as mandatory — this
+  // getter is reachable on safe boots (the API table is not filtered by
+  // safe mode and the connect load replays IN,0 inside EX,0), and every js
+  // touch below would act on the never-begun object's state (getInputCenter
+  // reads it, setMinimumRadius mutates it). Answer the zeroed default
+  // center without touching state — the same shape CA,0 answers.
+  if (!g_joystickSensorConnected || !js.isBegun()) {
+    pointFloatType sensorlessCenter = {0.0f, 0.0f};
+    printResponseFloatPoint(responseEnabled, apiEnabled, true, 0, "IN,0", true, sensorlessCenter);
+    return;
+  }
   pointFloatType tempCenterPoint = js.getInputCenter();
   js.setMinimumRadius();                                                                        // Update the minimum cursor operating radius 
   printResponseFloatPoint(responseEnabled, apiEnabled, true, 0, "IN,0", true, tempCenterPoint);
@@ -1406,6 +1426,15 @@ void setJoystickCalibration(bool responseEnabled, bool apiEnabled) {
   }
   canOutputAction = false;
   g_resetCenterComplete = false;  // Freeze cursor immediately, before the delayed step-0 callback
+  // 4.9.1: arm the entry freeze for the SERIAL path too. The menu path arms
+  // it in fullCalibrationPage; the serial path (the app's CA,1:1) left the
+  // whole START_DELAY + step-0 window (~1 s) with the current menu live to
+  // the input poll — on a safe-mode boot the safe menu (Restart / Factory
+  // Reset) sat registered beneath a "calibration is starting" flow, and a
+  // held Select could walk its destructive confirm before step 0's poll
+  // disable landed. The entry freeze covers the gap; the flow's own chain
+  // re-freezes per step.
+  screen.freezeMenuInputFor(CONF_JOY_CALIB_ENTRY_FREEZE_MS);
   // #36: apiEnabled is true only on the serial-dispatch path — a calibration
   // the app started must not end by parking the Hub's menu on screen. The
   // menu-driven path (fullCalibrationPage) passes false and keeps the
@@ -1451,7 +1480,11 @@ void setJoystickCalibration(bool responseEnabled, bool apiEnabled, String option
 // accepted inner >= outer, which reaches mapRoundInt with a zero/reversed
 // input span, and the setters accepted 1.0 even though the next GET silently
 // reset it.
-void loadJoystickDeadzonePair(float &innerDeadzone, float &outerDeadzone) {
+// 4.9.1: returns whether the read that produced the values actually
+// happened (read truth) — the getters use it to keep a failed read from
+// rewriting the live deadzones (the read-truth doctrine, getSapDisabled);
+// the setters ignore it as before.
+bool loadJoystickDeadzonePair(float &innerDeadzone, float &outerDeadzone) {
   JsonObject settings = mem.readObject(CONF_SETTINGS_FILE);
   innerDeadzone = settings["IZ"].as<float>();
   outerDeadzone = settings["OZ"].as<float>();
@@ -1476,6 +1509,7 @@ void loadJoystickDeadzonePair(float &innerDeadzone, float &outerDeadzone) {
       mem.writeObject(CONF_SETTINGS_FILE, "IZ/OZ", settings);
     }
   }
+  return mem.isLastReadOk();
 }
 
 //*** GET JOYSTICK DEADZONE FUNCTION***//
@@ -1493,10 +1527,17 @@ void loadJoystickDeadzonePair(float &innerDeadzone, float &outerDeadzone) {
 float getJoystickInnerDeadzone(bool responseEnabled, bool apiEnabled) {
   float tempDeadzone;
   float tempOuterDeadzone;
-  loadJoystickDeadzonePair(tempDeadzone, tempOuterDeadzone);
+  const bool dzReadOk = loadJoystickDeadzonePair(tempDeadzone, tempOuterDeadzone);
   (void)tempOuterDeadzone;
-  js.setInnerDeadzone(true, tempDeadzone);
-  js.reprocessLastReading();
+  // 4.9.1 read-truth doctrine (see getSapDisabled): a failed read must not
+  // rewrite the live deadzone and reprocess the cursor — the answer is the
+  // in-force factor instead.
+  if (dzReadOk) {
+    js.setInnerDeadzone(true, tempDeadzone);
+    js.reprocessLastReading();
+  } else {
+    tempDeadzone = js.getInnerDeadzoneFactor();
+  }
   printResponseFloat(responseEnabled, apiEnabled, true, 0, "IZ,0", true, tempDeadzone);
   return tempDeadzone;
 }
@@ -1582,10 +1623,15 @@ void setJoystickInnerDeadzone(bool responseEnabled, bool apiEnabled, String opti
 float getJoystickOuterDeadzone(bool responseEnabled, bool apiEnabled) {
   float tempInnerDeadzone;
   float tempOuterDeadzone;
-  loadJoystickDeadzonePair(tempInnerDeadzone, tempOuterDeadzone);
+  const bool dzReadOk = loadJoystickDeadzonePair(tempInnerDeadzone, tempOuterDeadzone);
   (void)tempInnerDeadzone;
-  js.setOuterDeadzone(true, tempOuterDeadzone);
-  js.reprocessLastReading();
+  // 4.9.1 read-truth doctrine (see getSapDisabled).
+  if (dzReadOk) {
+    js.setOuterDeadzone(true, tempOuterDeadzone);
+    js.reprocessLastReading();
+  } else {
+    tempOuterDeadzone = js.getOuterDeadzoneFactor();
+  }
   printResponseFloat(responseEnabled, apiEnabled, true, 0, "OZ,0", true, tempOuterDeadzone);
   return tempOuterDeadzone;
 }
@@ -1881,18 +1927,35 @@ void getBusHealth(bool responseEnabled, bool apiEnabled, String optionalParamete
 //*********************************//
 float getSipPressureThreshold(bool responseEnabled, bool apiEnabled) {
   String commandKey = "ST";
+  // 4.9.1 read-truth doctrine (see getSapDisabled): a failed read answers
+  // the in-force threshold and leaves the live sensor untouched — the old
+  // shape re-applied the compiled default to ps on every transient read
+  // failure.
   float tempSipThreshold;
-  tempSipThreshold = mem.readFloat(CONF_SETTINGS_FILE, commandKey);
-
-  if (!isfinite(tempSipThreshold) ||
-      (tempSipThreshold < CONF_PRESS_MIN_THRESHOLD) ||
-      (tempSipThreshold >= CONF_PRESS_MAX_THRESHOLD)) {
-    tempSipThreshold = CONF_SIP_THRESHOLD;
-    if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
-      mem.writeFloat(CONF_SETTINGS_FILE, commandKey, tempSipThreshold);
+  if (CONF_API_ENABLED) {
+    tempSipThreshold = mem.readFloat(CONF_SETTINGS_FILE, commandKey);
+    if (mem.isLastReadOk()) {
+      if (!isfinite(tempSipThreshold) ||
+          (tempSipThreshold < CONF_PRESS_MIN_THRESHOLD) ||
+          (tempSipThreshold >= CONF_PRESS_MAX_THRESHOLD)) {
+        tempSipThreshold = CONF_SIP_THRESHOLD;
+        // 4.9.1: heal the pair only after the heal write actually landed —
+        // healHardThresholds re-enters this getter for its floor, and a
+        // persistently failing write would otherwise recurse
+        // heal->getter->heal forever. (healHardThresholds also carries a
+        // re-entrancy guard; this gate keeps the depth at one level.)
+        if (mem.writeFloat(CONF_SETTINGS_FILE, commandKey, tempSipThreshold)) {
+          screen.healHardThresholds();  // the heal can strand the hard band — same rule as the setter
+        }
+      }
+      ps.setSipThreshold(tempSipThreshold);
+    } else {
+      tempSipThreshold = ps.getSipPressureThreshold();  // in force, not a readback
     }
+  } else {
+    tempSipThreshold = CONF_SIP_THRESHOLD;
+    ps.setSipThreshold(tempSipThreshold);
   }
-  ps.setSipThreshold(tempSipThreshold);
   printResponseFloat(responseEnabled, apiEnabled, true, 0, "ST,0", true, tempSipThreshold);
   return tempSipThreshold;
 }
@@ -1981,18 +2044,28 @@ void setSipPressureThreshold(bool responseEnabled, bool apiEnabled, String optio
 //*********************************//
 float getPuffPressureThreshold(bool responseEnabled, bool apiEnabled) {
   String commandKey = "PT";
+  // 4.9.1 read-truth doctrine (see getSipPressureThreshold).
   float tempPuffThreshold;
-  tempPuffThreshold = mem.readFloat(CONF_SETTINGS_FILE, commandKey);
-
-  if (!isfinite(tempPuffThreshold) ||
-      (tempPuffThreshold < CONF_PRESS_MIN_THRESHOLD) ||
-      (tempPuffThreshold >= CONF_PRESS_MAX_THRESHOLD)) {
-    tempPuffThreshold = CONF_PUFF_THRESHOLD;
-    if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
-      mem.writeFloat(CONF_SETTINGS_FILE, commandKey, tempPuffThreshold);
+  if (CONF_API_ENABLED) {
+    tempPuffThreshold = mem.readFloat(CONF_SETTINGS_FILE, commandKey);
+    if (mem.isLastReadOk()) {
+      if (!isfinite(tempPuffThreshold) ||
+          (tempPuffThreshold < CONF_PRESS_MIN_THRESHOLD) ||
+          (tempPuffThreshold >= CONF_PRESS_MAX_THRESHOLD)) {
+        tempPuffThreshold = CONF_PUFF_THRESHOLD;
+        // 4.9.1: heal only after the write lands (see getSipPressureThreshold).
+        if (mem.writeFloat(CONF_SETTINGS_FILE, commandKey, tempPuffThreshold)) {
+          screen.healHardThresholds();  // the heal can strand the hard band — same rule as the setter
+        }
+      }
+      ps.setPuffThreshold(tempPuffThreshold);
+    } else {
+      tempPuffThreshold = ps.getPuffPressureThreshold();  // in force, not a readback
     }
+  } else {
+    tempPuffThreshold = CONF_PUFF_THRESHOLD;
+    ps.setPuffThreshold(tempPuffThreshold);
   }
-  ps.setPuffThreshold(tempPuffThreshold);
   printResponseFloat(responseEnabled, apiEnabled, true, 0, "PT,0", true, tempPuffThreshold);
 
   return tempPuffThreshold;
@@ -2079,18 +2152,31 @@ void setPuffPressureThreshold(bool responseEnabled, bool apiEnabled, String opti
 //*********************************//
 float getHardSipPressureThreshold(bool responseEnabled, bool apiEnabled) {
   String commandKey = "HS";
+  // 4.9.1 read-truth doctrine (see getSipPressureThreshold): the heal here
+  // raises a hard floor — that CAN strand the band (hard < regular + margin
+  // on a regular threshold raised separately), so the getter's heal heals
+  // the pair exactly like the setter's.
   float tempHardSipThreshold;
-  tempHardSipThreshold = mem.readFloat(CONF_SETTINGS2_FILE, commandKey);
-
-  if (!isfinite(tempHardSipThreshold) ||
-      (tempHardSipThreshold < CONF_PRESS_MIN_THRESHOLD) ||
-      (tempHardSipThreshold >= CONF_PRESS_MAX_THRESHOLD)) {
-    tempHardSipThreshold = CONF_HARD_SIP_THRESHOLD;
-    if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
-      mem.writeFloat(CONF_SETTINGS2_FILE, commandKey, tempHardSipThreshold);
+  if (CONF_API_ENABLED) {
+    tempHardSipThreshold = mem.readFloat(CONF_SETTINGS2_FILE, commandKey);
+    if (mem.isLastReadOk()) {
+      if (!isfinite(tempHardSipThreshold) ||
+          (tempHardSipThreshold < CONF_PRESS_MIN_THRESHOLD) ||
+          (tempHardSipThreshold >= CONF_PRESS_MAX_THRESHOLD)) {
+        tempHardSipThreshold = CONF_HARD_SIP_THRESHOLD;
+        // 4.9.1: heal only after the write lands (see getSipPressureThreshold).
+        if (mem.writeFloat(CONF_SETTINGS2_FILE, commandKey, tempHardSipThreshold)) {
+          screen.healHardThresholds();
+        }
+      }
+      ps.setHardSipThreshold(tempHardSipThreshold);
+    } else {
+      tempHardSipThreshold = ps.getHardSipThreshold();  // in force, not a readback
     }
+  } else {
+    tempHardSipThreshold = CONF_HARD_SIP_THRESHOLD;
+    ps.setHardSipThreshold(tempHardSipThreshold);
   }
-  ps.setHardSipThreshold(tempHardSipThreshold);
   printResponseFloat(responseEnabled, apiEnabled, true, 0, "HS,0", true, tempHardSipThreshold);
 
   return tempHardSipThreshold;
@@ -2183,18 +2269,31 @@ void setHardSipPressureThreshold(bool responseEnabled, bool apiEnabled, String o
 //*********************************//
 float getHardPuffPressureThreshold(bool responseEnabled, bool apiEnabled) {
   String commandKey = "HP";
+  // 4.9.1 read-truth doctrine (see getSipPressureThreshold). The heal here
+  // cannot strand the band from THIS side (a lowered hard floor only
+  // widens it), but healHardThresholds is the one code path — keep it
+  // symmetric so a future threshold edit cannot silently diverge.
   float tempHardPuffThreshold;
-  tempHardPuffThreshold = mem.readFloat(CONF_SETTINGS2_FILE, commandKey);
-
-  if (!isfinite(tempHardPuffThreshold) ||
-      (tempHardPuffThreshold < CONF_PRESS_MIN_THRESHOLD) ||
-      (tempHardPuffThreshold >= CONF_PRESS_MAX_THRESHOLD)) {
-    tempHardPuffThreshold = CONF_HARD_PUFF_THRESHOLD;
-    if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
-      mem.writeFloat(CONF_SETTINGS2_FILE, commandKey, tempHardPuffThreshold);
+  if (CONF_API_ENABLED) {
+    tempHardPuffThreshold = mem.readFloat(CONF_SETTINGS2_FILE, commandKey);
+    if (mem.isLastReadOk()) {
+      if (!isfinite(tempHardPuffThreshold) ||
+          (tempHardPuffThreshold < CONF_PRESS_MIN_THRESHOLD) ||
+          (tempHardPuffThreshold >= CONF_PRESS_MAX_THRESHOLD)) {
+        tempHardPuffThreshold = CONF_HARD_PUFF_THRESHOLD;
+        // 4.9.1: heal only after the write lands (see getSipPressureThreshold).
+        if (mem.writeFloat(CONF_SETTINGS2_FILE, commandKey, tempHardPuffThreshold)) {
+          screen.healHardThresholds();
+        }
+      }
+      ps.setHardPuffThreshold(tempHardPuffThreshold);
+    } else {
+      tempHardPuffThreshold = ps.getHardPuffThreshold();  // in force, not a readback
     }
+  } else {
+    tempHardPuffThreshold = CONF_HARD_PUFF_THRESHOLD;
+    ps.setHardPuffThreshold(tempHardPuffThreshold);
   }
-  ps.setHardPuffThreshold(tempHardPuffThreshold);
   printResponseFloat(responseEnabled, apiEnabled, true, 0, "HP,0", true, tempHardPuffThreshold);
 
   return tempHardPuffThreshold;
@@ -2283,27 +2382,39 @@ void setHardPuffPressureThreshold(bool responseEnabled, bool apiEnabled, String 
 //*********************************//
 static int getHardAction(bool responseEnabled, bool apiEnabled, const char* commandKey, int compiledDefault) {
   int tempHardAction;
-  tempHardAction = mem.readInt(CONF_SETTINGS2_FILE, commandKey);
+  const bool hardSip = (commandKey[1] == 'A');
+  if (CONF_API_ENABLED) {
+    tempHardAction = mem.readInt(CONF_SETTINGS2_FILE, commandKey);
 
-  // Heal bound is the ACTION VOCABULARY, not an arbitrary 127: actions run
-  // 0..CONF_ACTION_FACTORY_RESET, so a stored 50 (hand-edited/foreign file)
-  // used to be answered with SUCCESS while the live table kept the compiled
-  // row — the read reported a value not in force (the read-vs-truth class).
-  // Out-of-vocabulary values heal to the compiled default here; the live
-  // table additionally applies the caregiver allowlist at load (a stored
-  // in-range but disallowed action keeps the compiled row there).
-  // 4.9.0: the getter's ANSWER is now allowlist-gated too — an in-vocabulary
-  // but disallowed action (e.g. a hand-edited HB=24 FACTORY_RESET, which
-  // switchRemapAllowed refuses) used to be answered with SUCCESS while the
-  // live table kept the compiled row, hiding the divergence from the app.
-  // The answer falls back to the compiled default exactly like the live
-  // load path does, so what the app sees is always what is in force.
-  if ((tempHardAction < CONF_ACTION_NOTHING) || (tempHardAction > CONF_ACTION_FACTORY_RESET)
-      || !switchRemapAllowed(tempHardAction, false)) {
-    tempHardAction = compiledDefault;
-    if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
-      mem.writeInt(CONF_SETTINGS2_FILE, commandKey, tempHardAction);
+    // Heal bound is the ACTION VOCABULARY, not an arbitrary 127: actions run
+    // 0..CONF_ACTION_FACTORY_RESET, so a stored 50 (hand-edited/foreign file)
+    // used to be answered with SUCCESS while the live table kept the compiled
+    // row — the read reported a value not in force (the read-vs-truth class).
+    // Out-of-vocabulary values heal to the compiled default here; the live
+    // table additionally applies the caregiver allowlist at load (a stored
+    // in-range but disallowed action keeps the compiled row there).
+    // 4.9.0: the getter's ANSWER is now allowlist-gated too — an in-vocabulary
+    // but disallowed action (e.g. a hand-edited HB=24 FACTORY_RESET, which
+    // switchRemapAllowed refuses) used to be answered with SUCCESS while the
+    // live table kept the compiled row, hiding the divergence from the app.
+    // The answer falls back to the compiled default exactly like the live
+    // load path does, so what the app sees is always what is in force.
+    // 4.9.1: a FAILED read is answered with the LIVE row, not the read's
+    // fabricated 0 (NOTHING is in vocabulary and allowlisted, so the old
+    // shape answered "nothing" with SUCCESS while the device kept firing the
+    // real action) — and the live table is never rewritten from a failed
+    // read (the read-truth doctrine, getSapDisabled).
+    if (mem.isLastReadOk()) {
+      if ((tempHardAction < CONF_ACTION_NOTHING) || (tempHardAction > CONF_ACTION_FACTORY_RESET)
+          || !switchRemapAllowed(tempHardAction, false)) {
+        tempHardAction = compiledDefault;
+        mem.writeInt(CONF_SETTINGS2_FILE, commandKey, tempHardAction);
+      }
+    } else {
+      tempHardAction = hardBandLiveAction(hardSip);
     }
+  } else {
+    tempHardAction = compiledDefault;
   }
   String responseKey = String(commandKey) + ",0";
   printResponseInt(responseEnabled, apiEnabled, true, 0, responseKey, true, tempHardAction);
@@ -3061,17 +3172,29 @@ void setLightBrightnessLevel(bool responseEnabled, bool apiEnabled, String optio
 //*********************************//
 int getSapDisabled(bool responseEnabled, bool apiEnabled) {
   String commandKey = "SD";
-  int tempSapDisabled = CONF_SAP_DISABLED_DEFAULT;
+  // 4.9.1 (read-truth doctrine, the HA/HB 4.9.0 precedent): a FAILED read
+  // must not act on the value it yields. readInt converts a failed read to
+  // 0, and the old shape applied that 0 to the LIVE gate — a transient
+  // settings read failure silently re-opened a caregiver-disabled
+  // mouthpiece (fail-open, the opposite of every other guard's direction)
+  // while the wire said SUCCESS. The live-apply now runs only on a read
+  // that actually happened, and the failed-read answer is the IN-FORCE
+  // gate — what the app displays is what the device enforces.
+  int tempSapDisabled = g_sapDisabled ? 1 : 0;
   if (CONF_API_ENABLED) {
-    tempSapDisabled = mem.readInt(CONF_SETTINGS_FILE, commandKey);
-    if ((tempSapDisabled != 0) && (tempSapDisabled != 1)) {
-      tempSapDisabled = CONF_SAP_DISABLED_DEFAULT;
-      if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
-        mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempSapDisabled);
+    int stored = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+    if (mem.isLastReadOk()) {
+      if ((stored != 0) && (stored != 1)) {
+        stored = CONF_SAP_DISABLED_DEFAULT;
+        mem.writeInt(CONF_SETTINGS_FILE, commandKey, stored);  // heal a stored value — the read is ok here
       }
+      g_sapDisabled = (stored == 1);
+      tempSapDisabled = stored;
     }
+  } else {
+    tempSapDisabled = CONF_SAP_DISABLED_DEFAULT;
+    g_sapDisabled = (tempSapDisabled == 1);
   }
-  g_sapDisabled = (tempSapDisabled == 1);
   printResponseInt(responseEnabled, apiEnabled, true, 0, "SD,0", true, tempSapDisabled);
   return tempSapDisabled;
 }
@@ -3119,17 +3242,24 @@ void setSapDisabled(bool responseEnabled, bool apiEnabled, String optionalParame
 //*********************************//
 int getMenuButtonsOnly(bool responseEnabled, bool apiEnabled) {
   String commandKey = "MA";
-  int tempMenuButtonsOnly = CONF_MENU_BUTTONS_ONLY_DEFAULT;
+  // 4.9.1 read-truth doctrine (see getSapDisabled): a failed read answers
+  // the in-force gate and leaves it untouched — the old shape applied the
+  // read-failure 0 live, silently lifting a caregiver menu restriction.
+  int tempMenuButtonsOnly = g_menuButtonsOnly ? 1 : 0;
   if (CONF_API_ENABLED) {
-    tempMenuButtonsOnly = mem.readInt(CONF_SETTINGS_FILE, commandKey);
-    if ((tempMenuButtonsOnly != 0) && (tempMenuButtonsOnly != 1)) {
-      tempMenuButtonsOnly = CONF_MENU_BUTTONS_ONLY_DEFAULT;
-      if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
-        mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempMenuButtonsOnly);
+    int stored = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+    if (mem.isLastReadOk()) {
+      if ((stored != 0) && (stored != 1)) {
+        stored = CONF_MENU_BUTTONS_ONLY_DEFAULT;
+        mem.writeInt(CONF_SETTINGS_FILE, commandKey, stored);
       }
+      g_menuButtonsOnly = (stored == 1);
+      tempMenuButtonsOnly = stored;
     }
+  } else {
+    tempMenuButtonsOnly = CONF_MENU_BUTTONS_ONLY_DEFAULT;
+    g_menuButtonsOnly = (tempMenuButtonsOnly == 1);
   }
-  g_menuButtonsOnly = (tempMenuButtonsOnly == 1);
   printResponseInt(responseEnabled, apiEnabled, true, 0, "MA,0", true, tempMenuButtonsOnly);
   return tempMenuButtonsOnly;
 }
@@ -3176,17 +3306,25 @@ void setMenuButtonsOnly(bool responseEnabled, bool apiEnabled, String optionalPa
 //*********************************//
 int getModeLocked(bool responseEnabled, bool apiEnabled) {
   String commandKey = "LK";
-  int tempModeLocked = CONF_MODE_LOCK_DEFAULT;
+  // 4.9.1 read-truth doctrine (see getSapDisabled): a failed read answers
+  // the in-force lock and leaves it untouched — the old shape applied the
+  // read-failure 0 live, silently unlocking the mode on a transient read
+  // failure.
+  int tempModeLocked = g_modeLocked ? 1 : 0;
   if (CONF_API_ENABLED) {
-    tempModeLocked = mem.readInt(CONF_SETTINGS_FILE, commandKey);
-    if ((tempModeLocked != 0) && (tempModeLocked != 1)) {
-      tempModeLocked = CONF_MODE_LOCK_DEFAULT;
-      if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
-        mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempModeLocked);
+    int stored = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+    if (mem.isLastReadOk()) {
+      if ((stored != 0) && (stored != 1)) {
+        stored = CONF_MODE_LOCK_DEFAULT;
+        mem.writeInt(CONF_SETTINGS_FILE, commandKey, stored);
       }
+      g_modeLocked = (stored == 1);
+      tempModeLocked = stored;
     }
+  } else {
+    tempModeLocked = CONF_MODE_LOCK_DEFAULT;
+    g_modeLocked = (tempModeLocked == 1);
   }
-  g_modeLocked = (tempModeLocked == 1);
   printResponseInt(responseEnabled, apiEnabled, true, 0, "LK,0", true, tempModeLocked);
   return tempModeLocked;
 }
@@ -3234,17 +3372,23 @@ void setModeLocked(bool responseEnabled, bool apiEnabled, String optionalParamet
 //*********************************//
 int getCursorHoldDuringSap(bool responseEnabled, bool apiEnabled) {
   String commandKey = "CF";
-  int tempCursorHold = CONF_CURSOR_HOLD_DEFAULT;
+  // 4.9.1 read-truth doctrine (see getSapDisabled): a failed read answers
+  // the in-force hold gate and leaves it untouched.
+  int tempCursorHold = g_freezeCursorDuringSap ? 1 : 0;
   if (CONF_API_ENABLED) {
-    tempCursorHold = mem.readInt(CONF_SETTINGS_FILE, commandKey);
-    if ((tempCursorHold != 0) && (tempCursorHold != 1)) {
-      tempCursorHold = CONF_CURSOR_HOLD_DEFAULT;
-      if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
-        mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempCursorHold);
+    int stored = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+    if (mem.isLastReadOk()) {
+      if ((stored != 0) && (stored != 1)) {
+        stored = CONF_CURSOR_HOLD_DEFAULT;
+        mem.writeInt(CONF_SETTINGS_FILE, commandKey, stored);
       }
+      g_freezeCursorDuringSap = (stored == 1);
+      tempCursorHold = stored;
     }
+  } else {
+    tempCursorHold = CONF_CURSOR_HOLD_DEFAULT;
+    g_freezeCursorDuringSap = (tempCursorHold == 1);
   }
-  g_freezeCursorDuringSap = (tempCursorHold == 1);
   printResponseInt(responseEnabled, apiEnabled, true, 0, "CF,0", true, tempCursorHold);
   return tempCursorHold;
 }
@@ -3296,18 +3440,22 @@ void setCursorHoldDuringSap(bool responseEnabled, bool apiEnabled, String option
 //*********************************//
 int getInputWindowShort(bool responseEnabled, bool apiEnabled) {
   String commandKey = "WS";
-  int tempWindow = CONF_INPUT_WINDOW_SHORT_DEFAULT_MS;
+  // 4.9.1 read-truth doctrine (see getSapDisabled): the live window apply
+  // runs only on a read that actually happened; a failed read answers the
+  // in-force window (0 = the compiled default, the same shape the live
+  // value uses).
+  int tempWindow = (g_inputWindowShortMs > 0) ? (int)g_inputWindowShortMs : CONF_INPUT_WINDOW_SHORT_DEFAULT_MS;
   if (CONF_API_ENABLED) {
     int stored = mem.readInt(CONF_SETTINGS_FILE, commandKey);
-    if (stored < 0) {
-      stored = 0;
-      if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+    if (mem.isLastReadOk()) {
+      if (stored < 0) {
+        stored = 0;
         mem.writeInt(CONF_SETTINGS_FILE, commandKey, 0);
       }
+      g_inputWindowShortMs = (stored > 0) ? (unsigned long)stored : 0;
+      sanitizeInputWindows();
+      tempWindow = (g_inputWindowShortMs > 0) ? (int)g_inputWindowShortMs : CONF_INPUT_WINDOW_SHORT_DEFAULT_MS;
     }
-    g_inputWindowShortMs = (stored > 0) ? (unsigned long)stored : 0;
-    sanitizeInputWindows();
-    tempWindow = (g_inputWindowShortMs > 0) ? (int)g_inputWindowShortMs : CONF_INPUT_WINDOW_SHORT_DEFAULT_MS;
   }
   printResponseInt(responseEnabled, apiEnabled, true, 0, "WS,0", true, tempWindow);
   return tempWindow;
@@ -3364,18 +3512,19 @@ void setInputWindowShort(bool responseEnabled, bool apiEnabled, String optionalP
 //*********************************//
 int getInputWindowLong(bool responseEnabled, bool apiEnabled) {
   String commandKey = "WL";
-  int tempWindow = CONF_INPUT_WINDOW_LONG_DEFAULT_MS;
+  // 4.9.1 read-truth doctrine (see getInputWindowShort).
+  int tempWindow = (g_inputWindowLongMs > 0) ? (int)g_inputWindowLongMs : CONF_INPUT_WINDOW_LONG_DEFAULT_MS;
   if (CONF_API_ENABLED) {
     int stored = mem.readInt(CONF_SETTINGS_FILE, commandKey);
-    if (stored < 0) {
-      stored = 0;
-      if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+    if (mem.isLastReadOk()) {
+      if (stored < 0) {
+        stored = 0;
         mem.writeInt(CONF_SETTINGS_FILE, commandKey, 0);
       }
+      g_inputWindowLongMs = (stored > 0) ? (unsigned long)stored : 0;
+      sanitizeInputWindows();
+      tempWindow = (g_inputWindowLongMs > 0) ? (int)g_inputWindowLongMs : CONF_INPUT_WINDOW_LONG_DEFAULT_MS;
     }
-    g_inputWindowLongMs = (stored > 0) ? (unsigned long)stored : 0;
-    sanitizeInputWindows();
-    tempWindow = (g_inputWindowLongMs > 0) ? (int)g_inputWindowLongMs : CONF_INPUT_WINDOW_LONG_DEFAULT_MS;
   }
   printResponseInt(responseEnabled, apiEnabled, true, 0, "WL,0", true, tempWindow);
   return tempWindow;
@@ -3428,18 +3577,19 @@ void setInputWindowLong(bool responseEnabled, bool apiEnabled, String optionalPa
 //*********************************//
 int getInputWindowMax(bool responseEnabled, bool apiEnabled) {
   String commandKey = "WM";
-  int tempWindow = CONF_INPUT_WINDOW_MAX_DEFAULT_MS;
+  // 4.9.1 read-truth doctrine (see getInputWindowShort).
+  int tempWindow = (g_inputWindowMaxMs > 0) ? (int)g_inputWindowMaxMs : CONF_INPUT_WINDOW_MAX_DEFAULT_MS;
   if (CONF_API_ENABLED) {
     int stored = mem.readInt(CONF_SETTINGS_FILE, commandKey);
-    if (stored < 0) {
-      stored = 0;
-      if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+    if (mem.isLastReadOk()) {
+      if (stored < 0) {
+        stored = 0;
         mem.writeInt(CONF_SETTINGS_FILE, commandKey, 0);
       }
+      g_inputWindowMaxMs = (stored > 0) ? (unsigned long)stored : 0;
+      sanitizeInputWindows();
+      tempWindow = (g_inputWindowMaxMs > 0) ? (int)g_inputWindowMaxMs : CONF_INPUT_WINDOW_MAX_DEFAULT_MS;
     }
-    g_inputWindowMaxMs = (stored > 0) ? (unsigned long)stored : 0;
-    sanitizeInputWindows();
-    tempWindow = (g_inputWindowMaxMs > 0) ? (int)g_inputWindowMaxMs : CONF_INPUT_WINDOW_MAX_DEFAULT_MS;
   }
   printResponseInt(responseEnabled, apiEnabled, true, 0, "WM,0", true, tempWindow);
   return tempWindow;
@@ -3517,29 +3667,37 @@ String getSwitchAction(bool responseEnabled, bool apiEnabled, String commandKey)
   int cells[3] = { 0, 0, 0 };
   if (CONF_API_ENABLED) {
     int stored = mem.readInt(CONF_SETTINGS_FILE, commandKey);
-    if (stored >= CONF_SWITCH_ACTION_PACK_BASE) {
-      int packed = stored - CONF_SWITCH_ACTION_PACK_BASE;
-      cells[0] = packed / 10000;
-      cells[1] = (packed / 100) % 100;
-      cells[2] = packed % 100;
-      // Defense-in-depth for the caregiver allowlist (the write path already
-      // enforces it): a stored value can only come from a hand-edited or
-      // foreign settings file, but the whole point of the allowlist is that
-      // one switch press can never erase settings or restart the device —
-      // so a stored triple that fails it falls back to the compiled
-      // factory mapping instead of loading the forbidden cells. The check
-      // is column-aware (4.5.7 review): a gamepad-column DRAG/SCROLL cell
-      // wedges the whole input path — those fall back too.
-      if (!switchRemapAllowed(cells[0], gamepad) || !switchRemapAllowed(cells[1], gamepad) || !switchRemapAllowed(cells[2], gamepad)) {
+    if (mem.isLastReadOk()) {  // 4.9.1: live-apply truth gate — see getSapDisabled
+      if (stored >= CONF_SWITCH_ACTION_PACK_BASE) {
+        int packed = stored - CONF_SWITCH_ACTION_PACK_BASE;
+        cells[0] = packed / 10000;
+        cells[1] = (packed / 100) % 100;
+        cells[2] = packed % 100;
+        // Defense-in-depth for the caregiver allowlist (the write path already
+        // enforces it): a stored value can only come from a hand-edited or
+        // foreign settings file, but the whole point of the allowlist is that
+        // one switch press can never erase settings or restart the device —
+        // so a stored triple that fails it falls back to the compiled
+        // factory mapping instead of loading the forbidden cells. The check
+        // is column-aware (4.5.7 review): a gamepad-column DRAG/SCROLL cell
+        // wedges the whole input path — those fall back too.
+        if (!switchRemapAllowed(cells[0], gamepad) || !switchRemapAllowed(cells[1], gamepad) || !switchRemapAllowed(cells[2], gamepad)) {
+          for (int w = 0; w < CONF_SWITCH_REMAP_ROWS_PER_JACK; w++) cells[w] = switchRemapDefaultCell(jack, w, gamepad);
+        }
+      } else {
         for (int w = 0; w < CONF_SWITCH_REMAP_ROWS_PER_JACK; w++) cells[w] = switchRemapDefaultCell(jack, w, gamepad);
       }
+      for (int w = 0; w < CONF_SWITCH_REMAP_ROWS_PER_JACK; w++) switchRemapApplyCell(jack, w, gamepad, cells[w]);
     } else {
-      for (int w = 0; w < CONF_SWITCH_REMAP_ROWS_PER_JACK; w++) cells[w] = switchRemapDefaultCell(jack, w, gamepad);
+      // 4.9.1: a failed read must not rewrite the live table (the old shape
+      // fell into the stored-0 path and re-applied the compiled defaults
+      // over the user's remap) — and the answer must be what is in force.
+      for (int w = 0; w < CONF_SWITCH_REMAP_ROWS_PER_JACK; w++) cells[w] = switchRemapLiveCell(jack, w, gamepad);
     }
   } else {
     for (int w = 0; w < CONF_SWITCH_REMAP_ROWS_PER_JACK; w++) cells[w] = switchRemapDefaultCell(jack, w, gamepad);
+    for (int w = 0; w < CONF_SWITCH_REMAP_ROWS_PER_JACK; w++) switchRemapApplyCell(jack, w, gamepad, cells[w]);
   }
-  for (int w = 0; w < CONF_SWITCH_REMAP_ROWS_PER_JACK; w++) switchRemapApplyCell(jack, w, gamepad, cells[w]);
   String triple = String(cells[0]) + "," + String(cells[1]) + "," + String(cells[2]);
   printResponseString(responseEnabled, apiEnabled, true, 0, commandKey + ",0", true, triple);
   return triple;
@@ -3650,6 +3808,19 @@ void controlHubMenu(bool responseEnabled, bool apiEnabled, int inputMenuControl)
   if ((inputMenuControl >= CONF_MENU_CONTROL_MIN) && (inputMenuControl <= CONF_MENU_CONTROL_MAX)) {
     switch(inputMenuControl) {
       case CONF_MENU_CONTROL_OPEN: 
+        // 4.9.1: a safe-mode boot owns its menu (see activateMenu's gate) —
+        // answer the refusal honestly instead of the SUCCESS-ack-for-a-drop
+        // convention the transient frozen-window presses use: safe mode is
+        // a STATE, not a transient, and a bare SUCCESS would tell the app
+        // the full menu opened when the safe menu is still registered (the
+        // CH,0/CH,5 poll would correct the mirror, but the wire should say
+        // why). activateMenu itself also refuses — this is the named wire
+        // half.
+        if (g_safeModeEnabled) {
+          printResponseInt(responseEnabled, apiEnabled, false, 3, "CH,1", true, inputMenuControl);
+          serialTxEnqueueLine("ERROR: menu open refused — safe mode owns the display (use the Hub buttons: Restart / Factory Reset)");
+          break;
+        }
         screen.activateMenu();
         break;     
       case CONF_MENU_CONTROL_SELECT:
@@ -4558,6 +4729,18 @@ void enterUpdateMode(bool responseEnabled, bool apiEnabled) {
     while (lipsyncRetentionUnsafe() && (long)(umWaitDeadlineMs - millis()) > 0) {
       delay(10);
     }
+  }
+  if (lipsyncRetentionUnsafe()) {
+    // 4.9.1: fail SAFE, not fail open. Past the deadline the SD state is
+    // still ambiguous (inside the begin() window with the flag not yet
+    // raisable) — the g_softDeviceEnabled branch below would take the raw
+    // enterSerialDfu() path and fault (APP_MEMACC), the fault handler's
+    // GPREGRET overwrite would clobber the magic, and the device would
+    // reboot into the app while Connect waits for a bootloader that never
+    // comes. Name the refusal; a retry once the init settles answers again.
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "UM,1", true, 1);
+    serialTxEnqueueLine("ERROR: update mode refused — the BLE init window is still open; retry in a moment");
+    return;
   }
   // With the SoftDevice live, prepare the DFU retention magic through its
   // sanctioned SVCs before promising success. The old code ignored both

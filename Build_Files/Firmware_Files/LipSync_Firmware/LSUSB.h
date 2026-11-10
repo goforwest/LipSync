@@ -30,11 +30,15 @@
 #define MOUSE_ALL (MOUSE_LEFT | MOUSE_RIGHT | MOUSE_MIDDLE)
 #define MOUSE_DESCRIPTOR "LipSync Mouse" // TODO 2025-Feb-21 Unused due to Tiny USB library hang
 
-// Consecutive not-ready report ticks before latching an error episode
-// (3 ticks = 60 ms at the 20 ms poll): a busy HID endpoint — a report in
-// flight, the host about to poll it — frees within a tick or two; only a
-// real outage persists. See LSUSBMouse::mouseReport.
-#define CONF_MOUSE_EP_BUSY_SKIP_LIMIT 3
+// Not-ready persistence before latching an error episode, in WALL TIME
+// (60 ms — the same budget the old 3-tick counter delivered at the 20 ms
+// poll): a busy HID endpoint — a report in flight, the host about to poll
+// it — frees within a tick or two; only a real outage persists. 4.9.1
+// switched the latch from attempt count to time (pending button state
+// drives attempts at main-loop granularity, latching ~20x early); the
+// old CONF_MOUSE_EP_BUSY_SKIP_LIMIT retired with it. See
+// LSUSBMouse::mouseReport.
+#define CONF_MOUSE_EP_BUSY_SKIP_MS 60
 
 #define GAMEPAD_DESCRIPTOR "LipSync Gamepad" // TODO 2025-Feb-21 Unused due to Tiny USB library hang
 
@@ -93,6 +97,7 @@ class LSUSBMouse {
     uint32_t nonzeroReports = 0;      // Reports that carried actual movement (x or y != 0)
     int16_t maxAbsReport = 0;         // Largest |x|/y| ever sent — 0 forever means the report PIPELINE sends zeros
     uint8_t consecutiveSkips = 0;     // Not-ready ticks in a row — persistence separates a transient busy endpoint from a real outage
+    unsigned long _firstBusyMs = 0;   // 4.9.1: when the current busy streak began (the latch is wall-time, not attempt count)
     // (4.8.7 review) _lastReportAttemptMs removed here: write-only since it
     // was added — no reader anywhere in the tree (the same class the 4.5.7
     // review removed showTestPage for). The BH counters above ARE consumed.
@@ -282,8 +287,15 @@ bool LSUSBMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t 
     // Latch only on persistence: a busy endpoint frees within a tick or two,
     // a real outage never does. Skipped busy ticks still cost nothing — the
     // pending report already carries the movement.
+    // 4.9.1: persistence is measured in WALL TIME, not attempt count. The
+    // attempt counter assumed the 20 ms poll cadence, but pending button
+    // state drives attempts at main-loop granularity (LSUSBMouse::service),
+    // latching an episode ~20x sooner than the documented 60 ms during
+    // exactly the "serial burst stretches the busy window" case the latch
+    // exists to ride out.
+    if (consecutiveSkips == 0) _firstBusyMs = millis();
     if (consecutiveSkips < 255) consecutiveSkips++;
-    if (consecutiveSkips < CONF_MOUSE_EP_BUSY_SKIP_LIMIT) return false;
+    if (millis() - _firstBusyMs < (unsigned long)CONF_MOUSE_EP_BUSY_SKIP_MS) return false;
     if (!timedOut) {
       // Episode start: latch the timeout state (consumed by errorCheck and
       // usbCheckConnection) and hand recovery to the connect machinery once —

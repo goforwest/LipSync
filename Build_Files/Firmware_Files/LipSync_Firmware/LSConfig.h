@@ -30,7 +30,7 @@
 
 #define CONF_LIPSYNC_VERSION_MAJOR  4
 #define CONF_LIPSYNC_VERSION_MINOR  9
-#define CONF_LIPSYNC_VERSION_REV    0
+#define CONF_LIPSYNC_VERSION_REV    1
 
 // 4.5.22 RESCUE-BUILD SWITCH (bench round 15): the device's settings
 // filesystem was left corrupted by the 4.5.20 race + the zombie phase's
@@ -217,15 +217,24 @@ const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + 
 // app-side host test (LipSync_Connect tests/settings-size.test.mjs) fails
 // when a new key's default alone busts the budget. 480 leaves a margin
 // under the 512-byte cliff for value-width growth (a threshold at 150.0, a
-// 5-digit timing window, 7-digit packed switch triples) while giving every
-// currently-shipped key set ~95 bytes of room.
+// 5-digit timing window, six-digit packed switch triples — the setter's
+// cap is 100000 + 19x10000 + 19x100 + 19 = 291919, six digits; the
+// "7-digit" figure was wrong) while giving every
+// currently-shipped key set ~95 bytes of room. 4.9.1 comment fix: the
+// "~463 B fully populated" figure in the settings2 note below belonged to
+// an earlier draft of this arithmetic — the seeded 323-byte document with
+// every optional key at its widest legal value lands at ~380-390 B,
+// matching the ~95-byte headroom this line claims (the two figures could
+// not both be true; the settings2 split decision itself rested on the
+// cliff, which is unchanged).
 #define CONF_SETTINGS_FILE_BUDGET 480
 
 // 4.7.0 / upstream #58: the SECOND settings file. The main file's 480-byte
 // budget is the 4.1.0 downgrade cliff (that firmware reads it with a fixed
 // 512-byte buffer and truncates anything longer on its next write), and the
-// fully-populated document sits at ~463 B — hard sip/puff's four keys do not
-// fit. New-format keys therefore live in their OWN file with their OWN
+// main file's fully-populated size (~380-390 B, see the budget note above)
+// plus hard sip/puff's four keys do not leave comfortable headroom inside
+// the SAME cliff — so new-format keys live in their OWN file with their OWN
 // budget: the main-file contract is untouched byte-for-byte (4.1.0
 // round-trips keep working exactly as guarded), 4.1.0 simply never touches
 // the second file, and a downgrade keeps the hard configuration for the
@@ -327,8 +336,11 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 // chain (start delay + 5 readings + completion margin), so a mid-flow Next
 // cannot redraw the menu over the "do not move joystick" instruction and a
 // mid-flow Select cannot hit selectMenuItem's unhandled page id.
-#define CONF_CENTER_RESET_FREEZE_MS 3000
-#define CONF_FULL_CALIB_STEP_FREEZE_MS 6000  // Covers the ~4.95 s corner/center step, including scheduling margin
+#define CONF_CENTER_RESET_FREEZE_MS 3500   // (4.9.1 margin) centerResetPage's freeze: the chain is ~2.6 s (the review-pinned
+                                           // scheduling chain plus blink delays); the 3000 landed only 400 ms clear of it —
+                                           // one wedged-I2C push (the failure mode this firmware plans for) ate the margin
+                                           // and re-opened the stale-repaint race the freeze exists for. 500 ms more.
+#define CONF_FULL_CALIB_STEP_FREEZE_MS 6500  // Covers the ~4.95 s corner/center step, plus scheduling margin (4.9.1: +500 ms — a wedged-I2C push must not consume the whole margin)
 
 // Bench fix (4.5.7): destructive menu confirms (safe-menu Restart / Factory
 // Reset and their confirm pages) require the select to be HELD for at least
@@ -369,6 +381,9 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
                                         // and the reset into the bootloader: long enough for the ack to reach the host
                                         // over USB and for the OLED framebuffer push to complete (bounded by Wire), so
                                         // the splash is the frame the OLED keeps while the bootloader owns the device
+#define CONF_RESET_DWELL_MS 3000       // Bounded dwell in softwareReset() between the shutdown page and NVIC_SystemReset;
+                                       // the dwell now also drains the response TX queue every 10 ms (4.9.1 — the
+                                       // response-before-reset guarantee previously depended on CDC FIFO space)
 
 // 4.5.10 bench fix: the BLE init (Bluefruit.begin -> SoftDevice enable ->
 // GATT table -> HID service -> advertising) runs on ITS OWN FreeRTOS task
@@ -510,7 +525,7 @@ const float PRESS_THRESHOLD_LEVEL_TABLE[] = { 2.0, 3.0, 4.0, 5.0, 7.0, 10.0, 15.
 #define CONF_JOY_CALIB_START_DELAY 1000              // Number of milliseconds to delay full joystick calibration once triggered
 #define CONF_JOY_CALIB_START_LED_COLOR LED_CLR_RED   // Joystick Calibration process start and end color
 #define CONF_JOY_CALIB_STEP_DELAY 1500               // Number of milliseconds to delay between corner measurements
-#define CONF_JOY_CALIB_ENTRY_FREEZE_MS 2000          // (4.9.0 review) fullCalibrationPage's pre-step-1 input freeze: the first corner prompt lands at STEP_DELAY + 3xSTEP_BLINK_DELAY (~1950 ms); until then the "Follow prompts" page was live to the input poll (a stray Next painted a cursor overlay over the prompt). The flow's own chain re-freezes per step.
+#define CONF_JOY_CALIB_ENTRY_FREEZE_MS 3200          // (4.9.0 review; 4.9.1 comment+margin fix) fullCalibrationPage's pre-step-1 input freeze: the first corner prompt lands at START_DELAY + STEP_DELAY + 3xSTEP_BLINK_DELAY (~2950 ms — the old ~1950 arithmetic dropped CONF_JOY_CALIB_START_DELAY, leaving the freeze 50 ms clear of the prompt; normal-path masking hid it because step 0 disables the input poll at T+1000, inside the freeze — the unmasked safe-mode serial CA,1 path had the full gap live). The flow's own chain re-freezes per step.
 #define CONF_JOY_CALIB_LED_NUMBER CONF_LED_ALL
 #define CONF_JOY_CALIB_LED_COLOR LED_CLR_RED         // LED color for joystick calibration process 
 #define CONF_JOY_CALIB_STEP_BLINK 1

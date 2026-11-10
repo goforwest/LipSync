@@ -38,6 +38,21 @@
 #include "LSBuzzer.h"
 #include "LSWatchdog.h"
 
+// 4.9.1: the host-compiled classifier's state numbers are mirrored into the
+// SAP action-table rows by hand (LSPressureClassify.h deliberately compiles
+// without LSConfig.h, so the pin lives HERE, where both headers are
+// visible) — the same static_assert treatment the release fraction already
+// has in LSPressure.h. A silent renumber of either side would remap the
+// hard sip/puff actions or route them to an inert row: the hard rows are
+// the mobility-critical instant-DRAG/SCROLL path for users who cannot
+// sustain holds.
+static_assert(LSPRESSURE_CLASSIFY_NONE == PRESS_SAP_MAIN_STATE_NONE &&
+              LSPRESSURE_CLASSIFY_SIP == PRESS_SAP_MAIN_STATE_SIP &&
+              LSPRESSURE_CLASSIFY_PUFF == PRESS_SAP_MAIN_STATE_PUFF &&
+              LSPRESSURE_CLASSIFY_HARD_SIP == PRESS_SAP_MAIN_STATE_HARD_SIP &&
+              LSPRESSURE_CLASSIFY_HARD_PUFF == PRESS_SAP_MAIN_STATE_HARD_PUFF,
+              "LSPressureClassify state numbers must mirror PRESS_SAP_MAIN_STATE_*");
+
 // Unique ID
 String g_deviceUID = "";  // Global variable for storing unique identifier for board
 
@@ -242,8 +257,16 @@ void initHangWitness() {
   // priority 7 guarantees is preemption of any ordinary thread-mode hang
   // (BASEPRI = 0 there) — the witness's actual job — plus legality under
   // both priority models. USB-only boots (SD never comes up) keep priority
-  // 0 for the freeze hunt.
-  NVIC_SetPriority(TIMER3_IRQn, (needsInitialization && !g_bleInitPending) ? 0 : 7);
+  // 0 for the freeze hunt — 4.9.1: the leftover-SD USB boot (the
+  // bootloader-left-the-SoftDevice-up state this file seeds
+  // g_softDeviceEnabled from the chip for) must NOT take priority 0: its
+  // retention writes route through the SD's SVCs, and an SVC cannot
+  // preempt an exception at equal priority — the hang marker would pend
+  // behind the ISR's own NVIC_SystemReset() and never land, the successor
+  // read pm=0/streak-cleared, and the 3-strike hang settle became an
+  // unbreakable ~4 s SREQ loop (strictly worse than the 30 s DOG cycle it
+  // replaces). The SD-up chip state is the decider, not the com mode.
+  NVIC_SetPriority(TIMER3_IRQn, (needsInitialization && !g_bleInitPending && !g_softDeviceEnabled) ? 0 : 7);
   NVIC_ClearPendingIRQ(TIMER3_IRQn);
   NVIC_EnableIRQ(TIMER3_IRQn);
   NRF_TIMER3->TASKS_START = 1;
@@ -709,16 +732,21 @@ void setup() {
   }
 
   initMemory();  // Initialize Memory
-  // (4.9.0 review) the trail's mid-boot milestone: writeTrailByte(0) means
-  // "pre-setup death", so a hang inside initMemory's mount/seed or in
-  // beginComOpMode below — the historically demonstrated hang phase (the
-  // LittleFS mount + settings seed, the exact reason the WDT arm moved
-  // earlier) — reported pt=0, indistinguishable from a death before setup()
-  // ever ran. Trail codes 0-7 are all assigned (v7), so this milestone REUSES
-  // code 1 with a narrowed meaning: pt=1 now reads "memory up" (stamped
-  // unconditionally — the old stamp sat behind the witness gate, so a settled
-  // safe boot never stamped anything either), and pt=0 really does mean
-  // pre-initMemory. Deaths after this point are loop-phase as before.
+  // (4.9.0 review; 4.9.1 HONEST BOUNDS) the trail's mid-boot milestone:
+  // writeTrailByte(0) means "pre-setup death", so a NON-hang death inside
+  // initMemory or beginComOpMode — a fault-capture SREQ, the classes that
+  // preserve GPREGRET2 — now names its phase as pt=1 instead of pt=0.
+  // A HANG in that window still reads pt=0/pm=0 on the successor: the 30 s
+  // hardware DOG catches it (the arm above covers the phase — this is the
+  // fix that matters operationally), and a DOG reset wipes the retention
+  // register wholesale (the witness-v8 fact), stamp included. pt=1 therefore
+  // reads "memory up" for every death class the trail can observe; it does
+  // NOT claim hang forensics for the mount/seed window — the DOG -> g_watchdogReset
+  // -> safe-mode settle is that hang's recovery path. Trail codes 0-7 are all
+  // assigned (v7), so this milestone REUSES code 1 with the narrowed meaning,
+  // stamped unconditionally (the old stamp sat behind the witness gate, so a
+  // settled safe boot never stamped anything either). Deaths after this
+  // point are loop-phase as before.
   bootTrailStamp(1);
 
   // bleVerdictConsume() runs inside initMemory(), so only now can a failed
@@ -2142,19 +2170,27 @@ void initOperatingMode() {
 //***CHANGE OPERATING MODE FUNCTION***//
 // Function   : changeOperatingMode
 //
-// Description: This function configures the state of operation based on the current and desired operating mode
+// Description: Applies an operating-mode change by restarting the device —
+//              the interfaces are re-begun for the stored mode on the next
+//              boot. 4.9.1 (dead-store removal): persistence happens in the
+//              CALLERS before this call (OM/CM store the pair, the menu's
+//              finishChangeMode runs storeModePair), and softwareReset()
+//              never returns — the trailing g_operatingMode assignment this
+//              function used to carry was unreachable, and its "this is
+//              where the mode is set" shape was a trap for exactly the
+//              future editor who adds a bail-out return to softwareReset()
+//              (the assignment would then flip the global AFTER
+//              usbmouse.end()/btmouse.end() ran — the 4.5.7 "live mode
+//              claims a mode the interfaces never entered" bug, recreated).
 //
 // Parameters : inputOperatingMode : int : The operating mode to change to
 //
 // Return     : void
 //****************************************//
 void changeOperatingMode(int inputOperatingState) {
-  if (inputOperatingState == g_operatingMode) {
-    // do nothing
-  } else {
-    softwareReset();
+  if (inputOperatingState != g_operatingMode) {
+    softwareReset();  // never returns
   }
-  g_operatingMode = inputOperatingState;
 }
 
 
@@ -2501,6 +2537,32 @@ int switchRemapDefaultCell(int jack, int window, bool gamepad) {
   return (int)switchActionProperty[row].mouseOutputActionNumber;
 }
 
+// 4.9.1 (read-truth doctrine): the LIVE cell — what the device actually
+// fires — for the switch-remap getters' failed-read answer. The getter
+// must neither rewrite the live table from a failed read (the stored-0
+// path would apply the compiled defaults over the user's remap) nor
+// answer a value that is not in force.
+int switchRemapLiveCell(int jack, int window, bool gamepad) {
+  int row = CONF_SWITCH_REMAP_FIRST_ROW + jack * CONF_SWITCH_REMAP_ROWS_PER_JACK + window;
+  if (row < 0 || row >= (int)(sizeof(switchActionProperty) / sizeof(inputActionStruct))) return 0;
+  if (gamepad) return (int)g_switchActionTable[row].gamepadOutputActionNumber;
+  return (int)g_switchActionTable[row].mouseOutputActionNumber;
+}
+
+// 4.9.1 (read-truth doctrine): the LIVE hard-band action — the row the
+// classifier actually fires — for the HA/HB getters' failed-read answer
+// (a failed read yields 0 = NOTHING, which is in vocabulary and
+// allowlisted, so the old shape answered NOTHING with SUCCESS while the
+// live row kept the real action).
+int hardBandLiveAction(bool hardSip) {
+  for (int i = 0; i < (int)(sizeof(sapActionProperty) / sizeof(inputActionStruct)); i++) {
+    if (sapActionProperty[i].inputActionState == (hardSip ? PRESS_SAP_MAIN_STATE_HARD_SIP : PRESS_SAP_MAIN_STATE_HARD_PUFF)) {
+      return (int)g_sapActionTable[i].mouseOutputActionNumber;
+    }
+  }
+  return CONF_ACTION_NOTHING;
+}
+
 //***EFFECTIVE WINDOW FUNCTION***//
 // Function   : effectiveWindowMs
 //
@@ -2775,8 +2837,16 @@ void pressureLoop() {
   // every later action dispatch until a hub-button press or a post-recovery
   // re-puff). Must run before evaluateOutputAction: getState() below now
   // reads the settled {NONE, WAITING}, which alone cannot release anything.
+  // 4.9.1 (ownership gate): the cancel exists for a hold the PRESSURE input
+  // owned — its RELEASED was never emitted. A hold owned by a hub button or
+  // an external switch has its own release path; a mouthpiece-sensor fault
+  // must not destroy a drag the user is actively steering with a button (the
+  // direction is fail-safe — releasing — but it is still a wrong-ownership
+  // teardown). -1 = no latch (defensive; nothing to protect).
   if (ps.takeHoldCancelPending()) {
-    cancelSapOutputHold();
+    if (g_outputHoldInputClass == INPUT_CLASS_SAP || g_outputHoldInputClass == -1) {
+      cancelSapOutputHold();
+    }
   }
 
   //pressureValues = ps.getAllPressure();  // Read the pressure object (can be last value from array, average or other algorithms)
@@ -4742,7 +4812,17 @@ void softwareReset() {
   gamepad.end();
   btmouse.end();
 
-  delay(3000);
+  // 4.9.1: the dwell must DRAIN the response queue. The response-before-reset
+  // guarantee (CM/MP/SR/RS/FR acks) silently depended on the CDC FIFO having
+  // room: a host that stopped reading the IN pipe left the ack in the TX
+  // queue, serialTxService wrote 0 bytes, and the reset below killed the
+  // queue with the ack still in it — the port dropped with no response at
+  // all. Servicing every 10 ms hands the queue the whole dwell.
+  const unsigned long resetDwellDeadlineMs = millis() + CONF_RESET_DWELL_MS;
+  while ((long)(resetDwellDeadlineMs - millis()) > 0) {
+    serialTxService();
+    delay(10);
+  }
   screen.clear();
   
   NVIC_SystemReset();

@@ -130,7 +130,17 @@ LSMemory::LSMemory() {
 // Return     : void
 //*********************************//
 void LSMemory::begin() {
-  InternalFS.begin();
+  // 4.9.1: a failed mount is named on the wire. The old unchecked begin()
+  // made a dead filesystem completely silent — the device ran on compiled
+  // defaults, every read failed, every setter answered bare FAIL,3, and no
+  // line ever named the root cause (the exact dies-silently-at-the-first-FS-
+  // operation class the 4.5.22 rescue build was created for). Serial output
+  // before DTR opens is discarded, so this line is visible to an attached
+  // monitor (USB_DEBUG benches) — but the boot trail and the setters'
+  // FAIL pattern now have a printed cause to point at.
+  if (!InternalFS.begin()) {
+    Serial.println("ERROR: LittleFS mount FAILED — settings persist nothing this boot (reads/writes will fail)");
+  }
 }
 
 
@@ -230,21 +240,57 @@ void LSMemory::initialize(String fileString, String jsonString) {
   // ([garbage][default]: still unparseable), and every boot appended
   // another copy, growing the file forever and never healing. A fresh seed
   // write here is boot-time-only, so remove-then-write is sufficient
-  // crash-safety: a power cut mid-reseed leaves no/partial file, which the
-  // NEXT boot's re-seed heals.
-  InternalFS.remove(fileName);
+  // crash-safety for POWER CUTS: a power cut mid-reseed leaves no/partial
+  // file, which the NEXT boot's re-seed heals.
+  // 4.9.1: the other failure direction is a FAILED REMOVE — a corrupt
+  // directory entry (the damage class this reseed exists to heal) or a
+  // nearly-full flash refuses it; the old shape discarded the status and
+  // the FILE_O_WRITE open then found the surviving entry and APPENDED the
+  // seed after the garbage anyway. The written==jsonLength guard could not
+  // see it (an append writes all its bytes), and this path had no
+  // read-back verify — the ONE writer in the class without the protection
+  // the runtime writers all carry. Now: the seed write is gated on the
+  // remove succeeding, and the result is verified by reading it back (an
+  // append or partial write fails the compare and is removed, not
+  // "succeeded").
+  if (!InternalFS.remove(fileName)) {
+    Serial.print("ERROR: could not remove the corrupt settings file (");
+    Serial.print(fileString);
+    Serial.println(") — reseed refused (the corrupt file stays; a power cycle may clear the directory state)");
+    return;
+  }
   delay(1);
-  if( file.open(fileName, FILE_O_WRITE) )
+  const char* jsonChar = jsonString.c_str();
+  const size_t jsonLength = strlen(jsonChar);
+  if (file.open(fileName, FILE_O_WRITE))
   {
-    const char* jsonChar = jsonString.c_str();
-    const size_t jsonLength = strlen(jsonChar);
     const size_t written = file.write(jsonChar, jsonLength);
     delay(1);
     file.close();
     delay(1);
     if (written != jsonLength) {
+      Serial.println("ERROR: settings seed short write — removing the partial seed");
+      InternalFS.remove(fileName);
+    } else if (file.open(fileName, FILE_O_READ)) {
+      // Read-back verify (the runtime writers' byte-compare rule).
+      char verifyBuffer[BUFFER_SIZE] = { 0 };
+      int verifyLen = file.read(verifyBuffer, sizeof(verifyBuffer) - 1);
+      file.close();
+      if (verifyLen != (int)jsonLength || strncmp(verifyBuffer, jsonChar, jsonLength) != 0) {
+        // An append past the seed (the failed-remove trap) or drifted
+        // bytes: remove, so the next boot's reseed starts clean instead
+        // of appending another copy onto the same garbage.
+        Serial.println("ERROR: settings seed verify FAILED (append/partial shape) — removing it");
+        InternalFS.remove(fileName);
+      }
+    } else {
+      Serial.println("ERROR: settings seed could not be reopened for verify — removing it");
       InternalFS.remove(fileName);
     }
+  } else {
+    Serial.print("ERROR: could not open the settings file for seed (");
+    Serial.print(fileString);
+    Serial.println(") — every read/write will fail until the flash recovers");
   }
 }
 
@@ -557,6 +603,12 @@ bool LSMemory::readPoint(String fileString, String key, pointFloatType &out){
   if (storedValue.isNull() || !storedValue.is<JsonArray>()) return false;
   JsonArray corner = storedValue.as<JsonArray>();
   if (corner.size() < 2) return false;
+  // 4.9.1: as<float>() COERCES — a corrupt-but-parseable element (a string,
+  // null, boolean: one bit-flip class away from real data) converts to 0.0
+  // and passes isfinite, answering true with a fabricated {0,0}-style
+  // corner. The header contract is "false on ANY read/parse failure"; the
+  // numeric-type check makes it true.
+  if (!corner[0].is<float>() || !corner[1].is<float>()) return false;
   const float x = corner[0].as<float>();
   const float y = corner[1].as<float>();
   // isfinite, not just isnan: a corrupt-but-parseable literal that overflows
@@ -572,15 +624,24 @@ bool LSMemory::readPoint(String fileString, String key, pointFloatType &out){
 //*********************************//
 // Function   : writeObject 
 // 
-// Description: General function for writing an individual attribute-value pair to the settings file.
-//              Refuses (returns false, file untouched) a write whose serialized
-//              form would push the file past CONF_SETTINGS_FILE_BUDGET —
-//              the 4.1.0 downgrade guard (see writeAll): the API layer
-//              turns the refusal into the existing FAIL,3 response shape.
+// Description: Writes the COMPLETE settings file from the given Json Object
+//              (4.9.1 docblock fix: the old "writing an individual
+//              attribute-value pair" text described a per-key write the
+//              implementation never did — obj is serialized as the WHOLE
+//              file content, and `key` appears only in error lines. A
+//              future caller following the old contract would atomically
+//              replace the entire file with {"key": …}, silently dropping
+//              every other setting). Callers must read the current file,
+//              mutate the document, then pass the FULL mutated object —
+//              the writeX helpers are that pattern. Refuses (returns false,
+//              file untouched) a write whose serialized form would push the
+//              file past CONF_SETTINGS_FILE_BUDGET — the 4.1.0 downgrade
+//              guard (see writeAll): the API layer turns the refusal into
+//              the existing FAIL,3 response shape.
 // 
 // Arguments :  fileString : String : the name of the file
-//              key : String : the key of the desired Json attribute
-//              obj : JsonObject : the Json Object value
+//              key : String : the key label used in error lines only
+//              obj : JsonObject : the complete document to store
 // 
 // Return     : bool : true when written, false when the budget guard refused
 //*********************************//

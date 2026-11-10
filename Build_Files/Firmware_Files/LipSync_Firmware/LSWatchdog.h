@@ -99,14 +99,15 @@ void checkResetReason() {
     lipsyncRetentionUpdate(1, 0x03, 0);  // clear the streak — the previous boot did not die in a witnessed hang (4.5.27: SD-aware)
     g_hangBootStreak = 0;
   }
-  // The watchdog-reset counter itself: a DOG reset wipes the register, so
-  // this always counts from zero (the documented-decorative 4.2.0 budget —
-  // the streak above is the functional settling path). The hang streak
-  // feeds this value so setup()'s retry-limit gate covers both classes.
+  // The watchdog-reset counter: a DOG reset wipes the register wholesale
+  // (the witness-v8 fact), so this count cannot accumulate — it is always 1
+  // after a watchdog boot (4.9.1: the old shape READ bits the else branch
+  // above had just cleared, a structurally dead read that implied an
+  // accumulation that cannot happen; set the documented value directly).
+  // The 4.2.0 budget stays decorative; the hang streak above is the
+  // functional settling path.
   if (g_watchdogReset) {
-    g_watchdogBootCount = (uint8_t)(lipsyncRetentionGet(1) & 0x03UL);  // 4.5.27: SD-aware
-    if (g_watchdogBootCount > 3) g_watchdogBootCount = 3;
-    if (g_watchdogBootCount == 0) g_watchdogBootCount = 1;
+    g_watchdogBootCount = 1;
   } else {
     g_watchdogBootCount = g_hangBootStreak;
   }

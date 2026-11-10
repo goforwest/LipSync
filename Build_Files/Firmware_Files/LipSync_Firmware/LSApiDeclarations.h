@@ -448,8 +448,19 @@ static inline uint32_t lipsyncRetentionGet(uint32_t id) {
 // trail bits and the witness ISR's marker bits can no longer clobber each
 // other's read-modify-write either (a bonus: the old full-register RMWs from
 // two contexts were also a race). SVC from the witness ISR at priority 7 is
-// legal (the SVC handler runs at a more urgent priority; USB-boot ISRs take
-// the raw path because the SD is down there).
+// legal (the SVC handler runs at a more urgent priority; 4.9.1 fix: a
+// leftover-SD USB boot also takes the SVC path now — the witness arms at
+// priority 7 whenever the chip reports the SD up, because an SVC cannot
+// preempt an exception at priority 0 and the marker would pend behind the
+// ISR's own reset and never land).
+// KNOWN NARROW WINDOW (4.9.1, documented honestly): the SVC path is a SPLIT
+// clr-then-set pair. A witness SREQ landing between the loop's two SVC calls
+// (CLR landed, SET not yet) erases the trail bits the stamp was writing AND
+// the previous stamp — the successor reads pt=0. The window is microseconds
+// per stamp against a 1 s tick, and only costs forensics (never state). The
+// ISR-side pair is safe (priority 7 cannot be preempted by the loop, and the
+// ISR's own reset fires after both SVCs). Closing it fully would mean
+// batching both halves into one SD call, which the API does not offer.
 static inline void lipsyncRetentionUpdate(uint32_t id, uint8_t clr, uint8_t set) {
   if (g_softDeviceEnabled) {
     if (clr) (void) sd_power_gpregret_clr(id, clr);
@@ -485,6 +496,8 @@ bool switchRemapAllowed(int actionNumber, bool gamepad);  // (4.5.7 review) colu
 void sanitizeInputWindows();                              // (4.5.7 review) boot-load validation for WS/WL/WM
 void switchRemapApplyCell(int jack, int window, bool gamepad, int actionNumber);
 int switchRemapDefaultCell(int jack, int window, bool gamepad);
+int switchRemapLiveCell(int jack, int window, bool gamepad);  // 4.9.1: the live table cell (read-truth getters)
+int hardBandLiveAction(bool hardSip);                          // 4.9.1: the live HA/HB row (read-truth getters)
 
 // Witness v2 boot-trail (diagnostic, bench 2026-10-23): milestone stamps that
 // survive resets in .noinit; the HB line prints the last one reached.

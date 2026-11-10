@@ -335,7 +335,10 @@ void LSBLEMouse::service(void)
     // latch alive with the wire button already cleared — cursor moves, no
     // button, until the user's release self-corrected it. The exact mirror
     // of LSUSBMouse::service's unmount flag; no action-bearing event.
-    if (_buttons != 0) _disconnectedWithButtonState = true;
+    // 4.9.1: the mirror is now exact — pending CLICK or BUTTON state with
+    // _buttons already cleared (a release whose transmit the drop ate) is
+    // the same lost-state class, and the USB twin covers it.
+    if (_buttons != 0 || _clickPending || _buttonStatePending) _disconnectedWithButtonState = true;
     _buttons = 0;
     _buttonStatePending = false;
     _clickPending = false;
@@ -805,7 +808,25 @@ static bool g_switchBounceCounted = false;          // the tracked handle's boun
 // the start: silent radio-off. The flag is set by every window ending while
 // no host is connected, and serviced per loop pass by
 // lsHostServiceSwitchWindow once the event has actually landed.
+// 4.9.1: the service can no longer CLEAR the flag on a young isRunning()
+// reading — that is exactly the stale reading the flag exists for (the old
+// shape cleared it in the gap, the event landed afterward, and the radio
+// went silently off). The arm time bounds the trust: the event gap is
+// sub-second, so a set still flagged "running" well past the bound is
+// genuinely on air and the pending settles.
 static bool g_switchAdvRestartPending = false;
+static unsigned long g_switchAdvRestartPendingMs = 0;
+#define LSHOST_ADV_RESTART_STALE_RUN_MS 2000UL
+
+// 4.9.1: the HID-subscription watchdog's grace must not survive a switch
+// window — the window's early return freezes a mid-grace anchor, and the
+// link that connects afterward (the freshly switched-to target) would
+// inherit the elapsed timer and be disconnected on its first post-window
+// pass, mid-CCCD-restore. Every window ending calls this; the watchdog
+// block defines it. (Forward declaration here — the window code sits
+// above the watchdog in this file.)
+static void lsHidWatchdogResetGrace(void);
+
 
 // Suspend the stock DISCONNECTED auto-restart (open FP_ANY advertising) for
 // the switch lifecycle: between the disconnect and the window's filtered
@@ -1051,7 +1072,15 @@ void lsHostCancelSwitchWindow(void) {
   // (round-3 review) a cancel can land in the stale-run/event-pending gap;
   // arm the deferred settle so a forget-path cancel cannot leave the radio
   // silently off. (A following arm/begin owns the radio and clears the flag.)
-  if (!Bluefruit.connected()) g_switchAdvRestartPending = true;
+  // 4.9.1: also end the HID watchdog's grace tracking here — a link that
+  // connects after the window must not inherit a grace frozen mid-window
+  // (the freshly switched-to target used to be disconnected on its first
+  // watchdog pass, mid-CCCD-restore).
+  if (!Bluefruit.connected()) {
+    g_switchAdvRestartPending = true;
+    g_switchAdvRestartPendingMs = millis();
+  }
+  lsHidWatchdogResetGrace();
 }
 
 // CLOSE: stop the window advertise, disarm the SD lists, restore the stock
@@ -1074,7 +1103,14 @@ void lsHostCloseSwitchWindow(void) {
   if (!Bluefruit.connected()) lsHostEnsureAdvertising();
   // Also arm the deferred restart: the one-shot ensure above can be fooled
   // by the stale _runnning flag in the event-pending gap (round-3 review).
-  if (!Bluefruit.connected()) g_switchAdvRestartPending = true;
+  // 4.9.1: the pending carries its arm time (the service must not trust a
+  // young isRunning reading), and the HID watchdog's grace tracking ends
+  // with the window (see the cancel path).
+  if (!Bluefruit.connected()) {
+    g_switchAdvRestartPending = true;
+    g_switchAdvRestartPendingMs = millis();
+  }
+  lsHidWatchdogResetGrace();
 }
 
 // (4.9.0 round-2 review) the window's millis bound must fire on EVERY path —
@@ -1129,11 +1165,18 @@ bool lsHostSwitchWindowBoundExpired(void) {
 // IRK — the privacy target, admitted pre-bond. sd_ecb_block_encrypt is a
 // big-endian (MSB-first) AES core, so the little-endian block and key are
 // byte-reversed in and the ciphertext byte-reversed out (the exact
-// definition of bt_encrypt_le). Returns false on any SD refusal — a
-// resolution failure reads as "not the target", and the armed IRK only ever
-// comes from the target's own bond file.
-bool lsHostRpaResolvesIrk(const uint8_t irk[16], const uint8_t peerAddr[6]) {
-  if (!lsHostAddrIsRpa(peerAddr)) return false;
+// definition of bt_encrypt_le).
+// 4.9.1: the result is TRI-STATE. The old shape folded an SD ECB refusal
+// into "no match" — but a refusal is INDEFINITE (the ECB is a shared AES
+// resource; the connect/encryption storm the bouncer itself generates can
+// refuse or serialize a call at exactly the moment the target connects),
+// while a computed hash mismatch is DEFINITIVE. The tick grants the
+// bond-decision grace to an undecided peer instead of bouncing it.
+#define LSHOST_RPA_EXCLUDED 0   // resolved, does NOT match the IRK — definitive not-the-target
+#define LSHOST_RPA_MATCH 1      // resolved and matches — the privacy target
+#define LSHOST_RPA_UNDECIDED (-1)  // the SD refused the ECB call — identity unknown
+int lsHostRpaResolvesIrk(const uint8_t irk[16], const uint8_t peerAddr[6]) {
+  if (!lsHostAddrIsRpa(peerAddr)) return LSHOST_RPA_EXCLUDED;
   uint8_t clearLe[16] = { 0 };
   clearLe[0] = peerAddr[3];
   clearLe[1] = peerAddr[4];
@@ -1144,8 +1187,8 @@ bool lsHostRpaResolvesIrk(const uint8_t irk[16], const uint8_t peerAddr[6]) {
     ecb.key[i] = irk[15 - i];          // big-endian AES key
     ecb.cleartext[i] = clearLe[15 - i];  // big-endian block
   }
-  if (sd_ecb_block_encrypt(&ecb) != NRF_SUCCESS) return false;
-  return lsHostRpaHashMatches(peerAddr, ecb.ciphertext) != 0;
+  if (sd_ecb_block_encrypt(&ecb) != NRF_SUCCESS) return LSHOST_RPA_UNDECIDED;
+  return (lsHostRpaHashMatches(peerAddr, ecb.ciphertext) != 0) ? LSHOST_RPA_MATCH : LSHOST_RPA_EXCLUDED;
 }
 int lsHostSwitchWindowTick(void) {
   if (!g_switchWindowOpen) return 0;
@@ -1174,21 +1217,30 @@ int lsHostSwitchWindowTick(void) {
       //     identity and lets tier (1) admit it.
       const bool isRpaPeer = lsHostAddrIsRpa(peer.addr);
       bool match = (memcmp(peer.addr, g_switchWlAddr.addr, 6) == 0);
+      bool rpaUndecided = false;
       if (!match && isRpaPeer && g_switchTargetIrkValid) {
-        match = lsHostRpaResolvesIrk(g_switchTargetIrk, peer.addr);
+        const int rpaState = lsHostRpaResolvesIrk(g_switchTargetIrk, peer.addr);
+        match = (rpaState == LSHOST_RPA_MATCH);
+        // 4.9.1: an ECB REFUSAL is not an exclusion — the AES engine is
+        // shared, and the connect/encryption storm the bouncer itself
+        // generates is exactly when a call can be refused. An undecided
+        // peer gets the bond-decision grace like a no-IRK peer (the
+        // next tick resolves it; the window bound still ends the wait).
+        rpaUndecided = (rpaState == LSHOST_RPA_UNDECIDED);
       }
       if (match) {
         targetConnected = true;
       } else {
         nonTargetHdl = hdl[i];
-        // A non-target is DECIDABLE unless it is an RPA peer whose identity
-        // the armed bond cannot judge at all (no IRK). Decidable includes
-        // an RPA the armed IRK just EXCLUDED (resolution failed = definitive
+        // A non-target is DECIDABLE unless its identity cannot be judged at
+        // all: an RPA the armed bond carries no IRK for, or an RPA whose
+        // resolution the SD just refused (4.9.1). Decidable INCLUDES an RPA
+        // the armed IRK computationally EXCLUDED (hash mismatch = definitive
         // not-the-target) — those bounce immediately, preserving the
         // bench-proven millisecond lockout for the public/static racer class
         // (a grace on every first sight would hand the racer 3 s of link per
         // cycle and reopen the wrong-host race).
-        nonTargetDecidable = !(isRpaPeer && !g_switchTargetIrkValid);
+        nonTargetDecidable = !((isRpaPeer && !g_switchTargetIrkValid) || rpaUndecided);
       }
     }
     if (targetConnected) {
@@ -1338,7 +1390,15 @@ void lsHostServiceSwitchWindow(void) {
     if (Bluefruit.connected()) {
       g_switchAdvRestartPending = false;  // a host owns the link; auto-restart owns the future
     } else if (Bluefruit.Advertising.isRunning()) {
-      g_switchAdvRestartPending = false;  // genuinely on air (the event landed or a start succeeded)
+      // 4.9.1: this branch may be reading the STALE flag (the directed set
+      // terminated, ADV_SET_TERMINATED not yet dispatched) — the exact gap
+      // the pending flag exists for. A young reading proves nothing; only
+      // trust "running" once it has persisted past the event-gap bound, by
+      // which time a stale flag has long resolved to false and a genuinely
+      // on-air open advertise stays.
+      if (millis() - g_switchAdvRestartPendingMs > LSHOST_ADV_RESTART_STALE_RUN_MS) {
+        g_switchAdvRestartPending = false;
+      }
     } else if (lsHostEnsureAdvertising()) {
       g_switchAdvRestartPending = false;
     }
@@ -1368,10 +1428,15 @@ bool lsHostSwitchWindowOpen(void) {
    link whose mouse-input CCCD is not enabled, after a 5 s grace (pairing/
    encryption/CCCD restore take a moment), the link is DISCONNECTED — the
    host's own retry then re-establishes and re-subscribes cleanly (the fix
-   that worked all night, driven by us). Bounded: 3 cycles max per session
-   (the counter resets only when a subscription is actually seen — a
-   persistent non-subscriber cannot be cycled forever); past the bound the
-   link is left to the host with one named INFO line. A subscribed link
+   that worked all night, driven by us). Bounded: 3 cycles max per LINK
+   EPISODE (4.9.1 re-key: the budget resets when the link ends or a new
+   link is observed — the old per-session cap let host A's burned budget
+   silently disable self-correction and diagnostics for every later host's
+   fresh link; a persistent non-subscriber on ONE link is still never
+   cycled forever); past the bound the link is left to the host with one
+   named INFO line, and the same is true of the disconnect-refusal cap
+   (4.9.1: the refusal cap now actually stops the attempts — the old shape
+   logged the cap and kept retrying every pass). A subscribed link
    resets everything.
 
    Guards: BONDED peers only (a BLE-DFU session is conventionally unbonded
@@ -1390,7 +1455,17 @@ static unsigned long g_hidWdConnectMs = 0;  // 0 = not tracking an unsubscribed 
 static uint16_t g_hidWdHdl = 0xFFFF;        // the link the grace timer belongs to (4.9.0)
 static int g_hidWdCycles = 0;
 static int g_hidWdRefused = 0;
+static bool g_hidWdRefusedCap = false;      // 4.9.1: 5 consecutive refusals — hands the link to the host FOR REAL (the old shape logged the cap and kept retrying every pass)
 static bool g_hidWdCappedLogged = false;
+
+// 4.9.1: the grace anchor ends with the link episode. Called from the
+// switch-window close/cancel paths (the window freezes the watchdog for its
+// whole duration; the link that connects afterward must start a fresh
+// grace) and from the watchdog's own new-link/link-less observations.
+static void lsHidWatchdogResetGrace(void) {
+  g_hidWdConnectMs = 0;
+  g_hidWdHdl = 0xFFFF;
+}
 
 void lsHidWatchdogLoop(void) {
   if (needsInitialization) return;
@@ -1398,40 +1473,57 @@ void lsHidWatchdogLoop(void) {
   if (g_switchWindowOpen) return;  // the window's tick owns the radio
 
   if (!Bluefruit.connected()) {
-    g_hidWdConnectMs = 0;
-    g_hidWdHdl = 0xFFFF;
-    // NOTE: g_hidWdCycles deliberately persists across link-less passes — the
-    // cap is per SESSION (a persistent non-subscriber must not be cycled
-    // forever); it resets only when a subscription is actually observed.
+    lsHidWatchdogResetGrace();
+    // 4.9.1: the cycle budget is now per LINK EPISODE, not per session —
+    // the link-less observation means whatever link had the budget is gone.
+    // (The old per-session cap meant host A's burned budget silently
+    // disabled self-correction AND diagnostics for every later host's
+    // fresh link, including a legitimately slow-to-subscribe one.)
+    g_hidWdCycles = 0;
+    g_hidWdRefused = 0;
+    g_hidWdRefusedCap = false;
+    g_hidWdCappedLogged = false;
     return;
   }
 
   uint16_t hdl[1];
   if (Bluefruit.getConnectedHandles(hdl, 1) == 0) return;
   BLEConnection* conn = Bluefruit.Connection(hdl[0]);
-  if (conn == NULL || !conn->bonded()) { g_hidWdConnectMs = 0; g_hidWdHdl = 0xFFFF; return; }  // DFU guard
+  if (conn == NULL || !conn->bonded()) { lsHidWatchdogResetGrace(); return; }  // DFU guard
 
   if (blehid.inputNotifyEnabled(HID_REPORT_ID_MOUSE)) {
-    // Subscribed — healthy. Reset the session counters.
-    g_hidWdConnectMs = 0;
-    g_hidWdHdl = 0xFFFF;
+    // Subscribed — healthy. Reset everything.
+    lsHidWatchdogResetGrace();
     g_hidWdCycles = 0;
     g_hidWdRefused = 0;
+    g_hidWdRefusedCap = false;
     g_hidWdCappedLogged = false;
     return;
   }
 
-  // The grace belongs to the link it started on (4.9.0): a drop+reconnect the
-  // 1 s pass never observed as link-less must not hand the new link the old
-  // link's elapsed grace — the new CCCD restore legitimately needs its own
-  // 5 s, and inheriting the elapsed timer bounced it mid-restore.
+  // The grace belongs to the link it started on (4.9.0, re-keyed 4.9.1): a
+  // new handle observation starts a fresh grace AND a fresh cycle budget —
+  // the SoftDevice reuses handle numbers, so a same-numbered reconnect must
+  // never inherit the previous link's elapsed timer (the 4.9.0 handle-keyed
+  // guard let exactly that through; the S140 always allocates the lowest
+  // free handle, making reuse the COMMON case).
   if (g_hidWdHdl != hdl[0]) {
     g_hidWdHdl = hdl[0];
     g_hidWdConnectMs = millis();
+    g_hidWdCycles = 0;
+    g_hidWdRefused = 0;
+    g_hidWdRefusedCap = false;
+    g_hidWdCappedLogged = false;
     return;
   }
   if (g_hidWdConnectMs == 0) { g_hidWdConnectMs = millis(); return; }  // grace begins
   if (millis() - g_hidWdConnectMs < LSHOST_HID_WD_GRACE_MS) return;
+
+  // 4.9.1: the refusal cap STOPS the intervention — the old shape logged
+  // "leaving the link to the host" and then kept attempting a disconnect
+  // every pass forever (only the log was capped). A persistent non-subscriber
+  // on THIS link episode is left to the host, as the header contract says.
+  if (g_hidWdRefusedCap) return;
 
   if (g_hidWdCycles < LSHOST_HID_WD_MAX_CYCLES) {
     // A cycle is consumed only when the disconnect actually dispatched —
@@ -1445,6 +1537,7 @@ void lsHidWatchdogLoop(void) {
     if (!Bluefruit.disconnect(hdl[0])) {
       if (++g_hidWdRefused >= LSHOST_HID_WD_MAX_REFUSED) {
         g_hidWdRefused = 0;
+        g_hidWdRefusedCap = true;  // hands off until the link ends or a subscription is seen
         if (!g_hidWdCappedLogged) {
           g_hidWdCappedLogged = true;
           serialTxEnqueueLine("INFO: HID watchdog capped (disconnects refused) — leaving the link to the host");

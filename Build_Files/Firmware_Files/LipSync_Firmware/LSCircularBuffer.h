@@ -31,7 +31,7 @@ class LSCircularBuffer {
     ~LSCircularBuffer();
     LSCircularBuffer(const LSCircularBuffer&) = delete;
     LSCircularBuffer& operator=(const LSCircularBuffer&) = delete;
-    T getElement( uint16_t );  // Zero is the push location of new element 
+    T getElement( uint16_t );  // Zero is the MOST RECENTLY pushed element (4.9.1 doc fix: pushElement advances the pointer BEFORE writing, so index 0 reads the newest sample, and the next push lands one past it)
     void begin( uint16_t inputSize );
     void clear();
     void pushElement(const T elementVal);
@@ -133,7 +133,10 @@ void LSCircularBuffer<T>::clear()
 // Function   : getElement 
 // 
 // Description: Get an element at some depth into the circular buffer
-//              zero is the push location.  Max: cBufferSize - 1
+//              zero is the MOST RECENTLY pushed element (4.9.1 doc fix —
+//              pushElement increments the pointer before writing, so the
+//              push location of the NEXT element is one past index 0).
+//              Max: cBufferSize - 1
 //
 // Arguments :  uint16_t elementNum: number of element in
 // 

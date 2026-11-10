@@ -129,6 +129,7 @@ extern bool g_displayConnected;                   // Display connection state
 extern bool g_joystickSensorConnected;            // Joystick sensor connection state
 extern bool g_mouthpiecePressureSensorConnected;  // Mouthpiece pressure sensor connection state
 extern bool g_ambientPressureSensorConnected;     // Ambient pressure sensor connection state
+extern bool g_safeModeEnabled;                    // 4.9.1: activateMenu refuses in safe mode (the safe menu owns the display)
 extern int g_safeModeReason;                      // Reason safe mode is triggered.
 extern bool g_modeLocked;                         // Operating-mode lock (roadmap item 11, LK setting)
 extern bool g_calibrationRunning;                  // Full calibration accepted and in flight
@@ -191,6 +192,7 @@ public:
   // run on the screen timer when the informational page's dwell time ends,
   // instead of delay() freezing the whole main loop for 0.2-3 s.
   void scheduleTransition(unsigned long delayMs, void (*transitionFn)());
+  void freezeMenuInputFor(unsigned long ms);  // 4.9.1: bare-deadline freeze for flows whose continuation lives on another timer pool (the API calibration path's entry gap)
   void finishExitMenu();
   void beginLongTextScroll();
   void returnToMenu();
@@ -279,7 +281,7 @@ private:
   unsigned long _displayProbeIntervalMs = 2000;  // Re-probe cadence; doubles after each wedged push (flaky buses
                                                  // ACK a probe during momentary releases, and every re-trusted
                                                  // full push that then wedges costs seconds of bounded timeouts)
-  void flushDisplay();                   // The single choke point for framebuffer pushes to the I2C bus
+  bool flushDisplay();                   // The single choke point for framebuffer pushes to the I2C bus — true when the framebuffer actually reached the bus (4.9.1: callers can tell a skipped push from a landed one)
   void finishSplashClear();              // The splash/ready page's scheduled self-clear (see its definition)
 
   bool _isActive = false;
@@ -586,6 +588,16 @@ bool LSScreen::inputIsFrozen() {
 //*********************************//
 void LSScreen::activateMenu() {
   if (!_begun || !g_displayConnected) return;
+  // 4.9.1: safe mode owns the display — the safe menu (Restart / Factory
+  // Reset) is the ONLY menu the action tables expose on a settled safe boot
+  // (CONF_ACTION_START_MENU is NOTHING in every safe-mode cell), and the
+  // physical input path cannot reach this method there. The serial CH,1
+  // route could: it registered the FULL main menu over the safe menu,
+  // handing a sip/puff user (via the app's own remote) calibration, mode
+  // changes and settings writes on a unit that just booted unsafe. The
+  // refusal mirrors the action-table doctrine; controlHubMenu answers the
+  // named FAIL for it.
+  if (g_safeModeEnabled) return;
   if (inputIsFrozen()) return;  // A scheduled page transition owns the menu right now (wrap/stale-safe — see inputIsFrozen)
   if (!Wire.busHealthy()) return;  // Held I2C bus — the menu could not draw anyway; don't feed the timeout tax
 
@@ -670,6 +682,15 @@ void LSScreen::scheduleTransition(unsigned long delayMs, void (*transitionFn)())
     _inputFrozenUntil = 0;
     if (transitionFn != nullptr) transitionFn();
   }
+}
+
+// 4.9.1: a BARE-deadline freeze for flows whose continuation lives on a
+// DIFFERENT timer pool than _screenStateTimer (the API calibration chain's
+// entry gap lives on calibrationTimer, invisible to inputIsFrozen's
+// transition-timer probe). The 15 s honor cap (see inputIsFrozen) bounds it
+// — keep callers under it, like every other bare deadline.
+void LSScreen::freezeMenuInputFor(unsigned long ms) {
+  _inputFrozenUntil = millis() + ms;
 }
 
 // Each continuation first clears the pending-transition id (the timer just
@@ -794,7 +815,18 @@ void LSScreen::drawUsbErrorPageOnce() {
       _screenStateTimerId = -1;
     }
     noUsbPage();
-    _usbErrorPagePainted = true;
+    // 4.9.1: the painted latch follows the PUSH, not the RAM draw. The old
+    // shape latched unconditionally although flushDisplay() (void) can
+    // silently skip the push while the display is health-demoted — the page
+    // existed only in RAM while the once-per-episode gate blocked every
+    // retry for the rest of the outage, i.e. the page failed during the
+    // exact failure it exists for. A skipped push leaves the episode
+    // un-latched so the next connection check redraws it.
+    if (flushDisplay()) {
+      _usbErrorPagePainted = true;
+      _usbErrorPageShown = true;
+    }
+    return;
   }
   _usbErrorPageShown = true;
 }
@@ -872,10 +904,16 @@ bool LSScreen::isDisplayHealthy() {
 //
 // Arguments :  void
 //
-// Return     : void
+// Return     : bool : true when the framebuffer actually reached the bus —
+//              false on every skip (not begun, display demoted, probe
+//              failed, bus held). 4.9.1: the return lets a caller distinguish
+//              "drawn to RAM, push skipped" from "pushed" — drawUsbErrorPageOnce
+//              uses it to keep its retry alive across a demoted display
+//              (a void return made the caller latch the page as painted
+//              although it never reached the glass).
 //*********************************//
-void LSScreen::flushDisplay() {
-  if (!_begun || !g_displayConnected) return;
+bool LSScreen::flushDisplay() {
+  if (!_begun || !g_displayConnected) return false;
   // Display health gate (mirrors the pressure sensors'): a full framebuffer
   // push against a held or absent display costs seconds of bounded
   // transaction timeouts — and a flaky bus ACKs probes during momentary
@@ -886,14 +924,14 @@ void LSScreen::flushDisplay() {
   // menu from stalling the main loop — or outrunning the 30 s watchdog at
   // boot — when the display side of the shared I2C bus is dead or flaky.
   if (!_displayHealthy) {
-    if (millis() - _lastDisplayProbeMs < _displayProbeIntervalMs) return;
+    if (millis() - _lastDisplayProbeMs < _displayProbeIntervalMs) return false;
     _lastDisplayProbeMs = millis();
     Wire.beginTransmission(SCREEN_ADDRESS);
-    if (Wire.endTransmission() != 0) return;  // Still not answering
+    if (Wire.endTransmission() != 0) return false;  // Still not answering
     _displayHealthy = true;                   // ACKed — the next flush pushes for real
   }
 
-  if (!Wire.busHealthy()) return;  // Bus held by something else — retry on a later flush
+  if (!Wire.busHealthy()) return false;  // Bus held by something else — retry on a later flush
 
   uint32_t recoveriesBefore = Wire.recoveryCount();
   unsigned long pushStartMs = millis();
@@ -927,6 +965,7 @@ void LSScreen::flushDisplay() {
   // the ack would require exiting the render path and desyncing the
   // framebuffer-push coupling for no reader benefit.)
   reportMenuState();
+  return true;
 }
 
 //*********************************//
@@ -2500,13 +2539,17 @@ void LSScreen::fullCalibrationPage(void) {
 
   flushDisplay();
 
-  // (4.9.0 review) mirror centerResetPage's freeze for the pre-step-1 gap:
-  // the first corner prompt lands ~2 s out (CONF_JOY_CALIB_STEP_DELAY), and
-  // until then this page was live to the input poll — a Next moved the stale
-  // confirm-page selection and displayCursor's overlay painted a stray ">"
-  // over the prompt text; a wrapped Next repainted the confirm page over it.
-  // The flow's own chain re-freezes per step (fullCalibrationPrompt), so
-  // only the entry gap needs the arm.
+  // (4.9.0 review; 4.9.1 arithmetic fix) mirror centerResetPage's freeze
+  // for the pre-step-1 gap: the first corner prompt lands ~2950 ms out
+  // (START_DELAY 1000 + STEP_DELAY 1500 + 3xSTEP_BLINK_DELAY 450 — the old
+  // "~1950" note dropped START_DELAY), and until then this page was live to
+  // the input poll — a Next moved the stale confirm-page selection and
+  // displayCursor's overlay painted a stray ">" over the prompt text; a
+  // wrapped Next repainted the confirm page over it. The constant now
+  // covers the real chain (3200 ms). The flow's own chain re-freezes per
+  // step (fullCalibrationPrompt), so only the entry gap needs the arm —
+  // and the SERIAL CA,1 path arms the same freeze via
+  // freezeMenuInputFor in setJoystickCalibration (4.9.1).
   _inputFrozenUntil = millis() + CONF_JOY_CALIB_ENTRY_FREEZE_MS;
 
   setJoystickCalibration(false, false);
@@ -2537,8 +2580,10 @@ void LSScreen::fullCalibrationPrompt(int stepNum) {
   // repaint the confirm page's selection column over the instruction
   // prompt, because the run registered no freeze. Step 6 (complete)
   // schedules its own return-to-menu transition and must NOT freeze past
-  // it.
-  if (stepNum >= 1 && stepNum <= 5) {
+  // it. 4.9.1: the error page joins the freeze — a step-5 failure used to
+  // fall outside the 1..5 guard, leaving the error message live to a stale
+  // NEXT/SELECT while it sits on the glass.
+  if ((stepNum >= 1 && stepNum <= 5) || stepNum == CONF_JOY_CALIB_ERROR) {
     _inputFrozenUntil = millis() + CONF_FULL_CALIB_STEP_FREEZE_MS;
   }
   setupDisplay();
@@ -2747,6 +2792,15 @@ void LSScreen::adjustPuffThreshMenu(void) {
 // Return     : void
 //*********************************//
 void LSScreen::healHardThresholds(void) {
+  // 4.9.1: re-entrancy guard. The threshold GETTERS' heal arm calls back
+  // into here (a healed regular floor must re-check the hard pair), and
+  // this body reads the thresholds back through those same getters — a
+  // heal whose write keeps failing would otherwise recurse
+  // heal -> getter -> heal forever. One level is the contract: the outer
+  // call's own comparisons already use the freshest values.
+  static bool healReentry = false;
+  if (healReentry) return;
+  healReentry = true;
   // Only heal while the floor is STORABLE (4.8.1): the hard setters refuse
   // values at/above CONF_PRESS_MAX_THRESHOLD, so a regular threshold raised
   // past (MAX - margin) leaves a floor no write can satisfy. The old shape
@@ -2779,6 +2833,7 @@ void LSScreen::healHardThresholds(void) {
       setHardPuffPressureThreshold(true, false, puffFloor);
     }
   }
+  healReentry = false;
 }
 
 //*********************************//

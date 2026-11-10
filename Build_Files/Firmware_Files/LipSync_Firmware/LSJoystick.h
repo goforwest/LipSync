@@ -57,7 +57,14 @@
 // count as a valid radius input (4.5.7 review — see setMinimumRadius): a
 // real corner sits 13-30 mT from the compensated center; anything closer is
 // a degenerate capture or garbage from an unvalidated settings load.
-#define JOY_MIN_CALIB_RADIUS 1.0
+// 4.9.1: raised 1.0 -> 3.0 to match the corner plausibility minimum the API
+// layer already enforces (CONF_JOY_CALIB_CORNER_MIN, |axis| >= 3) — a
+// center reset on an UNCALIBRATED unit whose compensated neutral sits near
+// the {30,30} default corner used to leave a ~1.4 mT valid initial radius
+// (clamping a breath of movement to full ±1024 throw, the hair-trigger
+// cursor class the floor exists to bound). A 3.0 mT floor stays ~4x below
+// the weakest real corner the calibration itself accepts.
+#define JOY_MIN_CALIB_RADIUS 3.0
 
 #define JOY_INPUT_XY_MAX 1024           // The max range of mapped input from float to int(-1024 to 1024)
 
@@ -86,9 +93,10 @@ class LSJoystick {
     int getMagnetZDirection();                                            // Get the Z direction of the magnet.
     void setMagnetZDirection();                                           // Update the magnet Z direction variable.
     void setMagnetDirection(int magnetXDirection, int magnetYDirection);  // Set magnet direction based on orientation of magnet (z axis), X and Y direction variables.
-    void setInnerDeadzone(bool deadzoneEnabled,float deadzoneFactor);     // Enable or disable the inner deadzone and set its factor (0,1.0); the compiled default is CONF_JOY_DEADZONE_INNER_DEFAULT (0.07) — begin() seeds it via JOY_OUTPUT_DEADZONE_FACTOR (0.05) when no stored value loads
+    void setInnerDeadzone(bool deadzoneEnabled,float deadzoneFactor);     // Enable or disable the inner deadzone and set its factor (0,1.0) — enforced here (refused out-of-range keeps the current factor)
     float getInnerDeadzoneFactor(void);                                   // Get the inner deadzone factor ()
-    void setOuterDeadzone(bool upperDeadzoneEnabled,float outerDeadzoneFactor);  // Enable or disable deadzone and set deadzone scale factor  Default 0.95 
+    void setOuterDeadzone(bool upperDeadzoneEnabled,float outerDeadzoneFactor);  // Enable or disable deadzone and set deadzone scale factor, enforced (0,1.0) here; compiled default 0.95
+    float getOuterDeadzoneFactor(void);                                   // Get the outer deadzone factor (4.9.1: the IZ/OZ read-truth getters answer this on a failed read)
     int getOutputRange();                                                 // Get the output range or speed levels.
     void setOutputRange(int rangeLevel);                                  // Set the output range or speed levels.
     int getMouseSpeedRange();                                             // Get the maximum cursor change
@@ -495,6 +503,17 @@ void LSJoystick::setMagnetDirection(int magnetXDirection, int magnetYDirection) 
 // Return     : void
 //*********************************//
 void LSJoystick::setInnerDeadzone(bool innerDeadzoneEnabled, float innerDeadzoneFactor){
+  // 4.9.1: enforce the documented (0,1) contract HERE — the old shape
+  // stored whatever it was handed, so a factor >= 1.0 classified every
+  // reading except extreme corner throws as inside the deadzone (the
+  // silent-dead-cursor class) and a NaN made round() an indeterminate
+  // conversion. A refused value keeps the current state. The API layer
+  // validates too; this is the header's own contract, defended at the
+  // method a future caller will trust.
+  if (innerDeadzoneEnabled &&
+      (!isfinite(innerDeadzoneFactor) || innerDeadzoneFactor <= 0.0f || innerDeadzoneFactor >= 1.0f)) {
+    return;
+  }
   _innerDeadzoneEnabled = innerDeadzoneEnabled;
   _innerDeadzoneFactor = innerDeadzoneFactor;
 
@@ -522,6 +541,22 @@ float LSJoystick::getInnerDeadzoneFactor(void){
 }
 
 //*********************************//
+// Function   : getOuterDeadzoneFactor
+// 
+// Description: Get the outer deadzone factor.
+// 
+// Arguments :  void
+// 
+// Return     : outerDeadzoneFactor : float : factor in (0.0, 1.0) — the
+//              enforced range (setOuterDeadzone refuses 0 and >=1); the
+//              IZ/OZ read-truth getters answer this on a failed settings
+//              read (4.9.1)
+//*********************************//
+float LSJoystick::getOuterDeadzoneFactor(void){
+  return _outerDeadzoneFactor;
+}
+
+//*********************************//
 // Function   : setOuterDeadzone 
 // 
 // Description: Set the upper deadzone value based on deadzone status and upper deadzone factor.
@@ -532,6 +567,14 @@ float LSJoystick::getInnerDeadzoneFactor(void){
 // Return     : void
 //*********************************//
 void LSJoystick::setOuterDeadzone(bool outerDeadzoneEnabled, float outerDeadzoneFactor){
+  // 4.9.1: enforce the documented (0,1) contract here (see setInnerDeadzone) —
+  // a factor >= 1.0 pushed the outer boundary past every reading, and a
+  // NaN made round() an indeterminate conversion. A refused value keeps
+  // the current state.
+  if (outerDeadzoneEnabled &&
+      (!isfinite(outerDeadzoneFactor) || outerDeadzoneFactor <= 0.0f || outerDeadzoneFactor >= 1.0f)) {
+    return;
+  }
   _outerDeadzoneEnabled = outerDeadzoneEnabled;
   _outerDeadzoneFactor = outerDeadzoneFactor;
 
@@ -1191,7 +1234,14 @@ pointIntType LSJoystick::scaleOutput(pointIntType inputPoint, float inputMagnitu
   
   pointIntType outputPoint = {0,0};  // Initialize outputPoint
 
-  // Map input magnitude (between 0 and 1024) to output magnitudes (between 0 and _rangeValue)
+  // Map input magnitude (0..JOY_INPUT_XY_MAX) to output magnitudes
+  // (0..CONF_JOY_OUTPUT_XY_MAX). 4.9.1 comment fix: the output range level
+  // (_rangeValue) is NOT applied here — scaleOutput always maps to the full
+  // CONF_JOY_OUTPUT_XY_MAX and constrain() clamps there; _rangeValue is
+  // applied once downstream (getMouseSpeedRange's consumer in
+  // LipSync_Firmware.ino). Keep it that way: applying the range here AND
+  // downstream would rescale every user's cursor (the 4.5.7
+  // setOutputRange note's double-application class).
   float outputMagnitude = mapIntToFloat(inputMagnitude, 0, JOY_INPUT_XY_MAX, 0, CONF_JOY_OUTPUT_XY_MAX);
   outputMagnitude = constrain(outputMagnitude, 0, CONF_JOY_OUTPUT_XY_MAX);
 
