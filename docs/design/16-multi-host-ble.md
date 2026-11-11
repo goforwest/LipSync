@@ -629,3 +629,22 @@ every mechanism bench-proven on the wire, macOS + Windows hosts):
    bond-decision grace. The 4.9.0 review also closed the refused-disconnect
    lockout surrender, the mid-window forget interaction, and the BT,3
    honesty/window guards.
+8. **FINAL VERDICT (4.9.3, 2026-11-10) — the directed trial is CLOSED; the
+   open door ships:** the 4.8.17 directed experiment left the tree only as a
+   bench trial, and it failed with BOTH hosts — Windows silently ignores
+   directed packets (item 2 above), and the iPhone cannot establish through
+   a directed set at all (bench 2026-11-09: taps produced "connection
+   attempts fail" with ZERO wire events for 60 s; every host connect that
+   ever worked landed inside the ~1 s first arm or after the window closed
+   into open advertising). The window is therefore STOCK OPEN ADVERTISING
+   (`start(0)`, held by the tick's keep-open ensure) with the 4.8.12
+   bouncer as the keeper and 4.9.0's RPA resolution as the target decision —
+   the combination where a privacy host's connect can actually REACH the
+   decision logic. Bench 2026-11-10 proved the RPA admission on radio (a
+   forced iPhone reconnect 1.1 s into an open window was ADMITTED through
+   the armed IRK analysis; the exclude branch bounced the same RPA in
+   milliseconds when the Mac was the target). The vendored `startDirected`
+   stays in the library (bounded, unused by the window); this item closes
+   Q4's contingency ladder for good — every rung was built, flashed, and
+   measured, and the door that every successful connect ever rode through
+   is the one that ships.

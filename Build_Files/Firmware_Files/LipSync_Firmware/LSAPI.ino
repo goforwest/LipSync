@@ -1236,6 +1236,32 @@ void setJoystickInitialization(bool responseEnabled, bool apiEnabled) {
     printResponseInt(responseEnabled, apiEnabled, false, 3, "IN,1", true, 1);
     return;
   }
+  // 4.9.4 (round 4): the same window gate CA,1 carries — a center flow
+  // freezes the cursor and disables the joystick poll, and the switch
+  // window's tick is serviced from the main loop, so the two would run
+  // concurrently and the window's close would act on a device whose input
+  // pipeline the center flow deliberately owns. Refused with the same named
+  // note; the app retries once the window closes.
+  //
+  // 4.9.4 (round 8, fix-set audit) THE CHAIN'S OWN CALL IS EXEMPT, explicitly:
+  // the full calibration's STEP 5 runs its center through THIS function
+  // (performJoystickCalibration sets g_calibrationCenterStep around the call
+  // precisely to bypass the in-flight gate above). That call is currently
+  // unreachable while a window is open — the round-4 CA,1 gate stops a
+  // calibration from starting during a window, and the executors'
+  // calibrationRunning gate stops a window from opening during one, so the
+  // two are mutually exclusive by construction. But this gate sits BELOW the
+  // g_calibrationCenterStep bypass check, so if that mutual exclusion is ever
+  // relaxed (a future caller, a re-ordered gate), step 5 would be refused
+  // mid-run, g_centerRunning would stay false, and the chain would abort with
+  // "center step refused" — a calibration that cannot complete, with the
+  // cause three gates away. Honor the same exemption here so the chain's
+  // internal call is never the one refused.
+  if (lsHostSwitchWindowOpen() && !g_calibrationCenterStep) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "IN,1", true, 1);
+    serialTxEnqueueLine("ERROR: IN,1 refused: a Bluetooth switch window owns the radio — retry once it closes");
+    return;
+  }
   // Record who initiated the center (4.5.2, wire hygiene): the completion's
   // IN,1 line is an ack (SUCCESS) only when the serial API asked for it —
   // a device-initiated center (boot auto-center, Hub-menu Center Reset,
@@ -1410,6 +1436,29 @@ void setJoystickCalibration(bool responseEnabled, bool apiEnabled) {
   // the shared corner slots. Refuse honestly; the running chain finishes.
   if (g_calibrationRunning || g_centerRunning) {
     printResponseInt(responseEnabled, apiEnabled, false, 3, "CA,1", true, 1);
+    return;
+  }
+  // 4.9.4 (round 4, the symmetric half of the calibration gate): lsHostExecuteSwitch
+  // and lsHostExecuteForget both refuse while a calibration/center flow is in
+  // flight (calibrationRunning), but the REVERSE was never true — a CA,1:1
+  // landing while a switch window is open was accepted. The two then ran
+  // CONCURRENTLY: the window tick is serviced from the MAIN LOOP
+  // (lsHostServiceSwitchWindow) and from btFeedbackLoop's poll, neither of
+  // which calibration disables, while calibration step 0 shuts down the
+  // joystick/scroll/input/pressure polls and holds canOutputAction false with
+  // the cursor frozen. The window could therefore close mid-calibration —
+  // admitting the target, painting LED state and (on the success path)
+  // running the close's radio/LED work against a device whose input pipeline
+  // is deliberately down, and the user's held corner pose would be sampled by
+  // a sensor poll that is supposed to be off. Calibration is also the flow
+  // that OWNS the joystick, so racing it against a radio switch has no honest
+  // resolution: refuse, exactly as the switch refuses calibration, and let the
+  // app retry once the window's bound elapses (60 s worst case) or the target
+  // takes the link. The named note mirrors lsHostRefusalLine's calibration
+  // wording so both directions read the same on the wire.
+  if (lsHostSwitchWindowOpen()) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "CA,1", true, 1);
+    serialTxEnqueueLine("ERROR: CA,1 refused: a Bluetooth switch window owns the radio — retry once it closes");
     return;
   }
   // Set at ACCEPTANCE, not at step 0 (4.5.7 review): the chain starts
@@ -4762,13 +4811,49 @@ void enterUpdateMode(bool responseEnabled, bool apiEnabled) {
   // already hold the confirmation when the port departs. The bounded dwell
   // then gives the ack time to reach the host and the splash's framebuffer
   // push time to complete before the OLED loses its driver.
+  //
+  // 4.9.4 (round 5, the ownership sweep continued): close any OPEN SWITCH
+  // WINDOW before the reset. A window holds live radio state that a reset
+  // does not unwind cleanly — g_switchWindowOpen true, the stock
+  // DISCONNECTED auto-restart SUSPENDED (lsHostSuspendAutoRestart), an armed
+  // target IRK and a bounce counter — and the window's own deferred-
+  // advertising-restart flag (g_switchAdvRestartPending) is armed for a
+  // radio that is about to vanish. Worse, the window's tick and the DFU
+  // magic write both own the retention registers: the window path writes
+  // GPREGRET2 while enterUpdateMode writes GPREGRET via the DFU magic, and a
+  // bounce landing in the dwell could enqueue INFO lines over the ack's
+  // frame. Closing the window first restores the stock radio state
+  // (auto-restart re-armed, open advertising resumed when nothing is
+  // connected) so the reset happens from exactly the state a normal UM does.
+  // Deliberately BEFORE the ack: a close that resumed advertising is
+  // invisible to the host, but an ack followed by radio work could interleave
+  // on the wire.
+  if (lsHostSwitchWindowOpen()) {
+    lsHostCloseSwitchWindow();
+  }
+
   printResponseInt(responseEnabled, apiEnabled, true, 0, "UM,1", true, 1);
 
   if (g_displayConnected) {
     screen.updateModePage();
   }
 
-  delay(CONF_UPDATE_MODE_DWELL_MS);
+  // 4.9.4: the dwell must DRAIN the response queue — the same fix 4.9.1 gave
+  // softwareReset()'s dwell, back-ported to the one reset path it missed. The
+  // UM,1 ack above rides the TX queue like every other response: with a host
+  // that stopped reading the IN pipe (or a full CDC FIFO), serialTxService
+  // wrote 0 bytes and the reset below killed the queue with the ack still in
+  // it — the port dropped with no response, and the app cannot distinguish
+  // "entering the bootloader" from a refused/dead command (its update flow
+  // keys the bootloader hand-off on this ack). Servicing every 10 ms hands
+  // the queue the whole dwell.
+  {
+    const unsigned long updateDwellDeadlineMs = millis() + CONF_UPDATE_MODE_DWELL_MS;
+    while ((long)(updateDwellDeadlineMs - millis()) > 0) {
+      serialTxService();
+      delay(10);
+    }
+  }
 
   // THE ARMED WATCHDOG SURVIVES THE RESET (4.9.0 — the DFU class): the WDT
   // cannot be stopped and survives warm resets (the inherited-instance feed

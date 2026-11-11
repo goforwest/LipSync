@@ -528,6 +528,37 @@ static void test_host_row_identity_matches() {
   CHECK(lsHostRowIdentityMatches(&row, "a1b2c3d4e5f6") == 0);
 }
 
+// 4.9.4: the bouncer's teardown horizon is measured from the BOUNCE, not the
+// connect. The bug this pins: a non-target bounced LATE (an undecidable RPA
+// peer waits out the 3 s decision grace first) had its 12 s horizon largely
+// consumed before the bounce even dispatched, so a slow teardown tripped the
+// refused-disconnect re-decide and re-counted the same dying connection.
+static void test_bounce_teardown_horizon_is_from_dispatch() {
+  const unsigned long HORIZON = 3000UL * 4UL;  // LSHOST_BOUNCE_DECISION_GRACE_MS * 4
+
+  // Freshly bounced: teardown is definitely still running.
+  CHECK(lsHostBounceTeardownStillRunning(0, HORIZON) == 1);
+  CHECK(lsHostBounceTeardownStillRunning(HORIZON - 1, HORIZON) == 1);
+
+  // At and past the horizon the hatch opens — the refused-disconnect escape.
+  CHECK(lsHostBounceTeardownStillRunning(HORIZON, HORIZON) == 0);
+  CHECK(lsHostBounceTeardownStillRunning(HORIZON + 1, HORIZON) == 0);
+
+  // The regression itself: a connection bounced at t=3 s (after the grace)
+  // and re-checked 1 s later is 1 s into its HORIZON, not 4 s into it. Under
+  // the old connect-keyed math this read as (3000+1000)-0 >= 12000? No —
+  // but at 10 s after connect it did, one second after the bounce. Pin the
+  // dispatch-relative answer for that exact shape: still tearing down.
+  const unsigned long connectToBounceMs = 3000UL;
+  const unsigned long sinceConnect = connectToBounceMs + 1000UL;  // 1 s after the bounce
+  CHECK(lsHostBounceTeardownStillRunning(sinceConnect - connectToBounceMs, HORIZON) == 1);
+
+  // And the same instant measured from CONNECT (the old, wrong anchor) is
+  // well past a 4 s comparison — demonstrating the two anchors disagree,
+  // which is the whole point of the fix.
+  CHECK(lsHostBounceTeardownStillRunning(sinceConnect, 4000UL) == 0);
+}
+
 int main() {
   static_assert(!std::is_copy_constructible<LSCircularBuffer<int>>::value,
                 "owning circular buffers must not be shallow-copyable");
@@ -548,6 +579,7 @@ int main() {
   test_host_forget_decision_allows_active();
   test_host_row_identity_matches();
   test_host_rpa_admission_helpers();
+  test_bounce_teardown_horizon_is_from_dispatch();
 
   std::printf("%d checks, %d failures\n", checks, failures);
   return failures == 0 ? 0 : 1;

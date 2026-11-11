@@ -798,6 +798,7 @@ static bool g_switchBouncedActive = false;
 static uint16_t g_switchBouncedHdl = 0xFFFF;
 static unsigned long g_switchBouncedConnectMs = 0;  // first tick observation of the tracked handle
 static bool g_switchBounceCounted = false;          // the tracked handle's bounce already fired (same-handle passes are teardown, not new connections)
+static unsigned long g_switchBounceDispatchedMs = 0; // 4.9.4: when the tracked handle's bounce actually dispatched (0 = none yet) — the teardown horizon is measured from here, not from connect
 // (4.9.0 round-3 review) DEFERRED ADVERTISING RESTART: a window ending can
 // land in the sub-second gap where the directed set has self-terminated but
 // the SD's ADV_SET_TERMINATED event has not been dispatched — the lib's
@@ -1041,6 +1042,7 @@ uint32_t lsHostBeginSwitchWindow(void) {
     g_switchBouncedActive = false;
     g_switchBouncedHdl = 0xFFFF;
     g_switchBounceCounted = false;
+    g_switchBounceDispatchedMs = 0;  // 4.9.4: horizon anchor clears with its connection tracking
     g_switchAdvRestartPending = false;  // the window owns the radio now
     return NRF_SUCCESS;
   }
@@ -1070,6 +1072,7 @@ void lsHostCancelSwitchWindow(void) {
   g_switchBouncedActive = false;
   g_switchBouncedHdl = 0xFFFF;
   g_switchBounceCounted = false;
+  g_switchBounceDispatchedMs = 0;  // 4.9.4: horizon anchor clears with its connection tracking
   g_switchTargetIrkValid = false;
   (void)Bluefruit.Advertising.stop();
   lsHostRestoreAutoRestart();
@@ -1101,6 +1104,7 @@ void lsHostCloseSwitchWindow(void) {
   g_switchBouncedActive = false;
   g_switchBouncedHdl = 0xFFFF;
   g_switchBounceCounted = false;
+  g_switchBounceDispatchedMs = 0;  // 4.9.4: horizon anchor clears with its connection tracking
   g_switchTargetIrkValid = false;
   (void)Bluefruit.Advertising.stop();  // window set; harmless if the SD already terminated it (rc ignored on purpose: the deferred-restart flag below covers a stale-run refusal)
   lsHostRestoreAutoRestart();
@@ -1292,7 +1296,27 @@ int lsHostSwitchWindowTick(void) {
         // the link for the window's remainder). Clear the tracking; the next
         // pass re-decides it as a fresh connection, still bounded by the
         // bounce cap.
-        if (millis() - g_switchBouncedConnectMs < LSHOST_BOUNCE_DECISION_GRACE_MS * 4UL) {
+        // 4.9.4: the horizon is measured from the BOUNCE, not from the
+        // connect. It used to key on g_switchBouncedConnectMs (set once at
+        // first observation), so a NON-target that connected, sat through
+        // the undecidable-RPA grace, and was then bounced at ~3 s had only
+        // ~9 s of horizon left — and ANY non-target whose teardown ran past
+        // 12 s from connect (a slow/loaded peer, or a bounce that landed
+        // late in the grace) tripped the re-decide while its ORIGINAL
+        // connection was still tearing down. That re-decide is meant for a
+        // REFUSED disconnect only; on a SUCCESSFUL bounce it re-counts and
+        // re-disconnects the same dying connection, inflating the bounce
+        // counter toward LSHOST_BOUNCE_MAX (600) — whose only exit is the
+        // MISMATCH close, i.e. the honest NOT-confirmed report for a switch
+        // the bouncer was still legitimately holding. Stamp the moment the
+        // bounce actually dispatched (falling back to the connect stamp for
+        // a connection that reached this branch already counted) and measure
+        // the horizon from there.
+        const unsigned long bounceHorizonStartMs = g_switchBounceDispatchedMs
+                                                   ? g_switchBounceDispatchedMs
+                                                   : g_switchBouncedConnectMs;
+        if (lsHostBounceTeardownStillRunning(millis() - bounceHorizonStartMs,
+                                             LSHOST_BOUNCE_DECISION_GRACE_MS * 4UL)) {
           // teardown in progress — wait it out quietly (the bound still applies)
           return lsHostSwitchWindowBoundExpired() ? -1 : 0;
         }
@@ -1312,6 +1336,7 @@ int lsHostSwitchWindowTick(void) {
       // exactly once, then the teardown-skip above owns its same-handle
       // passes.
       g_switchBounceCounted = true;
+      g_switchBounceDispatchedMs = millis();  // 4.9.4: the teardown horizon starts at the bounce, not at the connect
       if (g_switchBounceCount < LSHOST_BOUNCE_MAX) {
         g_switchBounceCount++;
         if (g_switchBounceCount <= 3 || (g_switchBounceCount % 20) == 0) {
@@ -1355,6 +1380,7 @@ int lsHostSwitchWindowTick(void) {
   } else {
     g_switchBouncedActive = false;  // link empty — the next connect is a NEW connection
     g_switchBounceCounted = false;
+    g_switchBounceDispatchedMs = 0;  // 4.9.4: horizon anchor clears with its connection tracking
   }
 
   if (g_switchWindowStartMs != 0
@@ -1363,10 +1389,20 @@ int lsHostSwitchWindowTick(void) {
     return -1;  // timed out — open advertising resumed by the close
   }
   // Keep-open (4.9.3): the window IS stock open advertising (start(0) runs
-  // forever) — this re-ensures it if anything stopped it mid-window (an
-  // FP_ANY handler restart, a close race). Idempotent; no directed re-arms.
+  // forever) — this re-ensures it if anything stopped it mid-window. The
+  // LIVE case is the bouncer's own bounce: a non-target connect stops the
+  // advertising set (the connection takes the radio role), the disconnect
+  // frees it, and the stock DISCONNECTED auto-restart is SUSPENDED for the
+  // whole window lifecycle (lsHostSuspendAutoRestart) — without this branch
+  // the radio sits dark for the window's remainder and the target can never
+  // connect (4.9.4 review: the branch called lsHostEnsureAdvertising(), whose
+  // first guard REFUSES while a window is open — a 4.9.0 directed-era rule
+  // whose rationale, "do not fill the directed set's inter-arm gap with open
+  // advertising", no longer applies to the open-window shape and which made
+  // the keep-open a silent no-op. Start the set here directly: while this
+  // window is open, open advertising IS the window).
   if (!Bluefruit.Advertising.isRunning() && !Bluefruit.connected()) {
-    lsHostEnsureAdvertising();
+    (void)Bluefruit.Advertising.start(0);  // rc immaterial — the tick retries every pass
   }
   return 0;  // still waiting
 }

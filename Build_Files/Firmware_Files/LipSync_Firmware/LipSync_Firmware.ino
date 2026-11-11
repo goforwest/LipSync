@@ -4673,11 +4673,67 @@ void btFeedbackLoop() {
   // Get the current bluetooth connection state
   bool tempIsConnected = btmouse.isConnected();
 
-  if (!tempIsConnected && (outputAction == CONF_ACTION_DRAG || outputAction == CONF_ACTION_SCROLL)) {
+  // 4.9.4 (round 3, cross-module): a SWITCH WINDOW is not a host change. While
+  // the bouncer holds the lockout, every non-target reconnect is deliberately
+  // connected-then-dropped within milliseconds — and this 1 s poll cannot tell
+  // that storm from real host transitions. Ungated, each bounce cycle drove
+  // the full transition narration: the scan-blink timer armed and deleted
+  // repeatedly (LED churn on a device whose user is watching the Hub for the
+  // switch to complete), g_btIsConnected thrashed, and — the part that
+  // matters — releaseOutputAction() fired on every transient drop, tearing
+  // down a DRAG/SCROLL latch the window's own lsHostExecuteSwitch had already
+  // released once. Worse, the push half (lsHostPushState below) narrated
+  // bouncer traffic to the app as if the user had changed hosts.
+  // The window's own tick owns connection decisions for its whole duration
+  // (it bounces non-targets, admits the target and closes), and the close
+  // path restores stock radio state — so the honest thing is to let the
+  // window own the narration too and resync once, on the pass after it
+  // closes. isConnected is still polled (the drag-latch guard below is
+  // meaningful only against real state) but the transition bookkeeping is
+  // suppressed while a window is open, and g_btIsConnected is re-synced on
+  // the first pass after the window ends so the close is not mistaken for a
+  // fresh transition.
+  const bool switchWindowOpen = lsHostSwitchWindowOpen();
+  static bool switchWindowWasOpen = false;
+  // 4.9.4 (round 6, a defect in this gate's own first draft): the resync must
+  // REPAINT, not merely adopt. Setting g_btIsConnected here made the
+  // transition block below see "no change" on the very pass that follows the
+  // window — so the LED kept whatever the window's last bounce/close left it
+  // showing, with nothing in the steady state to repaint it (the 4.5.28
+  // dark-until-unrelated-event class, reintroduced by this gate). Adopt the
+  // settled state AND drive the LED to match it on this one pass: solid blue
+  // when the target is connected, the scanning blink when it is not. The
+  // transition bookkeeping is still not replayed — this is one direct paint
+  // from the settled truth, not a replay of the storm's transitions.
+  const bool windowJustEnded = (switchWindowWasOpen && !switchWindowOpen);
+  if (windowJustEnded) {
+    g_btIsConnected = tempIsConnected;
+    if (ledTimerId[CONF_TIMER_LED_BT] >= 0) {
+      ledStateTimer.deleteTimer(ledTimerId[CONF_TIMER_LED_BT]);
+      ledTimerId[CONF_TIMER_LED_BT] = -1;
+    }
+    if (tempIsConnected) {
+      led.setLedColor(CONF_BT_LED_NUMBER, LED_CLR_BLUE, led.getLedBrightness());
+    } else {
+      setLedDefault();  // no host — hand the LED back to the default path
+    }
+  }
+  switchWindowWasOpen = switchWindowOpen;
+
+  if (!switchWindowOpen && !tempIsConnected && (outputAction == CONF_ACTION_DRAG || outputAction == CONF_ACTION_SCROLL)) {
     releaseOutputAction();  // Never carry a drag/scroll latch across hosts
   }
 
   //if (USB_DEBUG) { Serial.println(tempIsConnected); }
+  // 4.9.4 (round 3): the LED transition narration is suppressed for the
+  // window's duration — see the switch-window gate above. A bounce is not a
+  // host departure, and painting "disconnected / scanning" at the user while
+  // they wait for the switch to complete (then repainting on the next cycle)
+  // is narration of the lockout working, not of the device's state.
+  if (switchWindowOpen) {
+    // The window owns connection decisions; skip the transition block
+    // entirely but still run the watchdog/push/tick below.
+  } else
   // Perform Bluetooth LED blinking if Bluetooth is not connected and wasn't connected before
   if (g_comMode == CONF_COM_MODE_BLE && tempIsConnected == false && tempIsConnected == g_btIsConnected) {
     g_btIsConnected = false;
@@ -4729,7 +4785,17 @@ void btFeedbackLoop() {
   // boot prime keeps the first pass silent, and the change-detect keeps every
   // pass after it silent until something actually changes (the 4.5.29
   // healthy-boots-print-nothing contract; the CH,5 pattern).
-  lsHostPushState();
+  // 4.9.4 (round 3): suppressed while a switch window is open — during the
+  // bouncer's connect/drop storm the ACTIVE ROW flaps (the bounced non-target
+  // is briefly the connected-but-unbonded peer, then nothing, then the target
+  // on success), so an ungated push narrated the lockout to the app as a
+  // series of host changes and left the app's active marker depending on
+  // which microsecond its poll landed in. The window's close path restores
+  // stock radio state, and the next pass after it re-pushes the settled
+  // truth through the normal change-detect.
+  if (!switchWindowOpen) {
+    lsHostPushState();
+  }
 
   // HID-subscription watchdog (4.8.18, the bench 2026-11-07 "connected but
   // deaf" class): a bonded link whose HID subscription never re-enables is
@@ -4743,6 +4809,32 @@ void btFeedbackLoop() {
   // Window state (g_switchWindowOpen) is guarded by the loop task only.
   int w = lsHostSwitchWindowTick();
   (void)w;
+
+  // 4.9.4 (round 7, fix-set audit): the tick above can CLOSE the window on
+  // this very pass (target admitted, bound elapsed, bounce cap hit) — and this
+  // pass's gate read the PRE-tick state, so the window-end reconciliation
+  // (the LED repaint and the host-table push) could only ever happen on the
+  // NEXT 1 s pass. The damage is bounded — lsHostPushState is change-detected
+  // against persisted values, so a delayed push still lands, and the repaint
+  // likewise lands one pass later — but the three consumers inside ONE pass
+  // disagreed about whether a window was open, which is exactly the kind of
+  // split-state the gate exists to eliminate. Re-evaluate after the tick so
+  // the pass ends with every consumer agreeing, and run the reconciliation
+  // immediately when this pass is the one that ended the window.
+  if (switchWindowWasOpen && !lsHostSwitchWindowOpen()) {
+    g_btIsConnected = btmouse.isConnected();
+    if (ledTimerId[CONF_TIMER_LED_BT] >= 0) {
+      ledStateTimer.deleteTimer(ledTimerId[CONF_TIMER_LED_BT]);
+      ledTimerId[CONF_TIMER_LED_BT] = -1;
+    }
+    if (g_btIsConnected) {
+      led.setLedColor(CONF_BT_LED_NUMBER, LED_CLR_BLUE, led.getLedBrightness());
+    } else {
+      setLedDefault();
+    }
+    switchWindowWasOpen = false;
+    lsHostPushState();  // the settled truth, pushed from the pass that settled it
+  }
 
   //if (USB_DEBUG) { Serial.println("USBDEBUG: end of btFeedbackLoop"); }
 }
@@ -4804,6 +4896,25 @@ void softwareReset() {
   if (USB_DEBUG) { Serial.println("USBDEBUG: softwareReset()"); }
   g_shutdownInProgress = true;
   bootTrailStamp(5);  // witness v7: a software reset is starting — the next boot's pt=5 names this path
+
+  // 4.9.4 (round 5, the ownership sweep): close any OPEN SWITCH WINDOW before
+  // tearing the radio down. This is the SHARED reset path (CM/MP/SR/RS/FR and
+  // both menu resets all funnel here), and every one of them can fire while a
+  // window is open — the window's bound is 60 s, so a user who starts a
+  // switch and then changes mode (or a remote app that resets) would otherwise
+  // reset out from under live window state: g_switchWindowOpen still true, the
+  // stock DISCONNECTED auto-restart still SUSPENDED (lsHostSuspendAutoRestart),
+  // an armed target IRK, a bounce counter, and a deferred-advertising-restart
+  // flag armed for a radio that is about to vanish. btmouse.end() below then
+  // tears down the stack the window was mid-flight against, and the window's
+  // pending INFO lines can interleave with the shutdown page's own output.
+  // Closing first restores the stock radio state, so the reset happens from
+  // exactly the state a normal reset does. Placed BEFORE the teardown calls
+  // (not after) so the window never observes a half-dead stack.
+  if (lsHostSwitchWindowOpen()) {
+    lsHostCloseSwitchWindow();
+  }
+
   screen.restartPage();
   buzzer.playShutdownSound();
 

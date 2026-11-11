@@ -204,4 +204,32 @@ static inline int lsHostRpaHashMatches(const unsigned char peerAddr[6], const un
       && peerAddr[2] == cipherBe[13];
 }
 
+/* Teardown-horizon decision for the bouncer's same-handle tracking (4.9.4).
+ *
+ * A bounced non-target's handle lingers while the SoftDevice tears the link
+ * down; while it does, the tick must skip quietly (4.8.16: one connection =
+ * one bounce). The 4.9.0 escape hatch re-decides a handle that lingers too
+ * long, so a REFUSED disconnect can never surrender the lockout forever.
+ *
+ * That horizon must be measured from the BOUNCE, not from the connect. The
+ * original form keyed on the connect stamp under a 4x-grace (12 s) horizon,
+ * which is wrong in two ways for a connection that was bounced LATE — an
+ * undecidable RPA peer sits through the 3 s decision grace first, and any
+ * slow/loaded peer can outlive the remainder. The re-decide then fires while
+ * the ORIGINAL connection is still tearing down, re-counting and
+ * re-disconnecting the same dying link: the bounce counter races toward its
+ * cap (600), and the cap's only exit is the MISMATCH close — an honest
+ * "switch NOT confirmed" report for a window the bouncer was still
+ * legitimately holding.
+ *
+ * dispatchedMs == 0 (never bounced, or the stamp was cleared with its
+ * tracking) falls back to the connect stamp, preserving the pre-4.9.4
+ * behavior for the refused-disconnect case the hatch exists for.
+ * elapsedMs is the caller's (millis() - horizonStart); wrap-safe because the
+ * caller subtracts in unsigned arithmetic.
+ */
+static inline int lsHostBounceTeardownStillRunning(unsigned long elapsedMs, unsigned long horizonMs) {
+  return elapsedMs < horizonMs;
+}
+
 #endif  // LSHOST_SWITCH_H

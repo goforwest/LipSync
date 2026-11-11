@@ -15,24 +15,22 @@ def read_and_save_to_file(serial_port, baud_rate=115200):
     # Open serial port
     ser = serial.Serial(serial_port, baud_rate, timeout=1)
 
+    # Generate a timestamp for the current date and time and construct the
+    # filename from it — one file per run, named when the capture starts.
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    file_path = f'serial_data_{timestamp}.txt'
+
     try:
-        while True:
-            # Generate a timestamp for the current date and time
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        with open(file_path, 'w') as file:
+            while True:
+                # Read a line from the serial port
+                line = ser.readline().decode('utf-8').strip()
 
-            # Construct the filename using the timestamp
-            file_path = f'serial_data_{timestamp}.txt'
+                # Print the line to console (optional)
+                print(line)
 
-            with open(file_path, 'w') as file:
-                while True:
-                    # Read a line from the serial port
-                    line = ser.readline().decode('utf-8').strip()
-
-                    # Print the line to console (optional)
-                    print(line)
-
-                    # Write the line to the file
-                    file.write(line + '\n')
+                # Write the line to the file
+                file.write(line + '\n')
 
     except KeyboardInterrupt:
         # Handle keyboard interrupt (Ctrl+C)
