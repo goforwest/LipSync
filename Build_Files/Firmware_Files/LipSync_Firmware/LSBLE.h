@@ -1283,6 +1283,7 @@ int lsHostSwitchWindowTick(void) {
         g_switchBouncedHdl = nonTargetHdl;
         g_switchBouncedConnectMs = millis();
         g_switchBounceCounted = false;
+        g_switchBounceDispatchedMs = 0;  // 4.9.5: the anchor clears with its tracking here too — the prior connection's stamp must never outlive it (it is unreadable while Counted is false, but the invariant should not depend on that)
       }
       if (g_switchBounceCounted) {
         // Already bounced: the same handle still present is this connection
@@ -1308,13 +1309,13 @@ int lsHostSwitchWindowTick(void) {
         // re-disconnects the same dying connection, inflating the bounce
         // counter toward LSHOST_BOUNCE_MAX (600) — whose only exit is the
         // MISMATCH close, i.e. the honest NOT-confirmed report for a switch
-        // the bouncer was still legitimately holding. Stamp the moment the
-        // bounce actually dispatched (falling back to the connect stamp for
-        // a connection that reached this branch already counted) and measure
-        // the horizon from there.
-        const unsigned long bounceHorizonStartMs = g_switchBounceDispatchedMs
-                                                   ? g_switchBounceDispatchedMs
-                                                   : g_switchBouncedConnectMs;
+        // the bouncer was still legitimately holding. Anchor: the dispatch
+        // stamp (4.9.5 correction — the stamp is taken at the decision point,
+        // BEFORE the disconnect attempt, so a REFUSED disconnect is also
+        // dispatch-anchored; the connect-stamp fallback inside
+        // lsHostBounceHorizonAnchor is only the millis()==0 wrap-tick guard).
+        const unsigned long bounceHorizonStartMs = lsHostBounceHorizonAnchor(g_switchBounceDispatchedMs,
+                                                                            g_switchBouncedConnectMs);
         if (lsHostBounceTeardownStillRunning(millis() - bounceHorizonStartMs,
                                              LSHOST_BOUNCE_DECISION_GRACE_MS * 4UL)) {
           // teardown in progress — wait it out quietly (the bound still applies)

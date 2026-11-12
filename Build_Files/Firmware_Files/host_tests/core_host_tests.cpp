@@ -559,6 +559,27 @@ static void test_bounce_teardown_horizon_is_from_dispatch() {
   CHECK(lsHostBounceTeardownStillRunning(sinceConnect, 4000UL) == 0);
 }
 
+// 4.9.5 (final-diff-audit): pin the SHIPPED anchor selection, not just the
+// comparison helper. The 4.9.4 notes claimed the connect-stamp fallback
+// served "the refused-disconnect case the hatch is for" — it does not: the
+// stamp is taken at the decision point BEFORE the disconnect attempt, so a
+// refused disconnect is also dispatch-anchored, and the fallback is only the
+// millis()==0 wrap-tick guard.
+static void test_bounce_horizon_anchor_selection() {
+  // Normal dispatch: the dispatched stamp wins, whatever the connect stamp is.
+  CHECK(lsHostBounceHorizonAnchor(1000UL, 0UL) == 1000UL);
+  CHECK(lsHostBounceHorizonAnchor(4000UL, 1000UL) == 4000UL);
+
+  // Wrap-tick guard: a dispatch landing exactly on millis()==0 falls back to
+  // the connect stamp (the pre-4.9.4 anchor for that one connection).
+  CHECK(lsHostBounceHorizonAnchor(0UL, 3000UL) == 3000UL);
+
+  // Both zero (never bounced, wrap-tick at connect): the anchor is 0 — the
+  // caller's unsigned subtraction then measures from the wrap, which is the
+  // honest reading of that degenerate state.
+  CHECK(lsHostBounceHorizonAnchor(0UL, 0UL) == 0UL);
+}
+
 int main() {
   static_assert(!std::is_copy_constructible<LSCircularBuffer<int>>::value,
                 "owning circular buffers must not be shallow-copyable");
@@ -580,6 +601,7 @@ int main() {
   test_host_row_identity_matches();
   test_host_rpa_admission_helpers();
   test_bounce_teardown_horizon_is_from_dispatch();
+  test_bounce_horizon_anchor_selection();
 
   std::printf("%d checks, %d failures\n", checks, failures);
   return failures == 0 ? 0 : 1;

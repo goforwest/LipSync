@@ -1241,7 +1241,10 @@ void setJoystickInitialization(bool responseEnabled, bool apiEnabled) {
   // window's tick is serviced from the main loop, so the two would run
   // concurrently and the window's close would act on a device whose input
   // pipeline the center flow deliberately owns. Refused with the same named
-  // note; the app retries once the window closes.
+  // note; the app's waiter surfaces the refusal as a clean error and the
+  // retry is manual (re-run the calibration once the window closes — the
+  // final-diff-audit corrected this comment's claim of an automatic retry;
+  // sendCommand is one-shot).
   //
   // 4.9.4 (round 8, fix-set audit) THE CHAIN'S OWN CALL IS EXEMPT, explicitly:
   // the full calibration's STEP 5 runs its center through THIS function
@@ -1452,10 +1455,12 @@ void setJoystickCalibration(bool responseEnabled, bool apiEnabled) {
   // is deliberately down, and the user's held corner pose would be sampled by
   // a sensor poll that is supposed to be off. Calibration is also the flow
   // that OWNS the joystick, so racing it against a radio switch has no honest
-  // resolution: refuse, exactly as the switch refuses calibration, and let the
-  // app retry once the window's bound elapses (60 s worst case) or the target
-  // takes the link. The named note mirrors lsHostRefusalLine's calibration
-  // wording so both directions read the same on the wire.
+  // resolution: refuse, exactly as the switch refuses calibration. The
+  // app's CA,1 waiter surfaces the refusal as a clean error (the fail-fast
+  // abort contract); the retry is manual once the window's bound elapses
+  // (60 s worst case) or the target takes the link. The named note mirrors
+  // lsHostRefusalLine's calibration wording so both directions read the same
+  // on the wire.
   if (lsHostSwitchWindowOpen()) {
     printResponseInt(responseEnabled, apiEnabled, false, 3, "CA,1", true, 1);
     serialTxEnqueueLine("ERROR: CA,1 refused: a Bluetooth switch window owns the radio — retry once it closes");

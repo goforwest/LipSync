@@ -4720,8 +4720,44 @@ void btFeedbackLoop() {
   }
   switchWindowWasOpen = switchWindowOpen;
 
+  // (4.9.4 round 3) Never carry a drag/scroll latch across hosts — but the
+  // 4.9.4 final-diff-audit (minor, confirmed) showed the round-3 window gate
+  // reintroduced the exact class it was written to bound, by a different route:
+  // the guard below is suppressed for the WHOLE window, the input polls stay
+  // live, so a gesture engaged MID-WINDOW armed the latch while the guard was
+  // down — and on the SUCCESS path (target admitted) tempIsConnected is true
+  // on every later pass, so the latch crossed into the new host and swallowed
+  // its first input (the SCROLL half unguarded end-to-end: cursorScroll sets
+  // no wire state, so the take-and-clear disconnect-cleanup flag never raises;
+  // DRAG was mostly caught by that flag within one main-loop pass). Two
+  // triggers, each covering what the other misses:
+  //   (a) the original disconnected-state guard — the pre-4.9.4 behavior for
+  //       every non-window path, unchanged;
+  //   (b) a HOST-IDENTITY edge (4.9.5): the connected host's MAC changed —
+  //       none->target at admission, racer->none->target through the bounce
+  //       storm, or host->host across a sub-second switch whose whole window
+  //       fits between two 1 s polls (an ordering the reconciliation statics
+  //       never observe). The key cannot reintroduce the bounce-storm churn
+  //       the gate fixed: it flaps during bounces only while a latch is
+  //       HELD, and the first edge releases it (outputAction -> NOTHING), so
+  //       later flaps are no-ops and the LED/push narration stays suppressed.
+  //   (b) releases through cancelSapOutputHold() — LED default paired with
+  //       the release, matching the sensor-fault and unmount mirrors (the
+  //       hold's window color must not outlive the latch). No action-bearing
+  //       event either way.
   if (!switchWindowOpen && !tempIsConnected && (outputAction == CONF_ACTION_DRAG || outputAction == CONF_ACTION_SCROLL)) {
-    releaseOutputAction();  // Never carry a drag/scroll latch across hosts
+    releaseOutputAction();  // (a) disconnected with a held latch (never in a window — see the gate)
+  }
+  static char s_latchGuardHostMac[LSHOST_MAC_CHARS + 1] = "";
+  char activeHostMac[LSHOST_MAC_CHARS + 1];
+  const bool haveActiveHost = lsHostActiveMac(activeHostMac);  // bounded stack query, no FS; false in USB mode / pre-init
+  const char* currentHostKey = haveActiveHost ? activeHostMac : "";
+  if (strcmp(currentHostKey, s_latchGuardHostMac) != 0) {
+    strncpy(s_latchGuardHostMac, currentHostKey, sizeof(s_latchGuardHostMac) - 1);
+    s_latchGuardHostMac[sizeof(s_latchGuardHostMac) - 1] = '\0';
+    if (outputAction == CONF_ACTION_DRAG || outputAction == CONF_ACTION_SCROLL) {
+      cancelSapOutputHold();  // (b) the connected host changed — the latch must not cross
+    }
   }
 
   //if (USB_DEBUG) { Serial.println(tempIsConnected); }
