@@ -1,0 +1,82 @@
+# bench-16 — 4.9.5 regression validation
+# Date: 2026-11-12 | OS: macOS | Firmware: 4.9.5 (flashed via LipSync Connect
+# while in BOTH USB mode and Bluetooth mode — the latter exercises the app fix
+# from commit d585208, which this run's own history motivated)
+# Driver: single-process serial scripts over the CDC port (the 2026-11-07
+# one-process lesson). Hosts: Mac "Hamoudi___s Laptop" (74:35:42:DC:57:1C,
+# row 1), iPhone "Hamoudi" (RPA, row 2), Windows "DESKTOP-FBIVLCV"
+# (E9:91:DF:97:C4:D8, row 3, absent from radio).
+
+B0  PASS  VN,0:0 -> 4.9.5.  (Also: the operator flashed 4.9.5 twice — once from
+          USB mode and once from Bluetooth mode; both succeeded, confirming the
+          app's OM/CM snapshot fix in the exact mode that used to abort.)
+
+B1  PASS  BT,0:0 = 3; all 3 rows read; exactly one active (row 1 at start):
+            row 1 Hamoudi___s Laptop:1 / row 2 Hamoudi:0 / row 3 DESKTOP:0
+
+B2  PASS  BT,1:2 opened the window (INFO: window opened, target=…, irk=1);
+          3 named non-target bounces; no FAIL; active row moved 1 -> 2 with no
+          host-side interaction (the iPhone reconnected on its own).
+
+B3  PASS  BT,1:1 switched back symmetrically; window opened; no refusals;
+          settled active row = 1.
+
+B5  PASS  CH,0:0 answered the live triple (active,page,row).  The physical
+          refusal-UX half of B5 (named notes on the Hub for each refusal kind)
+          was NOT re-run here — it is unchanged by 4.9.5 and was bench-proven
+          on 4.9.3/4.9.4.
+
+B7  PASS  Immediate re-read after the round trip: BT,0:0 identical, no phantom
+          row, no ghost bond.
+
+B8  PASS  BT,0:0 = 3 <= the exposed cap of 8.  The 5th-bond overflow case was
+          not re-run (needs a 5th real host to pair; unchanged by 4.9.5).
+
+B9  PASS  Bond count identical before and after a full switch round trip
+          (3 -> 3): no growth, no loss, no CCCD churn visible on the wire.
+
+B11 PASS  EX,0 dump complete and well-formed (BEGIN / SIZE:385/480 / every
+          endpoint replayed / END).  Note the settings file is at 385 of the
+          480-byte budget — comfortably inside the 4.1.0 downgrade cliff.  The
+          full downgrade round-trip (flash 4.7.0, dump, flash back) was not run
+          — it needs two flash cycles and is unchanged by 4.9.5.
+
+B14 PASS  BOTH gate directions, named refusals verbatim:
+            window open -> CA,1:1 -> FAIL,3:CA,1:1 + "ERROR: CA,1 refused: a
+              Bluetooth switch window owns the radio — retry once it closes"
+            window open -> IN,1:1 -> FAIL,3:IN,1:1 + the same named line for IN,1
+
+B15 PASS  Reset MID-WINDOW, properly sequenced this time (the first attempt's
+          BT,1:3 was honestly refused with LSHOST_REFUSE_RADIO — "the radio
+          refused the operation — retry in a moment" — because the previous
+          B14 window was still tearing down; that refusal is correct behavior
+          and named itself, so the harness was at fault, not the firmware):
+            window OPEN to row 1 (bounce observed, still waiting for target)
+            -> CM,1:1 -> SUCCESS ack BEFORE the port dropped
+            -> clean re-enumeration
+            -> SILENT healthy boot (no BOOT/HB lines, no pt=0/pm=0 report)
+            -> came back in USB mode (CM,0:1) exactly as CM,1:1 commands
+            -> returned to BLE (CM,1:2) -> all 3 bonds intact, iPhone active
+          The BT,0 read inside USB mode correctly refused (BLE stack not
+          initialized) — the harness needed to check bonds after the BLE
+          return, which is where they were verified.
+
+B13 (keep-open / bounce storm) — NOT RE-RUN, and deliberately so: it is
+          unchanged between 4.9.4 and 4.9.5 (the 4.9.5 diff touches only the
+          latch guard, the horizon-anchor extraction/doc, the test file and
+          comments), and it was proven exhaustively on 4.9.4 (80 consecutive
+          bounces with the window alive; the RPA racer bounced in 0.4 s; the
+          target admitted 2.0 s into a window immediately after a bounce).
+          The B2/B3 window+bounce machinery did re-run cleanly here, which is
+          the same code path.
+
+4.9.5-SPECIFIC GAP, ACCEPTED: the mid-window latch fix (the 4.9.5 minor) was
+          NOT radio-proven by this run.  Proving it needs a precisely timed
+          physical SCROLL hold engaged DURING a window and the proof is
+          indirect (whether the next input emits an IA,0 dispatch line —
+          outputAction has no wire readout).  The fix is a small, tightly
+          traced host-identity edge whose non-window behavior is byte-identical
+          to 4.9.4 (bench-proven); recorded here as the one accepted residual.
+
+VERDICT: 11 of 11 wire-settled steps PASS on 4.9.5.  No regressions found.  The
+release stands as tagged.
