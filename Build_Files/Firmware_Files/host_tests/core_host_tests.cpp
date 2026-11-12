@@ -580,6 +580,47 @@ static void test_bounce_horizon_anchor_selection() {
   CHECK(lsHostBounceHorizonAnchor(0UL, 0UL) == 0UL);
 }
 
+// 4.9.5: the latch-crossing guard. Pins the semantics the radio bench cannot
+// reach cheaply (outputAction has no wire readout, so the field test would
+// need a precisely timed physical gesture).
+static void test_latch_crossing_guard() {
+  // No latch held: never release, whatever the keys say (this is what keeps a
+  // latch-free bounce storm from re-running releaseOutputAction).
+  CHECK(lsHostLatchCrossedHost("A1B2C3D4E5F6", "", 0) == 0);
+  CHECK(lsHostLatchCrossedHost("A1B2C3D4E5F6", "FFFFFFFFFFFF", 0) == 0);
+
+  // Same host, latch held: keep it (the hold continues on its own host).
+  CHECK(lsHostLatchCrossedHost("A1B2C3D4E5F6", "A1B2C3D4E5F6", 1) == 0);
+
+  // Host changed with a latch held: release — the confirmed 4.9.5 minor.
+  CHECK(lsHostLatchCrossedHost("A1B2C3D4E5F6", "FFFFFFFFFFFF", 1) == 1);
+
+  // none -> host (the switch-admission edge): "" -> a real key releases.
+  CHECK(lsHostLatchCrossedHost("A1B2C3D4E5F6", "", 1) == 1);
+  // host -> none (disconnect): releases too (the pre-4.9.4 behavior kept).
+  CHECK(lsHostLatchCrossedHost("", "A1B2C3D4E5F6", 1) == 1);
+  // none -> none: nothing to do.
+  CHECK(lsHostLatchCrossedHost("", "", 1) == 0);
+
+  // Full-string equality, not a prefix match: a 12-char key must not equal a
+  // differently-terminated 12-char key, and identical 12-char keys must match.
+  CHECK(lsHostLatchCrossedHost("A1B2C3D4E5F6", "A1B2C3D4E5F", 1) == 1);   // shorter -> differs at NUL
+  CHECK(lsHostLatchCrossedHost("A1B2C3D4E5F", "A1B2C3D4E5F6", 1) == 1);   // the other direction
+  CHECK(lsHostLatchCrossedHost("A1B2C3D4E5F6", "A1B2C3D4E5F6", 1) == 0);  // equal
+
+  // NULL keys are harmless (defensive: a caller with no host reference).
+  CHECK(lsHostLatchCrossedHost((const char*)0, "A1B2C3D4E5F6", 1) == 0);
+  CHECK(lsHostLatchCrossedHost("A1B2C3D4E5F6", (const char*)0, 1) == 0);
+
+  // RPA-stability property the fix RELIES on: the key is the STORED BOND
+  // identity, so a privacy host's rotating address must NOT produce an edge.
+  // Simulated here as the same stored key across passes while the live peer
+  // address would have rotated — the helper sees only the stored key.
+  const char* storedIdentity = "9DE25364404E";  // a bond's stored identity
+  CHECK(lsHostLatchCrossedHost(storedIdentity, storedIdentity, 1) == 0);
+  CHECK(lsHostLatchCrossedHost(storedIdentity, storedIdentity, 1) == 0);
+}
+
 int main() {
   static_assert(!std::is_copy_constructible<LSCircularBuffer<int>>::value,
                 "owning circular buffers must not be shallow-copyable");
@@ -602,6 +643,7 @@ int main() {
   test_host_rpa_admission_helpers();
   test_bounce_teardown_horizon_is_from_dispatch();
   test_bounce_horizon_anchor_selection();
+  test_latch_crossing_guard();
 
   std::printf("%d checks, %d failures\n", checks, failures);
   return failures == 0 ? 0 : 1;

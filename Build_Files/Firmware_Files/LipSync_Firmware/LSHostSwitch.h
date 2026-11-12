@@ -246,4 +246,50 @@ static inline int lsHostBounceTeardownStillRunning(unsigned long elapsedMs, unsi
   return elapsedMs < horizonMs;
 }
 
+/* Latch-crossing guard (4.9.5): must a held DRAG/SCROLL latch be released
+ * because the CONNECTED HOST changed?
+ *
+ * The contract: a drag/scroll latch is a HOLD on the wire, so it must never
+ * cross to a different host — the new host would receive a button/wheel state
+ * the user never pressed on it, and the user's first input there would be
+ * consumed releasing the stale hold instead of performing its action (the
+ * 4.9.4 final-diff-audit's confirmed minor: the pre-4.9.5 guard keyed on
+ * "disconnected", which the switch window suppresses, so a latch engaged
+ * MID-WINDOW crossed into the admitted target).
+ *
+ * Two callers, two questions, one rule:
+ *   - the DISCONNECTED trigger (never fires during a window) — the pre-4.9.4
+ *     behavior, unchanged;
+ *   - the HOST-KEY edge (fires in every ordering, including a window so short
+ *     the 1 s poll never observes it open): release when the connected host's
+ *     identity differs from the one the latch was armed under.
+ *
+ * Both keys are the STORED BOND IDENTITY (LSBLE.h's lsHostActiveMac ->
+ * BLEConnection::getPeerAddr, which returns _bond_id_addr whenever bonded),
+ * never the live peer address: a privacy host's rotating RPA would otherwise
+ * make consecutive reads differ with no host change and spuriously drop a
+ * legitimate hold. An ABSENT host keys as "" (the caller maps
+ * haveActiveHost==false to the empty string) so none->host and host->none are
+ * ordinary edges.
+ *
+ * latchHeld is the caller's (outputAction == DRAG || SCROLL). A latch-free
+ * pass never needs a release, so the caller may skip the whole query; this
+ * helper is pure and takes the already-resolved keys so it stays host-testable
+ * (the LSHostSwitch.h pattern).
+ */
+static inline int lsHostLatchCrossedHost(const char* currentHostKey, const char* latchHostKey, int latchHeld) {
+  if (!latchHeld) return 0;
+  if (currentHostKey == (const char*)0 || latchHostKey == (const char*)0) return 0;
+  // Compare up to and including the NUL, but STOP at the first NUL: the keys
+  // are short strings ("" for an absent host), so a fixed-count loop would
+  // read past a short literal's end. The 4.9.5 host suite caught exactly that
+  // (ASan global-buffer-overflow reading 1 byte past ""). Differing lengths
+  // still compare unequal — one side's NUL meets the other's character.
+  for (int i = 0; i <= LSHOST_MAC_CHARS; i++) {
+    if (currentHostKey[i] != latchHostKey[i]) return 1;
+    if (currentHostKey[i] == '\0') return 0;  // both NUL here (the != test above passed)
+  }
+  return 0;  // both keys ran the full length with no NUL: equal
+}
+
 #endif  // LSHOST_SWITCH_H

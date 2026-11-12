@@ -4748,16 +4748,22 @@ void btFeedbackLoop() {
   if (!switchWindowOpen && !tempIsConnected && (outputAction == CONF_ACTION_DRAG || outputAction == CONF_ACTION_SCROLL)) {
     releaseOutputAction();  // (a) disconnected with a held latch (never in a window — see the gate)
   }
+  // The key the latch was armed under. s_latchGuardHostMac tracks the last
+  // seen host; only a latch-HELD pass consults the decision (a latch-free pass
+  // cannot need a release), which is also what keeps the bounce-storm churn
+  // suppressed: during bounces the key flaps, but the first edge releases the
+  // latch, so every later flap is a no-op.
   static char s_latchGuardHostMac[LSHOST_MAC_CHARS + 1] = "";
-  char activeHostMac[LSHOST_MAC_CHARS + 1];
-  const bool haveActiveHost = lsHostActiveMac(activeHostMac);  // bounded stack query, no FS; false in USB mode / pre-init
-  const char* currentHostKey = haveActiveHost ? activeHostMac : "";
-  if (strcmp(currentHostKey, s_latchGuardHostMac) != 0) {
-    strncpy(s_latchGuardHostMac, currentHostKey, sizeof(s_latchGuardHostMac) - 1);
-    s_latchGuardHostMac[sizeof(s_latchGuardHostMac) - 1] = '\0';
-    if (outputAction == CONF_ACTION_DRAG || outputAction == CONF_ACTION_SCROLL) {
+  const bool latchHeld = (outputAction == CONF_ACTION_DRAG || outputAction == CONF_ACTION_SCROLL);
+  if (latchHeld) {
+    char activeHostMac[LSHOST_MAC_CHARS + 1];
+    const bool haveActiveHost = lsHostActiveMac(activeHostMac);  // bounded stack query, no FS; STORED BOND identity (stable across an RPA host's rotation)
+    const char* currentHostKey = haveActiveHost ? activeHostMac : "";
+    if (lsHostLatchCrossedHost(currentHostKey, s_latchGuardHostMac, 1)) {
       cancelSapOutputHold();  // (b) the connected host changed — the latch must not cross
     }
+    strncpy(s_latchGuardHostMac, currentHostKey, sizeof(s_latchGuardHostMac) - 1);
+    s_latchGuardHostMac[sizeof(s_latchGuardHostMac) - 1] = '\0';
   }
 
   //if (USB_DEBUG) { Serial.println(tempIsConnected); }
