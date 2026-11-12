@@ -1,0 +1,58 @@
+# bench-16 B13-B15 — 4.9.4 switch-window interaction validation
+# Date: 2026-11-11 | OS: macOS (serial driver) | Firmware: 4.9.4 ( flashed via LipSync Connect DFU from dist/LipSync_Firmware_4.9.4_dfu.zip )
+# Driver: single-process serial script (the 2026-11-07 one-process lesson); hosts:
+#   Mac "Hamoudi___s Laptop" (74:35:42:DC:57:1C, bonded row 1)
+#   iPhone "Hamoudi" (RPA 9DE25364404E..., bonded row 2, irk=1)
+#   Windows "DESKTOP-FBIVLCV" (E9:91:DF:97:C4:D8, bonded row 3, absent from radio)
+# Raw transcripts in the session log; observed lines below are verbatim.
+
+B0  PASS: VN,0:0 -> SUCCESS,0:VN,0:4.9.4 (post-DFU, settings restored by the app)
+
+B13 PASS (keep-open fix on radio — the decisive step):
+  Two independent live sequences.
+  Seq 1 (target = absent PC): the Mac racer connected and was bounced 80 times
+  across 22 s (INFO lines thinned to every 20th) and the window stayed ALIVE
+  through every bounce — pre-fix, the first bounce left the radio dark and
+  bounces #2..#80 were impossible. Advertising demonstrably resumed after
+  every single bounce.
+  Seq 2 (target = Mac, racer = iPhone): window opened 18.5 s; the iPhone's
+  rotating RPA (9DE25364404E, top bits 10) bounced in 0.4 s (t=18.9, the
+  IRK-exclude millisecond lockout preserved); MANUAL,0:BT,5:1 at t=20.5 —
+  the TARGET WAS ADMITTED 2.0 s into the window, immediately after a real
+  bounce of the racer. Window closed on the target connect; radio never dark.
+  Also observed: both racers' bounce lines carry no LED/BT,4/BT,5 narration
+  (the round-3 gate held: no scan-blink flicker, no host-table flap during
+  the 80-bounce storm).
+
+B14 PASS (calibration vs window, both directions + the IN,1 twin):
+  dir 1: window open (target=absent PC, bounces live) -> CA,1:1 ->
+    FAIL,3:CA,1:1 + "ERROR: CA,1 refused: a Bluetooth switch window owns the
+    radio — retry once it closes" (the round-4 gate, verbatim)
+  twin:  window open -> IN,1:1 -> FAIL,3:IN,1:1 + the same named line
+  dir 2: center flow running (no window) -> BT,1:1 -> FAIL,3:BT,1:1 +
+    "ERROR: BT,1 refused (row 1): calibration/center flow in flight"
+    (the pre-existing direction); the center then completed cleanly.
+  Incidental honest-failure observation: a BT,1 re-entry raced a live window
+  and answered FAIL,3 LSHOST_REFUSE_RADIO ("the radio refused the operation —
+  retry in a moment") — bounded, named, retry-class; the field then went to
+  the iPhone through the restored open advertising (BT,5:0 -> BT,5:2).
+
+B15 PASS (reset mid-window):
+  Window open (armed IRK, live bounce counters, suspended auto-restart) ->
+  CM,1:1 -> SUCCESS,0:CM,1:1 ack landed BEFORE the port dropped (the
+  response-before-reset drain, on the wire) -> clean re-enumeration ->
+  SILENT healthy boot (no BOOT/HB lines, no pt=0/pm=0 unattributed report) ->
+  CM,0:0=1 -> bonds intact (all 3 rows verified after returning to BLE).
+  UM,1 variant not run live (it strands the device in the bootloader; the
+  CM variant exercises the same softwareReset window-close + drain path, and
+  UM's drain fix is the identical code shape — noted as covered-by-analogy,
+  not live-proven).
+
+Incidental: an unattended CA,1:1 (a window-bound race in the driver, not a
+firmware issue) completed with nobody at the stick and persisted factory-
+default corners (+-13.00, radius 13.0); center re-captured at true neutral.
+Firmware behavior correct throughout (plausibility heal visible in CA,0).
+User to re-run the app calibration wizard to restore tuned corners.
+
+End state: Mac (row 1) is the active BLE host; iPhone/Windows bonded,
+inactive. Switch back any time from the app or another BT,1.
