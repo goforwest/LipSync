@@ -1,5 +1,21 @@
 name: Compress Firmware Files
 
+# (4.9.7 review) Contract: keep the tracked source ZIP current by
+# bot-committing ONLY when the tree's content actually changed. Two guards
+# make that real:
+#   1. the archive is rebuilt over fixed mtimes, so a content-identical tree
+#      produces byte-identical archive bytes (entry mtimes used to differ on
+#      every run, which made the "already current" guard dead code and turned
+#      this job into a bot-commit on every qualifying push — a guaranteed red
+#      check on a protected upstream main after the merge);
+#   2. the commit gate compares ENTRY CONTENTS (names + bytes), the same
+#      semantics as build_firmware.yml's release-day source-ZIP gate, so a
+#      runner-side zip/zlib version drift cannot manufacture a commit either.
+# A push the token cannot update (a protected branch) is tolerated with a
+# loud warning: the drift is named here, and build_firmware.yml's fail-closed
+# source-ZIP gate remains the backstop that refuses a release built from a
+# stale tracked ZIP.
+
 on:
   push:
     branches:
@@ -25,17 +41,59 @@ jobs:
 
       - name: Zip Firmware Files
         run: |
+          cd Build_Files/Firmware_Files
+          # Keep the committed archive aside for the content comparison below.
+          if [ -f LipSync_Firmware.zip ]; then
+            mv LipSync_Firmware.zip LipSync_Firmware.zip.committed
+          fi
           # (4.5.7 review) Rebuild the archive from scratch: `zip -r` only
           # adds/updates entries, so a file deleted or renamed from the tree
           # lived on in the committed zip forever.
-          rm -f Build_Files/Firmware_Files/LipSync_Firmware.zip
-          cd Build_Files/Firmware_Files
+          rm -f LipSync_Firmware.zip.new
           # Include every source needed by the pinned build. Packaging only
           # the sketch silently dropped the bounded Wire/pressure forks, the
           # Bluefruit fault capture, and XENSIV—the resulting download did not
           # reproduce CI or the release binary.
-          zip -r -X LipSync_Firmware.zip LipSync_Firmware Libraries \
+          # (4.9.7 review) Pin every mtime first so the archive bytes are a
+          # function of content alone (guard 1 — see the header comment).
+          find LipSync_Firmware Libraries -exec touch -t 198001010000.00 {} +
+          zip -r -X LipSync_Firmware.zip.new LipSync_Firmware Libraries \
             -x '*/.DS_Store'
+          # (4.9.7 review) Replace the committed archive only when its entry
+          # CONTENTS changed (guard 2). On "already current" the committed
+          # bytes go back untouched, so git sees no change and the commit
+          # step below exits without a bot commit.
+          python3 - <<'PY'
+          import os
+          import shutil
+          import sys
+          import zipfile
+
+          def entry_contents(path):
+              with zipfile.ZipFile(path) as z:
+                  names = [n for n in z.namelist() if not n.endswith('/')]
+                  if len(names) != len(set(names)):
+                      sys.exit('duplicate entries in ' + path)
+                  return {n: z.read(n) for n in names}
+
+          new = entry_contents('LipSync_Firmware.zip.new')
+          changed = True
+          if os.path.exists('LipSync_Firmware.zip.committed'):
+              try:
+                  changed = entry_contents('LipSync_Firmware.zip.committed') != new
+              except (zipfile.BadZipFile, OSError):
+                  changed = True  # unreadable committed archive: replace it
+          if changed:
+              if os.path.exists('LipSync_Firmware.zip'):
+                  os.remove('LipSync_Firmware.zip')
+              shutil.move('LipSync_Firmware.zip.new', 'LipSync_Firmware.zip')
+              print('Firmware source archive content changed.')
+          else:
+              shutil.move('LipSync_Firmware.zip.committed', 'LipSync_Firmware.zip')
+              os.remove('LipSync_Firmware.zip.new')
+              print('Firmware source archive is already current.')
+          PY
+          rm -f LipSync_Firmware.zip.committed
 
       - name: Commit and Push ZIP
         run: |
@@ -47,4 +105,13 @@ jobs:
             exit 0
           fi
           git commit -m "Automated update: Compress firmware files"
-          git push
+          # (4.9.7 review) Tolerate-and-warn on a refused push: on a branch
+          # the token may not update (a protected upstream main after the
+          # merge), a forced bot commit is a guaranteed red check. Name the
+          # drift instead; the fail-closed source-ZIP gate in
+          # build_firmware.yml still refuses any release built from a stale
+          # tracked ZIP, so tag day cannot silently publish one.
+          if ! git push; then
+            echo "::warning::Could not push the refreshed firmware source ZIP (protected or read-only branch). The refreshed archive exists only on this runner — refresh it manually from an allowed branch before tagging. build_firmware.yml will refuse a release whose tracked ZIP does not match the tagged tree."
+            exit 0
+          fi
