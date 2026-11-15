@@ -292,4 +292,46 @@ static inline int lsHostLatchCrossedHost(const char* currentHostKey, const char*
   return 0;  // both keys ran the full length with no NUL: equal
 }
 
+/* 4.9.7: the latch guard's PER-PASS update, extracted from btFeedbackLoop so
+ * the refresh cadence itself is host-pinned — the 4.9.6 suite pinned only the
+ * crossing comparison above and could not see the glue defect the review
+ * found: the .ino refreshed the stored key on latch-HELD passes only, so
+ * across every latch-free stretch the key retained the PREVIOUS episode's
+ * host ("" after a boot with a bonded host, the old host's key after a BT,1
+ * switch), and the user's FIRST drag/scroll on the new host was compared
+ * against that stale key, hit the crossing edge, and was killed mid-hold —
+ * the exact one-swallowed-input class the guard exists to prevent,
+ * reintroduced by the guard itself.
+ *
+ * Semantics (the fix, and the contract going forward):
+ *   - the crossing decision is consulted ONLY when latchHeld (a latch-free
+ *     pass cannot need a release — the bounce-storm churn contract is
+ *     unchanged), and it compares the stored key BEFORE the refresh, so a
+ *     hold that genuinely crosses a host change still releases on the first
+ *     differing pass;
+ *   - the stored key is refreshed to the current host key on EVERY pass,
+ *     held or not, so a hold that STARTS on a host never compares against a
+ *     stale key: between episodes the key simply tracks the live host.
+ *
+ * Copies currentHostKey into guardKey, NUL-terminated, bounded by
+ * guardKeySize. NULL guardKey, zero size, or NULL currentHostKey are
+ * defensive no-ops (same convention as lsHostLatchCrossedHost; the caller
+ * maps an absent host to "" rather than NULL). Returns 1 when a held latch
+ * must be released this pass.
+ */
+static inline int lsHostLatchGuardPass(const char* currentHostKey, char* guardKey, unsigned guardKeySize, int latchHeld) {
+  const int crossed = latchHeld ? lsHostLatchCrossedHost(currentHostKey, guardKey, 1) : 0;
+  if (guardKey != (char*)0 && guardKeySize > 0) {
+    unsigned i = 0;
+    if (currentHostKey != (const char*)0) {
+      while (i + 1 < guardKeySize && currentHostKey[i] != '\0') {
+        guardKey[i] = currentHostKey[i];
+        i++;
+      }
+    }
+    guardKey[i] = '\0';
+  }
+  return crossed;
+}
+
 #endif  // LSHOST_SWITCH_H

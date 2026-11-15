@@ -3873,7 +3873,7 @@ void controlHubMenu(bool responseEnabled, bool apiEnabled, int inputMenuControl)
         if (g_safeModeEnabled) {
           printResponseInt(responseEnabled, apiEnabled, false, 3, "CH,1", true, inputMenuControl);
           serialTxEnqueueLine("ERROR: menu open refused — safe mode owns the display (use the Hub buttons: Restart / Factory Reset)");
-          break;
+          return;  // 4.9.7 (review B4): break only exited the switch — the flow fell through to the unconditional SUCCESS ack below and answered twice for one request (FAIL,3 then SUCCESS,0), the exact outcome the gate's own comment says it prevents. The sibling gates (IN,1, CA,1) return.
         }
         screen.activateMenu();
         break;     

@@ -6,6 +6,7 @@
 
 #include "LSCircularBuffer.h"
 #include "LSHostSwitch.h"
+#include "LSMemorySeedGate.h"
 #include "LSPressureClassify.h"
 #include "LSPressureEngageFilter.h"
 #include "LSPressureOffsetFilter.h"
@@ -621,6 +622,99 @@ static void test_latch_crossing_guard() {
   CHECK(lsHostLatchCrossedHost(storedIdentity, storedIdentity, 1) == 0);
 }
 
+// 4.9.7: the latch guard's per-pass cadence (lsHostLatchGuardPass). The 4.9.6
+// suite pinned only the comparison helper and could not see the glue defect:
+// the .ino refreshed the stored key on held passes only, so the key retained
+// the PREVIOUS episode's host across every latch-free stretch, and the user's
+// FIRST hold on a new episode was cancelled against that stale key (boot with
+// a bonded host keyed ""; a BT,1 switch keyed the old host; a host that walks
+// away and another that bonds reconnect the same way).
+static void test_latch_guard_pass_cadence() {
+  char key[LSHOST_MAC_CHARS + 1];
+
+  // Boot with a bonded host: the key starts "" (static init) while the host
+  // is present on the very first pass — a latch-free pass releases nothing,
+  // but must refresh the key. The user's FIRST hold then runs against the
+  // real key and survives (this is the published-V4.9.6 regression).
+  std::strcpy(key, "");
+  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", key, sizeof(key), 0) == 0);  // the refresh pass
+  CHECK(std::strcmp(key, "A1B2C3D4E5F6") == 0);
+  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", key, sizeof(key), 1) == 0);  // the first hold survives
+
+  // BT,1 host switch: the old shape armed the PREVIOUS host's key here — the
+  // same swallowed first input. Latch-free passes track the new host.
+  std::strcpy(key, "FFFFFFFFFFFF");
+  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", key, sizeof(key), 0) == 0);
+  CHECK(std::strcmp(key, "A1B2C3D4E5F6") == 0);
+  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", key, sizeof(key), 1) == 0);
+
+  // A host walks away and another bonds before the next hold: the key passes
+  // through "" (none) and lands on the new host — still no stale comparison.
+  std::strcpy(key, "A1B2C3D4E5F6");
+  CHECK(lsHostLatchGuardPass("", key, sizeof(key), 0) == 0);
+  CHECK(std::strcmp(key, "") == 0);
+  CHECK(lsHostLatchGuardPass("9DE25364404E", key, sizeof(key), 0) == 0);
+  CHECK(lsHostLatchGuardPass("9DE25364404E", key, sizeof(key), 1) == 0);
+
+  // The crossing protection is intact: a hold engaged on A that meets B on a
+  // later held pass still releases — the compare runs BEFORE the refresh on
+  // the same pass, and the key lands on B so the release fires exactly once.
+  std::strcpy(key, "A1B2C3D4E5F6");
+  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", key, sizeof(key), 1) == 0);  // hold armed on A
+  CHECK(lsHostLatchGuardPass("FFFFFFFFFFFF", key, sizeof(key), 1) == 1);  // host changed mid-hold: release
+  CHECK(std::strcmp(key, "FFFFFFFFFFFF") == 0);                           // the key tracks the new host
+  CHECK(lsHostLatchGuardPass("FFFFFFFFFFFF", key, sizeof(key), 1) == 0);  // no repeated cancel
+
+  // A latch-free pass never releases, whatever the keys say (the bounce-storm
+  // churn contract), and still refreshes.
+  std::strcpy(key, "AAAAAAAAAAAA");
+  CHECK(lsHostLatchGuardPass("BBBBBBBBBBBB", key, sizeof(key), 0) == 0);
+  CHECK(std::strcmp(key, "BBBBBBBBBBBB") == 0);
+
+  // Boot with NO host: the key stays "" and a hold on no host is not a crossing.
+  std::strcpy(key, "");
+  CHECK(lsHostLatchGuardPass("", key, sizeof(key), 1) == 0);
+
+  // Buffer bounds: a short guardKey truncates and NUL-terminates.
+  char small[5];
+  std::strcpy(small, "ZZ");
+  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", small, sizeof(small), 1) == 1);  // held + differing keys: release
+  CHECK(std::strcmp(small, "A1B2") == 0);
+
+  // Defensive shapes: NULL sink (no crossing — a NULL on either key is the
+  // underlying helper's harmless no-op convention, pinned in
+  // test_latch_crossing_guard, and a caller with no guard storage has no
+  // episode to protect), zero size (key untouched), NULL current key (no
+  // crossing; the key reads as cleared — the caller maps an absent host to ""
+  // rather than NULL, so this only bounds a future caller's mistake).
+  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", (char*)0, 0, 1) == 0);
+  char scratch[4];
+  std::strcpy(scratch, "AA");
+  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", scratch, 0, 0) == 0);
+  CHECK(std::strcmp(scratch, "AA") == 0);
+  std::strcpy(key, "OLD");
+  CHECK(lsHostLatchGuardPass((const char*)0, key, sizeof(key), 1) == 0);
+  CHECK(std::strcmp(key, "") == 0);
+}
+
+// 4.9.7: the boot-reseed gate (lsmemSeedMayWrite). Pins the 4.9.1 anti-append
+// contract AND the absent-file fix: Adafruit_LittleFS::remove() is
+// (err == LFS_ERR_OK) — FALSE for LFS_ERR_NOENT — so the old unconditional
+// remove refused the seed on every boot for a device with no file yet (the
+// <=4.6.6 upgrade path for /settings2.dat), leaving the seed unwritten and
+// every SET on those keys answering FAIL,3 forever.
+static void test_seed_gate_absent_file_seeds() {
+  // Absent file: proceed — the <=4.6.6 upgrade boot (the 4.9.7 fix).
+  CHECK(lsmemSeedMayWrite(0, 0) == 1);
+  // Existing file removed cleanly: proceed — the healthy 4.9.1 reseed.
+  CHECK(lsmemSeedMayWrite(1, 1) == 1);
+  // Existing file the FS refuses to remove: refuse — the 4.9.1 anti-append
+  // gate (FILE_O_WRITE would append the seed after the garbage).
+  CHECK(lsmemSeedMayWrite(1, 0) == 0);
+  // Absent with a nominal remove success: consistent either way, proceeds.
+  CHECK(lsmemSeedMayWrite(0, 1) == 1);
+}
+
 int main() {
   static_assert(!std::is_copy_constructible<LSCircularBuffer<int>>::value,
                 "owning circular buffers must not be shallow-copyable");
@@ -644,6 +738,8 @@ int main() {
   test_bounce_teardown_horizon_is_from_dispatch();
   test_bounce_horizon_anchor_selection();
   test_latch_crossing_guard();
+  test_latch_guard_pass_cadence();
+  test_seed_gate_absent_file_seeds();
 
   std::printf("%d checks, %d failures\n", checks, failures);
   return failures == 0 ? 0 : 1;

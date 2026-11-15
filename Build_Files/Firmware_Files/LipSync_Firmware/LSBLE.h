@@ -1054,6 +1054,25 @@ uint32_t lsHostBeginSwitchWindow(void) {
   lsHostRestoreAutoRestart();
   lsHostDisarmSwitchWindow();
   lsHostEnsureAdvertising();
+  // 4.9.7 (review B3): this path now OWNS the radio like its cancel and
+  // close siblings — arm the deferred restart when nothing is connected.
+  // The retry loop above only continues while connected() != 0, so it breaks
+  // out on the FIRST adv_start refusal in exactly the state the bench
+  // documented (4.8.10/4.9.3: connected() reads 0 while the peripheral role
+  // is still tearing down — the CONN_COUNT class). In that state the
+  // DISCONNECTED event was already consumed while auto-restart was
+  // suspended, so nothing else will ever restart advertising for this gap,
+  // the one-shot lsHostEnsureAdvertising above is the last restarter and its
+  // rc is deliberately discarded (the executor's INFO line names the
+  // failure) — without the pending flag a refused ensure left the radio
+  // silently dark (the wire's "FALLBACK … open advertising" narration a
+  // state it did not verify). lsHostServiceSwitchWindow retries the ensure
+  // every pass until the set is genuinely on air (or a host connects), the
+  // same service the cancel and close paths already rely on.
+  if (!Bluefruit.connected()) {
+    g_switchAdvRestartPending = true;
+    g_switchAdvRestartPendingMs = millis();
+  }
   return rc;
 }
 

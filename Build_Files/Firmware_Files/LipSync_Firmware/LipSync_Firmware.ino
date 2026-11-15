@@ -4749,21 +4749,34 @@ void btFeedbackLoop() {
     releaseOutputAction();  // (a) disconnected with a held latch (never in a window — see the gate)
   }
   // The key the latch was armed under. s_latchGuardHostMac tracks the last
-  // seen host; only a latch-HELD pass consults the decision (a latch-free pass
-  // cannot need a release), which is also what keeps the bounce-storm churn
-  // suppressed: during bounces the key flaps, but the first edge releases the
-  // latch, so every later flap is a no-op.
+  // seen host; only a latch-HELD pass consults the crossing decision (a
+  // latch-free pass cannot need a release), which is also what keeps the
+  // bounce-storm churn suppressed: during bounces the key flaps, but the
+  // first edge releases the latch, so every later flap is a no-op.
+  // 4.9.7 (review B1, found independently by two reviewers): the key is now
+  // refreshed on EVERY pass through lsHostLatchGuardPass (LSHostSwitch.h,
+  // where the cadence is host-pinned), not only on held ones. The 4.9.6
+  // shape refreshed inside the held branch only, so the key retained the
+  // PREVIOUS episode's host across every latch-free stretch: boot with a
+  // bonded host left it "" and a BT,1 switch left it pointing at the old
+  // host — in both cases the user's FIRST drag/scroll on the new host
+  // compared against the stale key, hit the crossing edge, and was killed
+  // mid-hold by cancelSapOutputHold() (the exact one-swallowed-input class
+  // 4.9.5/4.9.6 shipped to fix, reintroduced by the fix; live in the
+  // published V4.9.6 binary). The compare-before-refresh order inside the
+  // helper keeps the intended crossing protection: a hold that STARTS on a
+  // host never sees a stale key, while a hold that CROSSES a host change
+  // still releases on the first differing pass. lsHostActiveMac is a bounded
+  // stack query, no FS — cheap and safe on every pass (it no-ops while the
+  // stack is down, nothing is connected, or the peer is unbonded); STORED
+  // BOND identity (stable across an RPA host's rotation).
   static char s_latchGuardHostMac[LSHOST_MAC_CHARS + 1] = "";
   const bool latchHeld = (outputAction == CONF_ACTION_DRAG || outputAction == CONF_ACTION_SCROLL);
-  if (latchHeld) {
-    char activeHostMac[LSHOST_MAC_CHARS + 1];
-    const bool haveActiveHost = lsHostActiveMac(activeHostMac);  // bounded stack query, no FS; STORED BOND identity (stable across an RPA host's rotation)
-    const char* currentHostKey = haveActiveHost ? activeHostMac : "";
-    if (lsHostLatchCrossedHost(currentHostKey, s_latchGuardHostMac, 1)) {
-      cancelSapOutputHold();  // (b) the connected host changed — the latch must not cross
-    }
-    strncpy(s_latchGuardHostMac, currentHostKey, sizeof(s_latchGuardHostMac) - 1);
-    s_latchGuardHostMac[sizeof(s_latchGuardHostMac) - 1] = '\0';
+  char activeHostMac[LSHOST_MAC_CHARS + 1];
+  const bool haveActiveHost = lsHostActiveMac(activeHostMac);
+  const char* currentHostKey = haveActiveHost ? activeHostMac : "";
+  if (lsHostLatchGuardPass(currentHostKey, s_latchGuardHostMac, sizeof(s_latchGuardHostMac), latchHeld ? 1 : 0)) {
+    cancelSapOutputHold();  // (b) the connected host changed under a held latch — the latch must not cross
   }
 
   //if (USB_DEBUG) { Serial.println(tempIsConnected); }

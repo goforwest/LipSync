@@ -31,6 +31,7 @@ extern LSMemory mem;
 #include <Adafruit_LittleFS.h>
 #include <InternalFileSystem.h>
 #include "LSApiDeclarations.h"
+#include "LSMemorySeedGate.h"  // the boot-reseed gate's pure decision (4.9.7, host-pinned)
 
 using namespace Adafruit_LittleFS_Namespace;
 
@@ -253,7 +254,22 @@ void LSMemory::initialize(String fileString, String jsonString) {
   // remove succeeding, and the result is verified by reading it back (an
   // append or partial write fails the compare and is removed, not
   // "succeeded").
-  if (!InternalFS.remove(fileName)) {
+  // 4.9.7 (review B2): gate the remove on the file EXISTING. The 4.9.1 shape
+  // called InternalFS.remove() unconditionally and read false as "the corrupt
+  // file could not be cleared" — but Adafruit_LittleFS::remove() returns
+  // (err == LFS_ERR_OK), i.e. FALSE for LFS_ERR_NOENT, so a device with no
+  // file yet refused the seed on EVERY boot: the <=4.6.6 upgrade path for
+  // /settings2.dat (the file simply does not exist until this seed writes
+  // it), and any first boot for either file. Consequences: the compiled
+  // default never landed, every HS/HP/HA/HB SET answered FAIL,3 forever (the
+  // API writers gate on read truth), the hard sip/puff band was
+  // unconfigurable on every upgraded device, and the power-cut-heals-next-
+  // boot promise below was false (the healed shape IS an absent file, and a
+  // remove of an absent file can never succeed). The anti-append remove only
+  // guards an EXISTING file; the proceed/refuse decision is the pure
+  // lsmemSeedMayWrite() (LSMemorySeedGate.h, host-pinned).
+  const bool seedFileExists = InternalFS.exists(fileName);
+  if (!lsmemSeedMayWrite(seedFileExists ? 1 : 0, seedFileExists ? (InternalFS.remove(fileName) ? 1 : 0) : 0)) {
     Serial.print("ERROR: could not remove the corrupt settings file (");
     Serial.print(fileString);
     Serial.println(") — reseed refused (the corrupt file stays; a power cycle may clear the directory state)");
