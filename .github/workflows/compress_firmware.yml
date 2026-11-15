@@ -4,10 +4,13 @@ name: Compress Firmware Files
 # bot-committing ONLY when the tree's content actually changed. Two guards
 # make that real:
 #   1. the archive is rebuilt over fixed mtimes, so a content-identical tree
-#      produces byte-identical archive bytes (entry mtimes used to differ on
+#      rebuilds with identical entry metadata (entry mtimes used to differ on
 #      every run, which made the "already current" guard dead code and turned
 #      this job into a bot-commit on every qualifying push — a guaranteed red
-#      check on a protected upstream main after the merge);
+#      check on a protected upstream main after the merge). Byte-level
+#      determinism additionally depends on the runner's zip/zlib build
+#      (readdir traversal order) — which is exactly why guard 2 compares
+#      ENTRY CONTENTS rather than archive bytes;
 #   2. the commit gate compares ENTRY CONTENTS (names + bytes), the same
 #      semantics as build_firmware.yml's release-day source-ZIP gate, so a
 #      runner-side zip/zlib version drift cannot manufacture a commit either.
@@ -105,13 +108,38 @@ jobs:
             exit 0
           fi
           git commit -m "Automated update: Compress firmware files"
-          # (4.9.7 review) Tolerate-and-warn on a refused push: on a branch
-          # the token may not update (a protected upstream main after the
-          # merge), a forced bot commit is a guaranteed red check. Name the
-          # drift instead; the fail-closed source-ZIP gate in
-          # build_firmware.yml still refuses any release built from a stale
-          # tracked ZIP, so tag day cannot silently publish one.
-          if ! git push; then
-            echo "::warning::Could not push the refreshed firmware source ZIP (protected or read-only branch). The refreshed archive exists only on this runner — refresh it manually from an allowed branch before tagging. build_firmware.yml will refuse a release whose tracked ZIP does not match the tagged tree."
+          # (4.9.7 review, follow-up) Tolerate-and-warn on a refused push —
+          # but the failure modes are not the same drift, so they are not the
+          # same warning:
+          #   - a genuine protected-branch refusal (GH006) is the documented
+          #     case: name it and exit green, pointing at the tag-day
+          #     backstop;
+          #   - a non-fast-forward means a human push landed while this run
+          #     was building the archive (the concurrency group serializes
+          #     workflow runs, not human pushes) — one rebase-and-retry
+          #     covers that race, so a green job no longer implies a
+          #     silently skipped ZIP commit;
+          #   - anything else gets a generic named warning.
+          # The fail-closed source-ZIP gate in build_firmware.yml still
+          # refuses any release built from a stale tracked ZIP, so tag day
+          # cannot silently publish one.
+          PUSH_OUT=$(git push 2>&1) || {
+            echo "$PUSH_OUT"
+            if echo "$PUSH_OUT" | grep -q 'GH006'; then
+              echo "::warning title=Source ZIP not updated::Push refused by branch protection (GH006). The refreshed archive exists only on this runner — refresh it manually from an allowed branch before tagging. build_firmware.yml will refuse a release whose tracked ZIP does not match the tagged tree."
+              exit 0
+            fi
+            if echo "$PUSH_OUT" | grep -qiE 'fast-forward|fetch first|rejected|behind'; then
+              if git pull --rebase --autostash origin "$GITHUB_REF_NAME"; then
+                if RETRY_OUT=$(git push 2>&1); then
+                  echo "Firmware source ZIP pushed after the rebase retry."
+                  exit 0
+                fi
+                echo "$RETRY_OUT"
+              else
+                git rebase --abort 2>/dev/null || true
+              fi
+            fi
+            echo "::warning title=Source ZIP not updated::Push failed (see the log above). The refreshed archive exists only on this runner — refresh it manually before tagging. build_firmware.yml will refuse a release whose tracked ZIP does not match the tagged tree."
             exit 0
-          fi
+          }
