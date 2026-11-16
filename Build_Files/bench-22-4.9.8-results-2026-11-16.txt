@@ -127,3 +127,14 @@ PR description for whenever the hub is next serviced, and the press/reseat obser
 the root-cause confirmation. Guidance for other makers: two error beeps at power-on that survive
 app restarts = power-cycle fully first; if it persists, reseat the XIAO module before opening
 anything else. 4.9.9's BH field 29 / HB vdd= turns any recurrence into a wire-side answer.
+
+=== PARKED-ITEM DISPOSITIONS (2026-11-16, session close) ===
+- HardFault (fp=0x6C000): watch-item, no action unless it recurs (one-off, unattended window,
+  page-granular forensics already recorded in CHANGES 4.9.9). Recurrence => widen the capture
+  (more PC bits / LR) and symbolize with a live repro.
+- Safe-mode hint + Maker-Guide troubleshooting line: proposed as PR follow-ups (maintainer design
+  call + the docs PR respectively) — recorded in PR_DESCRIPTION.md's Follow-ups section.
+- B18 (mid-hold host switch): moved to the TAG-DAY bench checklist. Does not gate the PR (the
+  latch-crossing logic is host-pinned by 24 checks; B16/B17 passed on radio); the physical
+  choreography needs two live hosts and row 2's bond is stale phone-side (deleted on the phone,
+  device side still bonded — BT,2:2 forget or re-pair when next benched).
