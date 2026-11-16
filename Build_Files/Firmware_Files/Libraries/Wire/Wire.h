@@ -76,6 +76,21 @@ class TwoWire : public Stream
     // turns it into "seconds since the bus last wedged".
     unsigned long lastRecoveryMs();
 
+    // *** LipSync patch *** — PROACTIVE bus clear (4.9.8): run the same NXP
+    // bus-clear the timeout recovery runs (bounded STOP, pins as GPIO, up to
+    // 9 verified SCL clocks, explicit STOP, re-attach) with NO transaction in
+    // flight and NO telemetry stamp. Call it once after begin() before the
+    // first transaction of a session: a slave the PREVIOUS reset stranded
+    // mid-transaction, or that powered up while SDA/SCL were still floating
+    // (before begin() configures the pull-ups), answers clean NACKs forever
+    // after — and a clean NACK never reaches the timeout recovery (only a
+    // timeout does), so the stuck state survives every warm reset. The clear
+    // realigns the slave's protocol state machine in ~100 µs. Deliberately
+    // NOT counted by recoveryCount()/busHealthy(): it is bring-up hygiene,
+    // not a wedge — a healthy boot's diagnostics must still read
+    // recoveries=0/bus=1.
+    void busClear();
+
     inline size_t write(unsigned long n) { return write((uint8_t)n); }
     inline size_t write(long n)          { return write((uint8_t)n); }
     inline size_t write(unsigned int n)  { return write((uint8_t)n); }

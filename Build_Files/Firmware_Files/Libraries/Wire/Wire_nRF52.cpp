@@ -114,14 +114,19 @@ static bool wireWaitEvent(NRF_TWIM_Type * twim, volatile uint32_t * eventReg, ui
   return true;
 }
 
-// Recovers a wedged TWIM: bounded STOP attempt, disconnect + disable the
-// peripheral, run the I2C bus-clear on the pins as GPIO, then re-attach and
-// re-enable for the next transaction.
-static void wireRecoverBus(NRF_TWIM_Type * twim, uint32_t pinSDA, uint32_t pinSCL)
+// The physical bus-clear sequence shared by the two entry points below:
+// wireRecoverBus() (reactive — a transaction hit the bounded timeout, and
+// this stamps the bus-held telemetry) and TwoWire::busClear() (proactive —
+// 4.9.8, run at boot with no transaction in flight and no telemetry stamp,
+// so bring-up hygiene never reads as a wedge in the BH row). Bounded STOP
+// attempt, disconnect + disable the peripheral, run the I2C bus-clear on the
+// pins as GPIO, then re-attach and re-enable for the next transaction.
+static void wireBusClearSequence(NRF_TWIM_Type * twim, uint32_t pinSDA, uint32_t pinSCL)
 {
-  wireLastRecoveryMs = millis();  // Stamp the bus-held window (see busHealthy())
-  wireRecoveryCount++;
   // A clean stop first — on a wedged bus even STOP may never complete, so bound it too
+  // (proactive callers: the TWIM is idle, so the STOP task completes its
+  // STOPPED event immediately — the bound is a wedge-path guarantee, not a
+  // boot-time tax)
   twim->TASKS_STOP = 0x1UL;
   uint32_t start = millis();
   while (!twim->EVENTS_STOPPED && millis() - start < WIRE_TRANSACTION_TIMEOUT_MS);
@@ -212,6 +217,15 @@ static void wireRecoverBus(NRF_TWIM_Type * twim, uint32_t pinSDA, uint32_t pinSC
                         | ((uint32_t)GPIO_PIN_CNF_PULL_Pullup      << GPIO_PIN_CNF_PULL_Pos)
                         | ((uint32_t)GPIO_PIN_CNF_DRIVE_S0D1       << GPIO_PIN_CNF_DRIVE_Pos)
                         | ((uint32_t)GPIO_PIN_CNF_SENSE_Disabled   << GPIO_PIN_CNF_SENSE_Pos);
+}
+
+// Recovers a wedged TWIM: stamps the bus-held window (see busHealthy()), then
+// runs the shared physical bus-clear above.
+static void wireRecoverBus(NRF_TWIM_Type * twim, uint32_t pinSDA, uint32_t pinSCL)
+{
+  wireLastRecoveryMs = millis();  // Stamp the bus-held window (see busHealthy())
+  wireRecoveryCount++;
+  wireBusClearSequence(twim, pinSDA, pinSCL);
 }
 // *** end LipSync patch ***
 
@@ -333,6 +347,21 @@ void TwoWire::end() {
   {
     _p_twis->ENABLE = (TWIS_ENABLE_ENABLE_Disabled << TWIS_ENABLE_ENABLE_Pos);
   }
+}
+
+// *** LipSync patch (4.9.8) *** — see Wire.h for the contract. The proactive
+// boot-time clear: the same physical sequence the timeout recovery runs, but
+// with the TWIM idle and the telemetry deliberately untouched (bring-up
+// hygiene is not a wedge — the BH row's recoveries=0/bus=1 is the healthy
+// boot's contract). The field shape this closes: the 2026-11-15 bench episode
+// where a display/sensor set left NACKing by the previous session's
+// NVIC_SystemReset() (or by power-up into the floating pre-begin bus) survived
+// every warm reset — a clean NACK never reaches wireRecoverBus — and each
+// next boot's single-shot scan condemned the device to safe mode until a
+// lucky replug healed it one device at a time.
+void TwoWire::busClear()
+{
+  wireBusClearSequence(_p_twim, _uc_pinSDA, _uc_pinSCL);
 }
 
 uint8_t TwoWire::requestFrom(uint8_t address, size_t quantity, bool stopBit)

@@ -54,6 +54,18 @@ in older firmware.
   recovery total and the millis() stamp of the latest one; the firmware's
   `BH` serial endpoint turns them into the "seconds since the bus last
   wedged" diagnostic (4.3.0, roadmap item 3).
+- Since 4.9.8, `TwoWire::busClear()` runs the same physical bus-clear
+  (bounded STOP, pins as GPIO, up to 9 verified SCL clocks, explicit STOP,
+  re-attach) PROACTIVELY — no transaction in flight, no telemetry stamp.
+  The firmware calls it once at the top of `setup()` (before any probe)
+  and between scan passes: a slave the previous reset stranded
+  mid-transaction, or that powered up while SDA/SCL were still floating
+  before `begin()` configures the internal pull-ups, answers clean NACKs
+  forever after — and a clean NACK never reaches the timeout recovery
+  (only a timeout does), so the stuck state survives every warm reset.
+  The clear realigns the slave in ~100 µs. Deliberately NOT counted by
+  `recoveryCount()`/`busHealthy()`: bring-up hygiene must not read as a
+  wedge in the `BH` row (a healthy boot still reports recoveries=0/bus=1).
 - Since 4.5.17 the TWIM/TWIS interrupt priority is 7, not upstream's 3 —
   the bench (2026-10-26, rounds 8-11) pinned the actual S140 6.1.1
   SoftDevice-reserved priority set to {0, 1, 4} (the core's own TinyUSB
@@ -65,9 +77,9 @@ in older firmware.
   BASEPRI=2 critical sections, and the handler calls no kernel APIs.
 
 `Wire.h` differs from the core's copy only by the `busHealthy()`,
-`recoveryCount()` and `lastRecoveryMs()` declarations and their comments;
-everything else lives in `Wire_nRF52.cpp`, marked with `LipSync patch`
-comment blocks.
+`recoveryCount()`, `lastRecoveryMs()` and `busClear()` declarations and
+their comments; everything else lives in `Wire_nRF52.cpp`, marked with
+`LipSync patch` comment blocks.
 
 ## How the build uses it
 

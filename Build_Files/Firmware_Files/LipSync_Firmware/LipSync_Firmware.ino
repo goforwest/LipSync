@@ -23,6 +23,7 @@
 #include "LSUtils.h"
 #include "LSApiDeclarations.h"  // Explicit cross-tab declarations (roadmap item 5) — early so every tab sees them
 #include "LSConfig.h"
+#include "LSI2CScan.h"  // 4.9.8: the boot I2C scan's pure layer (self-contained — carries its own CONF_I2C_SCAN_* constants)
 #define LSTIMER_USE_SERIAL_TX_QUEUE 1  // Normal-context timer diagnostics share the line-safe CDC queue
 #include "LSTimer.h"
 #include <ArduinoJson.h>
@@ -611,6 +612,27 @@ static void bleInitTaskBody(void* arg) {
 void setup() {
   g_loopTaskHandle = xTaskGetCurrentTaskHandle();  // 4.5.26: the loop task runs setup — capture its handle for the stack high-water print
   initGlobals();  //  Intialize global variables to default values
+  // 4.9.8 (boot-bus fix A): the I2C bus comes up HERE, at the very top of
+  // setup() — not in checkI2C() hundreds of ms later. The hub PCB carries no
+  // external pull-ups (the schematic's PIN_SDA/PIN_SCL nets are just the XIAO
+  // module and the two cables), so from plug-in until this begin() configures
+  // the nRF52's internal pull-ups both lines FLOAT while the four slaves are
+  // already powered and listening — the window in which a device can power up
+  // into a non-idle state (and the longest-lead device, the display, is the
+  // one the field episode stranded). Bring-up here shortens that window to
+  // its practical minimum (bootloader time is out of the app's reach), and
+  // the proactive bus-clear below realigns anything the floating window or
+  // the PREVIOUS session's mid-transaction NVIC_SystemReset() left stuck —
+  // a clean NACK never reaches the vendored Wire's timeout recovery, so
+  // without this the stuck state survived every warm reset (the 2026-11-15
+  // field episode: "two error beeps" boots that no number of replugs or
+  // Connect restarts could heal until a lucky one-beep boot appeared).
+  // No transaction happens between here and checkI2C()'s probes (LittleFS is
+  // internal flash; LEDs/buzzer/buttons are GPIO), so this is bring-up only —
+  // and busClear() stamps no recovery telemetry: a healthy boot's BH row must
+  // still read recoveries=0/bus=1.
+  Wire.begin();
+  Wire.busClear();
   // 4.6.6: seed the SD-up flag from the chip itself BEFORE the first
   // retention access. checkResetReason() below writes through the SD-aware
   // helper, and on the bootloader-leftover-SD boot (the sd=1 case the 4.5.13
@@ -1477,8 +1499,24 @@ void toggleSafeMode(bool safeModeEnabled) {
       }
       case CONF_SAFE_MODE_REASON_HARDWARE:
       {
-        static const char hardwareWarning[] = "WARNING: SAFE MODE ENABLED - Hardware";
-        serialTxEnqueueLine(hardwareWarning, sizeof(hardwareWarning) - 1);
+        // 4.9.8 (boot-bus fix E): name WHICH hardware is missing, in the
+        // heartbeat's own sns= encoding (LSI2CScan.h — joystick, mouthpiece,
+        // ambient, display). The bare line forced every field reader to
+        // re-derive the missing set from a BH probe; the 2026-11-15 "two
+        // error beeps" mystery was a full sns=0000 hiding behind a generic
+        // string, and the one-beep boots were sns=0111. toggleSafeMode runs
+        // after checkI2C's final verdicts, so the flags are the scan's.
+        static char hardwareWarning[LSI2C_SAFE_MODE_HARDWARE_WARNING_BUF];
+        const int hardwareWarningLen = lsi2cSafeModeHardwareWarning(
+            hardwareWarning, sizeof(hardwareWarning),
+            g_joystickSensorConnected, g_mouthpiecePressureSensorConnected,
+            g_ambientPressureSensorConnected, g_displayConnected);
+        if (hardwareWarningLen > 0) {
+          serialTxEnqueueLine(hardwareWarning, (size_t)hardwareWarningLen);
+        } else {
+          static const char hardwareWarningFallback[] = "WARNING: SAFE MODE ENABLED - Hardware";
+          serialTxEnqueueLine(hardwareWarningFallback, sizeof(hardwareWarningFallback) - 1);
+        }
         break;
       }
       default:
@@ -4252,54 +4290,6 @@ void setDebugState(int inputDebugMode) {
 void checkI2C() {
   if (USB_DEBUG) { Serial.println("USBDEBUG: checkI2C"); }
 
-  Wire.begin();
-
-  Wire.beginTransmission(I2CADDR_DISPLAY);
-  byte error_display;
-  error_display = Wire.endTransmission();
-
-  if (error_display == 0) {
-    g_displayConnected = true;  // Display found
-  } else {
-    Serial.println("ERROR: Display: Not found");
-    g_displayConnected = false;
-  }
-
-  // Scan for Ambient Pressure Sensor
-  Wire.beginTransmission(I2CADDR_LPS22);
-  byte error_LPS22;
-  error_LPS22 = Wire.endTransmission();
-
-  if (error_LPS22 == 0) {
-    g_ambientPressureSensorConnected = true;  // Ambient pressure sensor found
-  } else {
-    Serial.println("ERROR: Ambient Pressure Sensor: Not found");
-    g_ambientPressureSensorConnected = false;
-  }
-
-  // Scan for Sip and Puff Sensor
-  Wire.beginTransmission(I2CADDR_LPS35HW);
-  byte error_LPS35HW;
-  error_LPS35HW = Wire.endTransmission();
-
-  if (error_LPS35HW == 0) {
-    g_mouthpiecePressureSensorConnected = true;  // Sip and Puff Sensor Found
-  } else {
-    Serial.println("ERROR: Mouthpiece Pressure Sensor: Not found");
-    g_mouthpiecePressureSensorConnected = false;
-  }
-
-  // Scan for Joystick Sensor
-  Wire.beginTransmission(I2CADDR_TLV493D);
-  byte error_TLV493D;
-  error_TLV493D = Wire.endTransmission();
-
-  if (error_TLV493D == 0) {
-    g_joystickSensorConnected = true;  // Joystick sensor found
-  } else {
-    Serial.println("ERROR: Joystick Sensor: Not found");
-    g_joystickSensorConnected = false;
-  }
   // No Wire.end() here (4.5.4): this used to disable the TWIM peripheral
   // behind it — scanner-example residue with no consumer — and the bus only
   // worked afterwards because the display's and the pressure sensors'
@@ -4308,7 +4298,93 @@ void checkI2C() {
   // the shared bus (executeInit=false), which left the joystick-only
   // degraded boot reading against a dead controller until the vendored
   // Wire's bounded recovery re-enabled it. One owner instead: the bus comes
-  // up at the Wire.begin() above and stays up for every consumer.
+  // up at setup()'s top (4.9.8 fix A) and stays up for every consumer — this
+  // begin() remains as the idempotent re-assert for any future caller that
+  // reaches the scan without the setup-top bring-up.
+
+  // 4.9.8 (boot-bus fix C): the scan is now BOUNDED-RETRY, not single-shot.
+  // The field episode (app log 2026-11-15/16) showed the failure mode the
+  // single pass could never survive: a slave left in a non-idle protocol
+  // state by the previous session's mid-transaction NVIC_SystemReset() (or
+  // stranded by the floating pre-begin bus — no external pull-ups on this
+  // PCB) answers its address with a CLEAN NACK forever, a clean NACK never
+  // reaches the vendored Wire's timeout recovery, and the whole session was
+  // condemned to safe mode on pass 1 — with safe mode generating zero I2C
+  // traffic, so NOTHING could heal until a lucky boot scanned a bus that a
+  // previous pass had happened to realign ("two beeps" -> "one beep" ->
+  // healthy, one device class per boot). The retry turns that healing curve
+  // into boot-time work: the probes' own address clocks plus the inter-pass
+  // settle + proactive bus-clear realign the slaves HERE, within one boot.
+  // Costs: a healthy boot exits after pass 1 (identical to the old single
+  // shot — silence, no notes), and a truly-absent device delays the verdict
+  // by at most (CONF_I2C_SCAN_PASSES - 1) x (CONF_I2C_SCAN_SETTLE_MS + probe
+  // time) before the same "not found" outcome as before.
+  struct I2CProbe {
+    uint8_t address;
+    bool* connected;   // the global verdict flag hardwareErrorCheck/BH read
+    const char* name;  // the legacy per-device "Not found" string
+    uint8_t snsBit;    // this device's bit in the heartbeat's sns= nibble (LSI2CScan.h)
+  };
+  const I2CProbe probes[] = {
+    { I2CADDR_DISPLAY, &g_displayConnected, "Display", LSI2C_SNS_DISPLAY },
+    { I2CADDR_LPS22, &g_ambientPressureSensorConnected, "Ambient Pressure Sensor", LSI2C_SNS_AMBIENT },
+    { I2CADDR_LPS35HW, &g_mouthpiecePressureSensorConnected, "Mouthpiece Pressure Sensor", LSI2C_SNS_MOUTHPIECE },
+    { I2CADDR_TLV493D, &g_joystickSensorConnected, "Joystick Sensor", LSI2C_SNS_JOYSTICK },
+  };
+  const uint8_t probeCount = sizeof(probes) / sizeof(probes[0]);
+
+  uint8_t foundMask = 0;  // devices that have answered on ANY pass so far
+  int passesDone = 0;
+  do {
+    if (passesDone > 0) {
+      // The realignment window between passes: settle, then the proactive
+      // bus-clear (bounded STOP + NXP 9-clock bus-clear + explicit STOP).
+      // NOT stamped into the recovery telemetry — this is bring-up work,
+      // not a wedge, and a scan that healed a bus must not read as
+      // recoveries>0 in the BH row.
+      delay(CONF_I2C_SCAN_SETTLE_MS);
+      Wire.busClear();
+    }
+    for (uint8_t probeIdx = 0; probeIdx < probeCount; probeIdx++) {
+      if (foundMask & probes[probeIdx].snsBit) continue;  // already answered — one ACK is final
+      Wire.beginTransmission(probes[probeIdx].address);
+      const byte probeError = Wire.endTransmission();
+      if (probeError == 0) {
+        foundMask |= probes[probeIdx].snsBit;  // Display found / sensor found
+        if (passesDone > 0) {
+          // A pass-1 NACK that a later pass healed is exactly the state the
+          // field episode could only diagnose from the app's BH rows — name
+          // it on the wire (queued: the USB attach is still ahead of us, the
+          // line drains once the port is up). First-pass success stays
+          // SILENT (the healthy-boots-print-nothing contract).
+          char healNote[80];  // worst case: "INFO: I2C scan: " + the longest name
+                              // ("Mouthpiece Pressure Sensor", 26) + " answered on pass 3 of 3" = 67
+          const int healNoteLen = snprintf(healNote, sizeof(healNote),
+                                           "INFO: I2C scan: %s answered on pass %d of %d",
+                                           probes[probeIdx].name, passesDone + 1,
+                                           (int)CONF_I2C_SCAN_PASSES);
+          if (healNoteLen > 0) {
+            serialTxEnqueueLine(healNote, (size_t)healNoteLen);
+          }
+        }
+      }
+    }
+    passesDone++;
+  } while (lsi2cScanWantsAnotherPass(passesDone, (uint8_t)(LSI2C_SNS_ALL & ~foundMask)));
+
+  // Final verdicts — written once, after the scan budget, in the legacy
+  // string shape (the raw prints land in TinyUSB's pre-attach discard window;
+  // the wire-visible copies are hardwareErrorCheck's queued ERROR lines).
+  for (uint8_t probeIdx = 0; probeIdx < probeCount; probeIdx++) {
+    if (foundMask & probes[probeIdx].snsBit) {
+      *probes[probeIdx].connected = true;
+    } else {
+      Serial.print("ERROR: ");
+      Serial.print(probes[probeIdx].name);
+      Serial.println(": Not found");
+      *probes[probeIdx].connected = false;
+    }
+  }
 }
 
 
@@ -4970,6 +5046,26 @@ void softwareReset() {
     lsHostCloseSwitchWindow();
   }
 
+  // 4.9.8 (boot-bus fix D): quiesce every I2C-driving poll BEFORE the farewell
+  // traffic. The CONF_RESET_DWELL_MS (3 s) used to leave the 20 ms screen
+  // poll, the 20 ms joystick/scroll polls and the 50 ms pressure poll
+  // transacting right up to NVIC_SystemReset() — a reset landing
+  // mid-transaction strands a slave between protocol states, and the slave
+  // then answers the SUCCESSOR boot's scan with a clean NACK forever (a clean
+  // NACK never reaches the vendored Wire's timeout recovery — the 2026-11-15
+  // field episode: every SR/CM/MP restart risked manufacturing the exact
+  // "all devices missing" safe-mode boot the scan retry now heals). After
+  // this point the ONLY I2C traffic in the reset path is the synchronous
+  // restart-page push, the clear push, and the final bus-clear — each
+  // bounded, each completing before the reset fires. The SCREEN poll is the
+  // one that matters most: its pending state-timer callback (restartPage's
+  // own scheduled finish) is the one framebuffer push that could otherwise
+  // land inside the final milliseconds.
+  pollTimer.disable(pollTimerId[CONF_TIMER_SCREEN]);
+  pollTimer.disable(pollTimerId[CONF_TIMER_JOYSTICK]);
+  pollTimer.disable(pollTimerId[CONF_TIMER_SCROLL]);
+  pollTimer.disable(pollTimerId[CONF_TIMER_PRESSURE]);
+
   screen.restartPage();
   buzzer.playShutdownSound();
 
@@ -4990,7 +5086,15 @@ void softwareReset() {
     delay(10);
   }
   screen.clear();
-  
+
+  // 4.9.8 (boot-bus fix D, second half): leave the bus IDLE at the reset
+  // instant. The proactive bus-clear returns any slave the farewell pushes
+  // left between protocol states to idle (bounded STOP, NXP 9-clock
+  // bus-clear, explicit STOP), so the successor boot's scan probes a clean
+  // bus instead of inheriting this session's tail. ~100 µs on a healthy bus;
+  // stamps no recovery telemetry.
+  Wire.busClear();
+
   NVIC_SystemReset();
   
 }

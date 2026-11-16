@@ -6,6 +6,7 @@
 
 #include "LSCircularBuffer.h"
 #include "LSHostSwitch.h"
+#include "LSI2CScan.h"
 #include "LSMemorySeedGate.h"
 #include "LSPressureClassify.h"
 #include "LSPressureEngageFilter.h"
@@ -715,6 +716,96 @@ static void test_seed_gate_absent_file_seeds() {
   CHECK(lsmemSeedMayWrite(0, 1) == 1);
 }
 
+// 4.9.8: the boot I2C scan's retry budget. Pins the three directions the
+// field episode (app log 2026-11-15/16, the "two error beeps" safe-mode
+// boots) depends on: a healthy boot exits after pass 1, a healing boot gets
+// exactly the budgeted extra passes, and a truly absent device delays its
+// verdict by a BOUNDED number of passes — never an unbounded wait.
+static void test_i2c_scan_retry_budget_and_early_exit() {
+  // Everything answered on pass 1: no more passes — the healthy boot's
+  // zero-extra-cost shape (and its silence: no heal notes on this path).
+  CHECK(lsi2cScanWantsAnotherPass(1, 0x0) == 0);
+  // Zero missing with zero passes done is degenerate but must also stop.
+  CHECK(lsi2cScanWantsAnotherPass(0, 0x0) == 0);
+
+  // Missing devices buy more passes, up to the budget.
+  CHECK(lsi2cScanWantsAnotherPass(0, 0x1) == 1);
+  CHECK(lsi2cScanWantsAnotherPass(1, 0x1) == 1);
+  CHECK(lsi2cScanWantsAnotherPass(2, 0x1) == 1);
+  // The budget is the bound: after CONF_I2C_SCAN_PASSES completed passes the
+  // NACK is a verdict, whatever is still missing.
+  CHECK(lsi2cScanWantsAnotherPass(3, 0x1) == 0);
+  CHECK(lsi2cScanWantsAnotherPass(3, 0xF) == 0);
+  // All four missing still gets the full budget (the field episode's
+  // "two beeps" boot — every device class NACKing on pass 1).
+  CHECK(lsi2cScanWantsAnotherPass(0, 0xF) == 1);
+  CHECK(lsi2cScanWantsAnotherPass(2, 0xF) == 1);
+  // Any single missing device (bit order irrelevant to this decision — only
+  // "none missing" stops early) keeps the loop alive.
+  CHECK(lsi2cScanWantsAnotherPass(1, 0x8) == 1);
+}
+
+// 4.9.8: the sns= nibble. Pins the digit order against the heartbeat line's
+// own printfs (debugLoop prints sns=<joystick><mouthpiece><ambient><display>,
+// so the mask rendered most-significant-digit first must read identically):
+// a mask that silently swapped two digits would make the new safe-mode
+// warning line name the WRONG missing device.
+static void test_i2c_sns_mask_digit_order_matches_heartbeat() {
+  // All four present: the heartbeat's sns=1111.
+  CHECK(lsi2cSnsMask(1, 1, 1, 1) == 0xF);
+  // All absent: the field episode's "two error beeps" boot (sns=0000).
+  CHECK(lsi2cSnsMask(0, 0, 0, 0) == 0x0);
+  // Display only missing: the field episode's "one error beep" boot —
+  // sensors recovered, display still NACKing (sns=1110, mask 0xE).
+  CHECK(lsi2cSnsMask(1, 1, 1, 0) == 0xE);
+  // Joystick only missing (sns=0111, mask 0x7) — the digit order's other
+  // end: the FIRST heartbeat digit is the one that went missing.
+  CHECK(lsi2cSnsMask(0, 1, 1, 1) == 0x7);
+  // Display only present: the 4.6.0 bench's unseated-interface-cable shape
+  // (joystick + both pressures absent; CHANGES.txt quotes it as sns=0001).
+  CHECK(lsi2cSnsMask(0, 0, 0, 1) == 0x1);
+  // Each device class is its own bit, independently observable.
+  CHECK(lsi2cSnsMask(1, 0, 0, 0) == 0x8);
+  CHECK(lsi2cSnsMask(0, 1, 0, 0) == 0x4);
+  CHECK(lsi2cSnsMask(0, 0, 1, 0) == 0x2);
+  // Non-bool truthy inputs normalize to their bit (callers pass sensor flags).
+  CHECK(lsi2cSnsMask(2, -1, 0, 7) == 0xD);
+}
+
+// 4.9.8: the hardware safe-mode warning line. Pins the exact wire shape —
+// the bare legacy line with the sns nibble appended, byte-identical to what
+// toggleSafeMode queues — plus the two refusal directions (a too-small
+// buffer refuses rather than sending a truncated line).
+static void test_i2c_safe_mode_warning_line_names_the_missing_hardware() {
+  char buf[LSI2C_SAFE_MODE_HARDWARE_WARNING_BUF];
+  int len = lsi2cSafeModeHardwareWarning(buf, sizeof(buf), 1, 1, 1, 0);
+  CHECK(len == (int)std::strlen("WARNING: SAFE MODE ENABLED - Hardware (sns=1110)"));
+  CHECK(std::strcmp(buf, "WARNING: SAFE MODE ENABLED - Hardware (sns=1110)") == 0);
+
+  // The legacy shape is preserved as the prefix — hosts that substring-match
+  // the old line keep matching.
+  len = lsi2cSafeModeHardwareWarning(buf, sizeof(buf), 0, 0, 0, 0);
+  CHECK(std::strncmp(buf, "WARNING: SAFE MODE ENABLED - Hardware", 37) == 0);
+  CHECK(std::strcmp(buf, "WARNING: SAFE MODE ENABLED - Hardware (sns=0000)") == 0);
+
+  // All healthy is not a shape this line is drawn for, but the composer must
+  // still render it coherently if a future caller does.
+  len = lsi2cSafeModeHardwareWarning(buf, sizeof(buf), 1, 1, 1, 1);
+  CHECK(std::strcmp(buf, "WARNING: SAFE MODE ENABLED - Hardware (sns=1111)") == 0);
+
+  // Exactly-sized buffer (the composed line is 48 chars + NUL = 49) fits.
+  char exact[49];
+  CHECK(lsi2cSafeModeHardwareWarning(exact, sizeof(exact), 1, 1, 1, 0) == 48);
+  CHECK(std::strcmp(exact, "WARNING: SAFE MODE ENABLED - Hardware (sns=1110)") == 0);
+
+  // One byte too small: refuse (negative), do not truncate mid-token.
+  char tiny[48];
+  CHECK(lsi2cSafeModeHardwareWarning(tiny, sizeof(tiny), 1, 1, 1, 0) < 0);
+  // Degenerate sizes refuse too.
+  char one[1];
+  CHECK(lsi2cSafeModeHardwareWarning(one, sizeof(one), 1, 1, 1, 1) < 0);
+}
+
 int main() {
   static_assert(!std::is_copy_constructible<LSCircularBuffer<int>>::value,
                 "owning circular buffers must not be shallow-copyable");
@@ -740,6 +831,9 @@ int main() {
   test_latch_crossing_guard();
   test_latch_guard_pass_cadence();
   test_seed_gate_absent_file_seeds();
+  test_i2c_scan_retry_budget_and_early_exit();
+  test_i2c_sns_mask_digit_order_matches_heartbeat();
+  test_i2c_safe_mode_warning_line_names_the_missing_hardware();
 
   std::printf("%d checks, %d failures\n", checks, failures);
   return failures == 0 ? 0 : 1;
