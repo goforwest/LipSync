@@ -87,3 +87,22 @@ FOLLOW-UPS: (1) the electrical hunt (multimeter/wiggle/continuity above); (2) th
   if pm/fp recur; (3) consider a safe-mode periodic re-scan + "sns improved" report as a future
   observability item (a re-scan can HEAL nothing electrical but would timestamp a wobble recovery
   and could catch the moment a marginal contact returns).
+
+=== ADDENDUM (2026-11-16 ~11:00): THE 4.9.9 VDD MATRIX — THE RAIL IS EXONERATED ===
+10 more replug cycles on 4.9.9 (BH field 29 + HB vdd= live): 7/10 two-beep boots, 3/10 healthy —
+and VDD AT THE CHIP WAS NOMINAL ON EVERY BOOT, dead and healthy alike: 3322-3339 mV, no sag, no
+difference between states (field-29 read at probe time + the HB line's vdd= on the stuck boots:
+3323-3339 mV). The USB cable, the regulator, and the +3V3 path at the module are EXONERATED; the
+dead state is NOT a rail sag the MCU can see.
+CONSEQUENCE: with the rail nominal at the module and BOTH connectors' devices (J1 display + J2 pod)
+vanishing together, the only shared failure element left is the XIAO module's own connection to the
+hub board — the socketed module's header contacts for SDA/SCL (or 3V, whose joint breaks the slaves'
+supply while the module runs from VBUS). Master-alone-on-the-bus is exactly what a lifted SDA/SCL
+header joint produces: the chip's internal pull-ups hold the lines, every probe reads a clean NACK,
+recov=0 bus=1. The stochasticity maps to board/enclosure flex during each replug; warm resets can
+never heal it (no mechanical change); the user's "slow replug heals" observation = different seating.
+The single-device 1-beep shapes (joystick-only, mouthpiece-only, across the field logs) remain a
+second, milder thread — pod-side wiring or per-device marginality — not the shared joint.
+NEXT PHYSICAL STEPS (decisive, 2 minutes): during a 2-beep boot press/reseat the XIAO module and
+watch for the devices popping back; then pull-inspect-reseat the module (dull pins / spread socket
+contacts); optional multimeter at J1.2 during a dead boot (3.3 V = SDA/SCL joint, 0 V = 3V joint).
