@@ -118,3 +118,12 @@ from the wire alone. REMEDIATION (maker-level): pull the module, inspect pins + 
 replace the female headers. The single-device 1-beep shapes remain a milder second thread (pod
 wiring/per-device marginality). FIRMWARE CONTRIBUTIONS STAND: 4.9.8 closed the reset-manufactured
 strand class (B22 8/8); 4.9.9's vdd field turned a multimeter question into a wire answer.
+
+=== FIELD-UNIT DISPOSITION (2026-11-16): DOCUMENTED, NOT AN ACTION ITEM ===
+The owner declines to open the hub enclosure now — correctly: the finding is a documentation
+outcome, not an urgent repair. The unit runs 4.9.9 with the diagnostic aboard; the remediation
+(inspect/clean/reseat the XIAO, reflow/replace headers if it recurs) is recorded here and in the
+PR description for whenever the hub is next serviced, and the press/reseat observation stands as
+the root-cause confirmation. Guidance for other makers: two error beeps at power-on that survive
+app restarts = power-cycle fully first; if it persists, reseat the XIAO module before opening
+anything else. 4.9.9's BH field 29 / HB vdd= turns any recurrence into a wire-side answer.
