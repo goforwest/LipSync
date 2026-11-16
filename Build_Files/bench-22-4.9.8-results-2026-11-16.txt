@@ -106,3 +106,15 @@ second, milder thread — pod-side wiring or per-device marginality — not the 
 NEXT PHYSICAL STEPS (decisive, 2 minutes): during a 2-beep boot press/reseat the XIAO module and
 watch for the devices popping back; then pull-inspect-reseat the module (dull pins / spread socket
 contacts); optional multimeter at J1.2 during a dead boot (3.3 V = SDA/SCL joint, 0 V = 3V joint).
+
+=== ROOT CAUSE CONFIRMED (2026-11-16 ~11:15): THE XIAO SOCKET JOINT ===
+User's physical test during a 2-beep boot: pressing/"messing with" the XIAO module restored ALL
+FOUR devices immediately. The all-devices-missing boot state is an intermittent connection between
+the socketed XIAO module and the hub board (SDA/SCL or 3V header contacts) — handling during each
+replug flexes the board/module, warm resets can never heal it (no mechanical change), and the
+rail self-measurement (4.9.9 BH field 29 / HB vdd=) is what localized it to the module boundary
+from the wire alone. REMEDIATION (maker-level): pull the module, inspect pins + socket contacts
+(dull/oxidized pins, spread sockets), clean (isopropyl), reseat firmly; if it recurs, reflow or
+replace the female headers. The single-device 1-beep shapes remain a milder second thread (pod
+wiring/per-device marginality). FIRMWARE CONTRIBUTIONS STAND: 4.9.8 closed the reset-manufactured
+strand class (B22 8/8); 4.9.9's vdd field turned a multimeter question into a wire answer.
