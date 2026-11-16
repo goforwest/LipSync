@@ -1,0 +1,89 @@
+# LipSync V4.9.8 bench — B22 boot-bus rounds, driven over the wire from the repo checkout (2026-11-15 23:00 – 2026-11-16 02:50 America/Vancouver)
+# Driver: Build_Files/lipsync-wire.py + Build_Files/bench-22-sr-storm.py + Build_Files/bench-22b-replug-watch.py; port /dev/cu.usbmodem101
+# Build under test: dist/LipSync_Firmware_4.9.8.uf2 (local CI-recipe build; VN,0:4.9.8 confirmed on device)
+# Context: the field "two error beeps" boot mystery (app logs 2026-11-16T02-21 + 07-04); fixes A-E shipped in 4.9.8 (commit 9bcef05)
+
+=== B22: SR STORM (deliberate-reset class, fix D under test) ===
+Pre-flight BH: 0,1,1,1,1,-1 (all healthy, USB gamepad mode).
+8 x (SR,1:1 -> dwell -> reboot -> probe VN+BH):
+  cycle 1..8: ALL PASS — VN=4.9.8, display=1 pressure=1 joystick=1, recov=0 bus=1, every cycle.
+Verdict: 8/8 boots healthy across 8 warm restarts; no device class lost, no bus recovery, no
+heartbeat/degraded lines on any successor boot (the silence contract held throughout).
+Significance: on 4.9.7 the field episode's all-missing state AROSE after one SR from a working
+session (07-04 log's predecessor: 02:13:10 SR -> 02:13:20 boot all-missing). On 4.9.8 the reset
+path is I2C-quiet (fix D: polls quiesced + final bus-clear before NVIC_SystemReset) and produced
+zero strandings in 8 attempts.
+
+=== B22 (cont): MODE-CHANGE REBOOT ===
+MP,1:2 (restore OM=1/CM=2 Bluetooth mouse from the recovery attempts' leftover OM=2/CM=1):
+acked, rebooted, successor boot healthy (BH 0,1,1,1,1) and BT,0:3 answers (BLE stack initialized,
+3 hosts bonded). 9 healthy resets running.
+
+=== B22b: REPLUG MATRIX (power-on class; human replugs, script probes) ===
+cycle 1: replug observed; successor boot VN=4.9.8, display=1 pressure=1 joystick=1 recov=0 bus=1 —
+  HEALTHY power-on boot (10-for-10 on the day).
+cycles 2+: no further replugs (human away; watcher window expired). The 2-beep power-on state did
+  NOT reproduce under observation today.
+
+=== THE FIELD EPISODE ON 4.9.8 (app log 2026-11-16T07-04-45, BEFORE this bench) — what it proves ===
+The user's replug roulette hit the 2-beep state ON 4.9.8 and it behaved exactly as on 4.9.7:
+survived >=6 SR restarts and healed only after more replug attempts.
+Wire truth from that log (HB/BH lines, fix E's sns encoding working):
+  - sns=0000 (all four missing) and sns=0111 (joystick-only missing) alternate across boots,
+    including a REGRESSION 0111 -> 0000 across one plain SR (07:01:14 -> 07:01:42);
+  - EVERY bad boot: recoveries=0, bus=1 — clean NACKs on an idle bus, again;
+  - NO "INFO: I2C scan:" heal note ever fired — the 3-pass retry RAN on every bad boot and ALL
+    THREE passes NACKed. The scan retry + boot bus-clear cannot heal this state;
+  - the final healthy boot reported CM=1 (the recovery attempts' mode changes), so its BT,0
+    refusal was by-design (USB-mode boot), not a BLE failure.
+REVISED DIAGNOSIS (supersedes the "stranded protocol state" reading in CHANGES 4.9.8):
+  The 2-beep state is ELECTRICAL, not protocol: the master is electrically ALONE on the bus.
+  A floating-but-pulled-up master bus reads exactly like a NACK on every probe (no timeout, no
+  recovery — matching recov=0/bus=1), so the state is "slaves unpowered or the bus wires between
+  master and slaves are open". The staged, non-monotonic healing (0000 -> 0111 -> 0000 -> healthy
+  across replugs/handling) is contact wobble, not state-machine realignment; the user's "1 beep +
+  restart heals" observation fits a 1-beep boot's HEAVY bus traffic (display init + framebuffer
+  pushes + sensor reads) re-making a marginal contact, while a 2-beep safe boot generates no I2C
+  traffic at all and heals nothing. 4.9.8's A-D fixes remain correct and necessary (they close the
+  firmware-side strand classes: mid-transaction resets — proven by B22's 8/8 — the app-side
+  floating window, slow slave power-up; fix E's sns lines carried the diagnosis in the field log),
+  but they cannot heal an open circuit, and the ~1.5 s BOOTLOADER floating window (before the app
+  runs, on every boot incl. warm resets) remains unreachable from the app.
+OPEN HARDWARE QUESTIONS (need hands):
+  1. Multimeter during a 2-beep boot: 3V3 at J1 pin 2 (display) and J2 pin 2 (joystick pod)
+     relative to GND, then a gentle wiggle of the XIAO module and both cables while watching.
+     Rail dead vs rail alive decides "power path" vs "bus wire open".
+  2. Inspect/reseat the XIAO module's header joints (SDA/SCL/3V3 pins) — the one component common
+     to ALL FOUR devices on both connectors.
+  3. Continuity: XIAO SDA/SCL pins -> J1/J2 signal pins, power off.
+
+=== NEW, SEPARATE FINDING: A CAPTURED HARDFAULT ON A HEALTHY BOOT (needs its own hunt) ===
+At ~02:45 (after the replug round, device otherwise healthy, Bluetooth mouse mode) the first-host
+byte report printed the PREVIOUS boot's forensics: "BOOT: 4.9.8 rst=0x4 pt=7 pm=2 ... fp=0x6C000
+sw=443" — a captured HardFault (pm=2) at PC page 0x36, converted by the fault capture into a clean
+SREQ reset; the successor boot is healthy (BH 0,1,1,1,1; BT,0:3).
+Symbolized against the 4.9.8 build map, page 0x6C000-0x6E000 contains:
+  ada_callback_queue / ada_callback_invoke (the core's deferred-callback dispatch — the BLE event
+  path), init/pinMode/analogWrite/HardwarePWM, FreeRTOS list ops, and the CRYS_RND (BLE pairing
+  crypto) block. 8 KB page granularity cannot pin the function; a BT-mode idle fault makes the
+  ada_callback BLE-dispatch path the prime suspect, CRYS the second. One occurrence, unattended
+  window (human presence between the probes is unconfirmed). NOT related to the boot-bus class
+  (no I2C involvement visible); recorded for a follow-up hunt with the fault-page capture widened
+  if it recurs.
+
+=== VERDICTS ===
+PASS B22 (fix D): 8/8 healthy boots across SR,1:1 storms + 1 mode-change reboot — the deliberate
+  reset no longer manufactures the all-missing state on this unit (the 4.9.7 field shape).
+PASS B22b (partial): 1/1 observed replug healthy. The 2-beep power-on state did not reproduce
+  under observation; the field episode (above) shows it CAN still occur on 4.9.8 and is now
+  attributed to an intermittent electrical open in the shared I2C path (hardware follow-up).
+PASS (fix E): the field log's HB lines carry sns=0000/sns=0111 in the pinned digit order — the
+  mystery's state now reads directly off the wire (the queued WARNING variant did not surface in
+  the app export; the HB line carries the same truth).
+CONFIRMED (fix C behavior): on genuinely-dead devices the 3-pass retry exhausts silently (no heal
+  notes fired) and still boots safe mode with honest verdicts — the retry is not a cure for an
+  open circuit, by design it only re-probes.
+FOLLOW-UPS: (1) the electrical hunt (multimeter/wiggle/continuity above); (2) the HardFault thread
+  if pm/fp recur; (3) consider a safe-mode periodic re-scan + "sns improved" report as a future
+  observability item (a re-scan can HEAL nothing electrical but would timestamp a wobble recovery
+  and could catch the moment a marginal contact returns).
