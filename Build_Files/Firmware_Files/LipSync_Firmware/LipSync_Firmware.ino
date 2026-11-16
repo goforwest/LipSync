@@ -1149,26 +1149,26 @@ void loop() {
     int diagnosticLen;
     if (bleInitFailed) {
       diagnosticLen = snprintf(diagnosticLine, sizeof(diagnosticLine),
-        "HB: ms=%lu mode=%d safe=%d wdt=%d feed=%s rst=0x%lX pt=%u pm=%u trail=%u bus=%d recov=%lu sns=%d%d%d%d ble=3 st=%d sd=%d pstep=%u pcode=0x%lX need=0x%lX bad1=0x%lX bad2=0x%lX dem=%u rc=0x%lX pst=%d prc=0x%X fp=0x%s sw=%lu",
+        "HB: ms=%lu mode=%d safe=%d wdt=%d feed=%s rst=0x%lX pt=%u pm=%u trail=%u bus=%d recov=%lu sns=%d%d%d%d vdd=%dmV ble=3 st=%d sd=%d pstep=%u pcode=0x%lX need=0x%lX bad1=0x%lX bad2=0x%lX dem=%u rc=0x%lX pst=%d prc=0x%X fp=0x%s sw=%lu",
         (unsigned long)millis(), g_operatingMode, g_safeModeEnabled ? 1 : 0,
         g_watchdogArmed ? 1 : 0, feedText, (unsigned long)g_lastRebootReason,
         g_bootTrailPrev, g_hangMarkerPrev, readTrailByte(), Wire.busHealthy() ? 1 : 0,
         (unsigned long)Wire.recoveryCount(), g_joystickSensorConnected ? 1 : 0,
         g_mouthpiecePressureSensorConnected ? 1 : 0, g_ambientPressureSensorConnected ? 1 : 0,
-        g_displayConnected ? 1 : 0, g_bleInitStage, (int)g_bleSdWasEnabled,
+        g_displayConnected ? 1 : 0, readVddMillivolts(), g_bleInitStage, (int)g_bleSdWasEnabled,
         g_bleProbeStep, (unsigned long)g_bleProbeCode, (unsigned long)g_bleProbeNeed,
         (unsigned long)g_bleIrqBad1, (unsigned long)g_bleIrqBad2, g_bleProbeDemoted,
         (unsigned long)g_bleInitRc, (int)g_blePrevSt, (unsigned int)g_blePrevRc,
         faultText, (unsigned long)(g_loopTaskHandle ? uxTaskGetStackHighWaterMark(g_loopTaskHandle) : 0));
     } else {
       diagnosticLen = snprintf(diagnosticLine, sizeof(diagnosticLine),
-        "HB: ms=%lu mode=%d safe=%d wdt=%d feed=%s rst=0x%lX pt=%u pm=%u trail=%u bus=%d recov=%lu sns=%d%d%d%d",
+        "HB: ms=%lu mode=%d safe=%d wdt=%d feed=%s rst=0x%lX pt=%u pm=%u trail=%u bus=%d recov=%lu sns=%d%d%d%d vdd=%dmV",
         (unsigned long)millis(), g_operatingMode, g_safeModeEnabled ? 1 : 0,
         g_watchdogArmed ? 1 : 0, feedText, (unsigned long)g_lastRebootReason,
         g_bootTrailPrev, g_hangMarkerPrev, readTrailByte(), Wire.busHealthy() ? 1 : 0,
         (unsigned long)Wire.recoveryCount(), g_joystickSensorConnected ? 1 : 0,
         g_mouthpiecePressureSensorConnected ? 1 : 0, g_ambientPressureSensorConnected ? 1 : 0,
-        g_displayConnected ? 1 : 0);
+        g_displayConnected ? 1 : 0, readVddMillivolts());
     }
     if (diagnosticLen > 0 && diagnosticLen < (int)sizeof(diagnosticLine)) {
       serialTxEnqueueLine(diagnosticLine, (size_t)diagnosticLen);
@@ -4277,6 +4277,45 @@ void setDebugState(int inputDebugMode) {
   }
 }
 
+
+//***READ VDD MILLIVOLTS FUNCTION***//
+// Function   : readVddMillivolts
+//
+// Description: Measures the chip's own VDD — electrically the +3V3 net that
+//              feeds all four I2C devices (the XIAO's 3V pin, the display on
+//              J1 and the joystick pod on J2). The boot-bus hunt's field
+//              evidence (B22b, 20 power cycles: ~35% of power-on boots land
+//              all-missing with clean NACKs on an idle bus, stochastic across
+//              dwell time and plug technique, healing in per-device stages)
+//              reads as "the master is alone on the bus" — either the shared
+//              rail sagging/never-cycling (USB input, connector, regulator)
+//              or an open between the rail and the slaves. The nRF52840
+//              survives a much lower VDD than the sensors do, so the rail can
+//              sag far enough to kill every slave while the MCU boots fine —
+//              and the SAADC's internal VDD channel answers that from the
+//              wire: a degraded boot reporting vdd=~3300 points downstream
+//              (contacts/wiring/slaves), vdd well below ~3100 points at the
+//              rail itself. Diagnostic only — no behavior keys on it.
+//
+//              AR_INTERNAL (0.6 V ref, gain 1/6) gives a 3.6 V full scale;
+//              12-bit resolution maps raw*3600/4095 to millivolts. Two
+//              samples with the first discarded — the first conversion after
+//              a SAADC config change carries the startup artifact. ~2x<50 us
+//              per call, blocking; called from BH (on demand) and the
+//              degraded HB line (every 5 s in safe mode).
+//
+// Parameters : void
+//
+// Return     : int : measured VDD in millivolts (0 on a failed conversion)
+//****************************************//
+int readVddMillivolts() {
+  analogReference(AR_INTERNAL);
+  analogReadResolution(12);
+  (void)analogReadVDD();  // discard the post-config-change first sample
+  const uint32_t raw = analogReadVDD();
+  if (raw == 0 || raw > 4095) return 0;
+  return (int)((raw * 3600UL) / 4095UL);
+}
 
 //***CHECK I2C FUNCTION***//
 // Function   : checkI2C

@@ -343,6 +343,11 @@ void errorScreen();
 // Buzzer feedback helper called by the Hub menu (LSScreen.h)
 void buzzerErrorCue();
 
+// 4.9.9 boot-bus diagnostics: the +3V3 rail self-measurement (the I2C slaves'
+// supply — see the definition for the field evidence it discriminates).
+// Non-blocking budget: two SAADC samples, ~100 us, blocking.
+int readVddMillivolts();
+
 // Input restriction machinery (roadmap item 11): boot-time load of the four
 // restriction settings, and the single gate every resolved input action passes
 // through (inputClass is INPUT_CLASS_SAP/_BUTTON/_SWITCH from LSConfig.h).

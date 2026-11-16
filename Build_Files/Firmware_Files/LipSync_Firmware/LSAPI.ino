@@ -1887,6 +1887,16 @@ void getPressureValue(bool responseEnabled, bool apiEnabled, String optionalPara
 //                              2 = poll backed off (bus crawls)
 //                ageSec      : seconds since the last recovery, -1 when none
 //                              happened this boot
+//                vddMillivolts (4.9.9, field 29): the +3V3 rail self-measured
+//                              (SAADC internal VDD channel — the I2C slaves'
+//                              supply). Appended for the boot-bus hunt: a
+//                              degraded boot reporting all-devices-missing
+//                              with vdd near ~3300 mV points DOWNSTREAM of
+//                              the rail (J1/J2 contacts, wiring, the slaves
+//                              themselves); vdd well below ~3100 mV points at
+//                              the rail itself (USB input, connector, the
+//                              regulator). Diagnostic only — nothing keys on
+//                              it, and the app's first-six read is unaffected.
 //
 // Parameters :  responseEnabled : bool : The response for serial printing is enabled if it's set to true.
 //                                        The serial printing is ignored if it's set to false.
@@ -1931,7 +1941,7 @@ void getBusHealth(bool responseEnabled, bool apiEnabled) {
   int pipelineDiagnostics[14];
   fillJoystickPipelineDiagnostics(pipelineDiagnostics);
 
-  const int outputArraySize = 29;
+  const int outputArraySize = 30;  // 4.9.9: + vddMillivolts (field 29) — see the endpoint doc above
   int tempBusHealth[outputArraySize];
   tempBusHealth[0] = (int)recoveries;
   tempBusHealth[1] = Wire.busHealthy() ? 1 : 0;
@@ -1939,6 +1949,7 @@ void getBusHealth(bool responseEnabled, bool apiEnabled) {
   tempBusHealth[3] = pressureHealth;
   tempBusHealth[4] = joystickHealth;
   tempBusHealth[5] = ageSec;
+  tempBusHealth[29] = readVddMillivolts();  // 4.9.9: the +3V3 rail self-measurement (see the endpoint doc above)
   for (int diagIndex = 0; diagIndex < 9; diagIndex++) {
     tempBusHealth[6 + diagIndex] = hidDiagnostics[diagIndex];
   }

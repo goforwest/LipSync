@@ -68,7 +68,11 @@ def bh_fields(lines):
     for line in lines:
         if "SUCCESS,0:BH,0:" in line:
             parts = [p.strip() for p in line.split("SUCCESS,0:BH,0:", 1)[1].split(",")]
-            return [int(p) for p in parts[:6]]
+            fields = [int(p) for p in parts[:6]]
+            # 4.9.9: field 29 = the +3V3 rail self-measurement (mV) — the
+            # boot-bus hunt's rail-vs-downstream discriminator.
+            fields.append(int(parts[29]) if len(parts) > 29 else -1)
+            return fields
     return None
 
 
@@ -114,7 +118,7 @@ def main():
         extra = [l for l in drain(ser, 4.0)
                  if any(k in l for k in ("INFO: I2C scan", "WARNING: SAFE", "HB:", "ERROR"))]
         ser.close()
-        state = f"display={bh[2]} pressure={bh[3]} joystick={bh[4]} recov={bh[0]} bus={bh[1]}" if bh else "NO-BH"
+        state = f"display={bh[2]} pressure={bh[3]} joystick={bh[4]} recov={bh[0]} bus={bh[1]} vdd={bh[6]}mV" if bh else "NO-BH"
         print(f"cycle {cycle}: VN={vn}  {state}" + (f"  extra={extra}" if extra else ""), flush=True)
     print("=== B22b done ===", flush=True)
 
