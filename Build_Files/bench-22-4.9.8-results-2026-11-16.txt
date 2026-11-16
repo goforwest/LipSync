@@ -150,3 +150,12 @@ mouse, the FIRST drag on Windows worked, and NO stuck button state was inherited
 criteria met — the mid-hold host-switch release behaves exactly as the latch-guard fix intends.
 This closes the last NEEDS-HANDS item from the bench-16 list; B18 moves to DONE on the tag-day
 checklist (re-run optional).
+
+=== INCIDENTAL PASS: FORGET-AN-INACTIVE-HOST-WHILE-CONNECTED (2026-11-16 ~13:05, user-initiated) ===
+The user forgot the stale row-2 bond (the deleted-side iPhone — the exact cleanup the 4.9.7 bench
+log flagged as optional). Observed: host count 3 -> 2, rows renumbered MAC-order (Windows moved
+row 3 -> row 2, as designed), the CONNECTED Mac (row 1) untouched and active throughout, device
+healthy, BT,0:3 correctly answers "no such host row (re-read BT,0 after any forget)". This is the
+forget-while-connected path from the 4.9.0 hardening working end-to-end on hardware. The
+renumbering contract (fresh MAC-sorted enumeration; clients re-read after any forget) held.
+Current host table: 1=Hamoudi___s Laptop (connected), 2=DESKTOP-FBIVLCV (Windows, inactive).
