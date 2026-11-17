@@ -1073,6 +1073,14 @@ uint32_t lsHostBeginSwitchWindow(void) {
     g_switchAdvRestartPending = true;
     g_switchAdvRestartPendingMs = millis();
   }
+  // 4.9.9 review round 2: end the HID watchdog's grace tracking here too, like
+  // the cancel and close siblings. The window never opened, so no mid-window
+  // freeze occurred — but if the outgoing link was already mid-grace
+  // (unsubscribed) when the switch started, a same-handle reconnect after this
+  // failure inherits the elapsed grace (lsHidWatchdogLoop re-keys only on
+  // handle change) and can take one early watchdog cycle mid-CCCD-restore.
+  // Every path that tears down window state must also end grace tracking.
+  lsHidWatchdogResetGrace();
   return rc;
 }
 

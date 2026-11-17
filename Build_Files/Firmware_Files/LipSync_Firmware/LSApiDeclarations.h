@@ -38,6 +38,7 @@
 
 #include <WString.h>
 #include "LSHostSwitch.h"  // Upstream #16: the pure host-switch row model + decisions (no Arduino types)
+#include "LSUtils.h"  // pointFloatType (the float* formatter params below) — self-contained, not include-order dependent
 
 // ---- Serial settings API (defined in LSAPI.ino) ----
 // The two-argument cores and their String redefinitions that the dispatch
@@ -59,6 +60,7 @@ int getCommunicationMode(bool responseEnabled, bool apiEnabled);
 void getCommunicationMode(bool responseEnabled, bool apiEnabled, String optionalParameter);
 void setCommunicationMode(bool responseEnabled, bool apiEnabled, int inputCommunicationMode);
 void setCommunicationMode(bool responseEnabled, bool apiEnabled, String optionalParameter);
+void toggleCommunicationMode(bool responseEnabled, bool apiEnabled);  // CM: the apply-and-store half of a mode change (LipSync_Firmware.ino cross-tab call)
 bool storeModePair(int operatingMode, int communicationMode);  // Atomic menu-mode persistence; caller resets once
 void setModePreset(bool responseEnabled, bool apiEnabled, int inputPreset);
 void setModePreset(bool responseEnabled, bool apiEnabled, String optionalParameter);
@@ -326,6 +328,43 @@ void printResponseString(bool responseEnabled,
                          String responseCommand,
                          bool responseParameterEnabled,
                          String responseParameter);
+// The float formatters — LipSync_Firmware.ino calls the Point/Array variants
+// cross-tab (IN,1 corner answers, DEBUG,1/DEBUG,2), so they must not depend
+// on the ctags auto-prototype pass (see the file comment above).
+void printResponseFloat(bool responseEnabled,
+                        bool apiEnabled,
+                        bool responseStatus,
+                        int responseNumber,
+                        String responseCommand,
+                        bool responseParameterEnabled,
+                        float responseParameter);
+void printResponseFloatArray(bool responseEnabled,
+                             bool apiEnabled,
+                             bool responseStatus,
+                             int responseNumber,
+                             String responseCommand,
+                             bool responseParameterEnabled,
+                             String responsePrefix,
+                             int responseParameterSize,
+                             char responseParameterDelimiter,
+                             float responseParameter[]);
+void printResponseFloatPoint(bool responseEnabled,
+                             bool apiEnabled,
+                             bool responseStatus,
+                             int responseNumber,
+                             String responseCommand,
+                             bool responseParameterEnabled,
+                             pointFloatType responseParameter);
+void printResponseFloatPointArray(bool responseEnabled,
+                                  bool apiEnabled,
+                                  bool responseStatus,
+                                  int responseNumber,
+                                  String responseCommand,
+                                  bool responseParameterEnabled,
+                                  String responsePrefix,
+                                  int responseParameterSize,
+                                  char responseParameterDelimiter,
+                                  pointFloatType responseParameter[]);
 void serialTxService();  // Non-blocking CDC response queue; called from loop()
 bool serialTxEnqueueLine(const char* line, size_t length);
 bool serialTxEnqueueLine(const String &line);
