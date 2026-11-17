@@ -1,6 +1,6 @@
 # Adafruit LPS2X — LipSync bounded fork
 
-Vendored from the release-pinned **Adafruit LPS2X 2.0.6** library.
+Vendored from the release-pinned **Adafruit LPS2X 2.0.6** library (upstream: https://github.com/adafruit/Adafruit_LPS2X).
 
 The upstream `reset()` and one-shot waits have no timeout. Adafruit BusIO
 returns all-one bits when an I2C read fails, so a sensor that disappears or

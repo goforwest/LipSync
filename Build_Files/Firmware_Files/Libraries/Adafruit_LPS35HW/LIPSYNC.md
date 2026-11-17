@@ -1,6 +1,6 @@
 # Adafruit LPS35HW — LipSync bounded fork
 
-Vendored from the release-pinned **Adafruit LPS35HW 1.0.6** library.
+Vendored from the release-pinned **Adafruit LPS35HW 1.0.6** library (upstream: https://github.com/adafruit/Adafruit_LPS35HW).
 
 Upstream waits forever for reset, one-shot measurement, and pressure-zero
 bits to clear. A failed Adafruit BusIO read returns all ones, which keeps each
