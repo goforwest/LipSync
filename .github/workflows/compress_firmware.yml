@@ -108,18 +108,21 @@ jobs:
             exit 0
           fi
           git commit -m "Automated update: Compress firmware files"
-          # (4.9.7 review, follow-up) Tolerate-and-warn on a refused push —
-          # but the failure modes are not the same drift, so they are not the
-          # same warning:
+          # (4.9.7 review, follow-up) Push-failure handling is
+          # failure-mode-specific — and 4.9.9 round 2 makes the exit status
+          # specific too, so only the documented case can masquerade as
+          # success:
           #   - a genuine protected-branch refusal (GH006) is the documented
-          #     case: name it and exit green, pointing at the tag-day
-          #     backstop;
+          #     tolerate-and-warn case: name it and exit green, pointing at
+          #     the tag-day backstop;
           #   - a non-fast-forward means a human push landed while this run
           #     was building the archive (the concurrency group serializes
           #     workflow runs, not human pushes) — one rebase-and-retry
-          #     covers that race, so a green job no longer implies a
-          #     silently skipped ZIP commit;
-          #   - anything else gets a generic named warning.
+          #     covers that race; if the retry ALSO fails, exit red (an
+          #     exhausted retry is not a tolerated drift);
+          #   - anything else (auth, read-only token, network) exits red:
+          #     a green job must mean the ZIP is current or the drift is the
+          #     named GH006 case, never an undisclosed failure.
           # The fail-closed source-ZIP gate in build_firmware.yml still
           # refuses any release built from a stale tracked ZIP, so tag day
           # cannot silently publish one.
@@ -139,7 +142,9 @@ jobs:
               else
                 git rebase --abort 2>/dev/null || true
               fi
+              echo "::error title=Source ZIP not updated::Push failed after the rebase retry (see the log above). The refreshed archive exists only on this runner — refresh it manually before tagging. build_firmware.yml will refuse a release whose tracked ZIP does not match the tagged tree."
+              exit 1
             fi
-            echo "::warning title=Source ZIP not updated::Push failed (see the log above). The refreshed archive exists only on this runner — refresh it manually before tagging. build_firmware.yml will refuse a release whose tracked ZIP does not match the tagged tree."
-            exit 0
+            echo "::error title=Source ZIP not updated::Push failed (not the documented GH006 case — see the log above). The refreshed archive exists only on this runner — refresh it manually before tagging. build_firmware.yml will refuse a release whose tracked ZIP does not match the tagged tree."
+            exit 1
           }

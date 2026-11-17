@@ -21,9 +21,6 @@ on:
       - 'v*'  # (4.5.7 review) this repo's own history carries lowercase tags (v4.0, v4.0.1) — a lowercase tag used to produce a release with NO artifacts and no manifest, silently
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 env:
   FQBN: Seeeduino:nrf52:xiaonRF52840
   SEEED_BOARD_INDEX: https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
@@ -31,6 +28,10 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # (4.9.9 review round 2) Job-level: the minimum for the release attach and
+    # the firmware-binaries push, scoped to the only job that needs it.
+    permissions:
+      contents: write
     # (4.5.7 review) Two near-simultaneous tags publishing the
     # firmware-binaries branch is a push race; the version guard below is
     # read-then-push, so serialize the publish job as belt-and-braces.
@@ -136,6 +137,16 @@ jobs:
                          /^#define[ \t]+CONF_LIPSYNC_VERSION_MINOR/{printf "%s.", $3}
                          /^#define[ \t]+CONF_LIPSYNC_VERSION_REV/{printf "%s", $3}' \
             Build_Files/Firmware_Files/LipSync_Firmware/LSConfig.h)
+          # (4.9.9 review round 2) The awk reads three #define fields and the
+          # value is interpolated into python expressions downstream. A
+          # malformed define (a macro name, a stray token) must fail the run
+          # HERE, shape-checked, rather than crash the publish step's int()
+          # parse into its "branch holds newer" branch — a green run that
+          # silently skips the branch publish while the release still attaches.
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+(\.[0-9]+)*$'; then
+            echo "LSConfig.h version constants did not parse as a plain dotted number (got: '$VERSION'). Check CONF_LIPSYNC_VERSION_MAJOR/MINOR/REV." >&2
+            exit 1
+          fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             TAG_VERSION="${GITHUB_REF_NAME#V}"
@@ -236,8 +247,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" --verify-tag --title "${GITHUB_REF_NAME}" \
-            --notes "Firmware ${VERSION}. See CHANGES.txt for details." || true
+          # (4.9.9 review round 2) Tolerate ONLY the "release already exists"
+          # race (a re-run after a partial publish). A blanket `|| true` also
+          # swallowed real API/quota failures; the upload below would catch
+          # them eventually, but with a less precise error.
+          if ! gh release create "${GITHUB_REF_NAME}" --verify-tag --title "${GITHUB_REF_NAME}" \
+            --notes "Firmware ${VERSION}. See CHANGES.txt for details."; then
+            if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+              echo "Release ${GITHUB_REF_NAME} already exists — attaching artifacts to it."
+            else
+              echo "gh release create failed and the release does not exist." >&2
+              exit 1
+            fi
+          fi
           gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
 
       # The browser updater cannot fetch release download URLs cross-origin
@@ -286,6 +308,14 @@ jobs:
             exit 1
           else
             EXPECTED_REMOTE_SHA=$(git ls-remote origin refs/heads/firmware-binaries | cut -f1)
+            # (4.9.9 review round 2) A branch deleted between the two probes
+            # would leave this empty and fall through to the unconditional
+            # recreate push below. That outcome is benign, but fail closed
+            # per this step's own policy — a re-run re-probes cleanly.
+            if [ -z "$EXPECTED_REMOTE_SHA" ]; then
+              echo "firmware-binaries vanished between the two probes — refusing to publish ${VERSION} blind; re-run the build." >&2
+              exit 1
+            fi
             if ! MANIFEST_B64=$(gh api "repos/${GITHUB_REPOSITORY}/contents/firmware-manifest.json?ref=firmware-binaries" \
               --jq '.content' 2>/dev/null); then
               echo "Could not read firmware-manifest.json from firmware-binaries — refusing to publish ${VERSION} blind." >&2
