@@ -234,6 +234,7 @@ uint32_t lsHostBeginSwitchWindow(void); // switch window: start the DIRECTED adv
 void lsHostDisarmSwitchWindow(void);                   // clear the SD whitelist + identity list (stock empty state; no-op storage after 4.8.8 — the directed mechanism arms neither)
 void lsHostCloseSwitchWindow(void); // close an open window: stop the window advertise, disarm, restore auto-restart, resume open advertising when no host is connected
 void lsHostCancelSwitchWindow(void); // cancel an open window without owning the final radio state (a second switch re-owns the radio from its own arm/begin/fallback)
+void lsHostArmDeferredAdvRestart(void);  // 4.9.9 round 3: the shared "window abandoned" tail — arm the deferred advertising restart when nothing is connected + end the HID watchdog grace (the begin-failure/cancel/close shape; the executor's disconnect-refused path uses it too)
 int  lsHostSwitchWindowTick(void);  // poll an open window: 1 = armed target connected, 0 = waiting (directed set re-armed), -1 = bound elapsed / re-arm failed, -2 = NON-TARGET connected (switch NOT confirmed; named on the wire)
 void lsHostServiceSwitchWindow(void);  // per-loop-pass window service (millisecond-granularity directed re-arms); no-op when no window is open
 bool lsHostSwitchWindowOpen(void);     // 4.9.0: is a switch window open? (the BT,3 gate — the bouncer would drop the peer pair-new admits)
@@ -368,10 +369,25 @@ void printResponseFloatPointArray(bool responseEnabled,
 void serialTxService();  // Non-blocking CDC response queue; called from loop()
 bool serialTxEnqueueLine(const char* line, size_t length);
 bool serialTxEnqueueLine(const String &line);
+// 4.9.9 review round 3 (reshaped round 4): the BOOT-DIAGNOSTIC enqueue — the
+// pre-attach one-shots (I2C heal note, hardwareErrorCheck ERROR lines, the
+// poll-timer registration audit, the safe-mode warnings) buffer for the
+// first host session instead of being silently dropped by the 4.6.4
+// anti-replay gate. Everything response-shaped keeps serialTxEnqueueLine.
+bool serialTxEnqueueDiagLine(const char* line, size_t length);
+bool serialTxEnqueueDiagLine(const String &line);
 
 // ---- Cross-tab free functions (defined in LipSync_Firmware.ino) ----
 
 // Device lifecycle
+// 4.9.9 review round 4: the BLE-init-window gate, split out so the serial
+// endpoints can gate BEFORE they mutate live state or print their acks.
+// Waits up to 2 s for the Bluefruit.begin() window to close; on expiry it
+// clears the FR preset witness exemption, queues a named ERROR line, and
+// returns false — the caller answers FAIL,3 and leaves every global
+// untouched. softwareReset() runs this gate itself, so the menu paths (no
+// ack) keep their protection.
+bool softwareResetGate();
 void softwareReset();
 void releaseOutputAction();
 void cancelSapOutputHold();  // 4.6.6: ends an engaged DRAG/SCROLL hold without emitting an input event (fault-interrupted holds)
@@ -418,6 +434,11 @@ void fillJoystickPipelineDiagnostics(int out[14]);
 // helpers shared by the SA/SB/SC/GA/GB/GC endpoints.
 void initSwitchActions();
 extern unsigned long g_menuInputHoldMs;  // (4.5.7 bench fix) hold duration of the input currently dispatching — see selectMenuItem's hold-to-confirm gate
+// 4.9.9 review round 3: the accepted full-calibration chain's initiator
+// (persisted at CA,1 acceptance, cleared at step 6/abort) — the internal
+// step-5 center's abort sites read this so a host CA,1 waiter resolves
+// FAIL,3 instead of an unsolicited MANUAL line.
+extern bool g_calibrationFromApi;
 // 4.5.11 bench: the BLE init task's progress/failure stage, printed in the
 // repeating boot header (the stage's own Serial line is discarded while the
 // port is closed). Codes: 0 = not started/running, 1 = SoftDevice enable
@@ -464,19 +485,26 @@ extern bool g_bootReportWorthy;
 // the machinery entirely. All retention access now routes through the
 // sanctioned SVCs when the SoftDevice is up.
 extern volatile bool g_softDeviceEnabled;  // set true right after Bluefruit.begin() succeeds (the SD is up from that instant until reset); read by the ISR paths — do NOT probe sd_softdevice_is_enabled() from an ISR, that is itself an SVC
-// 4.6.6: true ONLY while the BLE init task is inside Bluefruit.begin(). The
-// SD is enabled INSIDE that call, so between sd_softdevice_enable running
-// and the flag above being raisable, neither retention path is safe: the
-// SVC path would issue SD-function SVCs with the SD down (the core's
-// SVC_Handler is FreeRTOS's context-switch trampoline — not a no-op) and
-// the raw path is an APP_MEMACC kill with the SD up. Diagnostic retention
-// writers (trail stamps, the witness marker, the streak clear) skip the
-// write for this sub-second window via lipsyncRetentionUnsafe(); must-run
-// writers (fault capture) are unaffected.
+// 4.6.6: true while the BLE init task is inside a SoftDevice-state
+// transition — Bluefruit.begin() (the SD is enabled INSIDE that call, so
+// between sd_softdevice_enable running and the flag above being raisable,
+// neither retention path is safe: the SVC path would issue SD-function SVCs
+// with the SD down (the core's SVC_Handler is FreeRTOS's context-switch
+// trampoline — not a no-op) and the raw path is an APP_MEMACC kill with the
+// SD up), and — 4.9.9 review round 3 — the leftover-SD boot's
+// sd_softdevice_disable (the SD goes DOWN inside it while the flag still
+// reads true, so an SVC issued in the disable→flag-store gap reaches the
+// dead SD the same way). Diagnostic retention writers (trail stamps, the
+// witness marker, the streak clear) skip the write for these sub-second
+// windows via lipsyncRetentionUnsafe(); must-run writers (fault capture)
+// are unaffected.
 extern volatile bool g_bleInitWindow;
 // True while a retention write must not touch the POWER registers at all.
+// Window-based (not flag-difference-based): both covered transitions have
+// one side of the g_softDeviceEnabled flag stale, so the window itself is
+// the only trustworthy signal.
 static inline bool lipsyncRetentionUnsafe() {
-  return g_bleInitWindow && !g_softDeviceEnabled;
+  return g_bleInitWindow;
 }
 #include <nrf_soc.h>  // sd_power_gpregret_get/set/clr — the sanctioned POWER-register access with the SD up
 static inline uint32_t lipsyncRetentionGet(uint32_t id) {

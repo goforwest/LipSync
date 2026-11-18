@@ -35,8 +35,10 @@
 #define LSHOST_OLED_NAME_MAX 17   /* OLED label name portion; + " (XX)" suffix */
 #define LSHOST_MENU_MAX_ROWS 4    /* Hub page shows at most 4 host rows */
 #define LSHOST_ENUM_CAP 8         /* wire/list cap: up to 8 bonds enumerated (the   */
-                                  /* MAC-lowest 8 when more exist; Hub shows 4,    */
-                                  /* bench B8 exercises 5; Forget is the valve)    */
+                                  /* MAC-lowest 8 when more exist — except the      */
+                                  /* ACTIVE host is always included (4.9.9 round 3, */
+                                  /* lsHostCapEvictIndex); Hub shows 4, bench B8    */
+                                  /* exercises 5; Forget is the valve)              */
 
 /* Refusal reasons — the numeric values are internal; shells map them to
  * FAIL,3 + a named note (serial) or a note page (menu). */
@@ -106,6 +108,46 @@ static inline void lsHostSortRows(lsHostRow* rows, int n) {
 /* Rows the 4-slot Hub page cannot show. */
 static inline int lsHostHiddenCount(int rowCount) {
   return (rowCount > LSHOST_MENU_MAX_ROWS) ? (rowCount - LSHOST_MENU_MAX_ROWS) : 0;
+}
+
+/* Strict byte-wise mac12 ordering ("shorter prefix sorts first", the
+ * lsHostSortRows convention) without string.h — the same NUL-terminated
+ * fixed-width key the sort uses. */
+static inline int lsHostMacLess(const char* a, const char* b) {
+  for (int k = 0; k <= LSHOST_MAC_CHARS; k++) {
+    if (a[k] != b[k]) return ((unsigned char)a[k] < (unsigned char)b[k]);
+    if (a[k] == '\0') return 0;  // equal keys
+  }
+  return 0;  // both ran the full length: equal
+}
+
+/* 4.9.9 review round 3: the enumeration cap's eviction decision, extracted
+ * from LSBLE.h's lsHostEnumerate so it is host-testable (the LSHostSwitch.h
+ * pattern). The caller consults it once per bond seen while the capped set
+ * is FULL (rows holds the current set; cap == its length).
+ *
+ * Returns the slot index to overwrite, or -1 to keep the current set.
+ *   - The ACTIVE row is never evicted, and an active newcomer ALWAYS takes
+ *     a slot: with more bonds than the cap, a connected host whose MAC
+ *     sorts high used to fall outside the enumerated set — BT,5 then
+ *     reported "no active host" while a host WAS connected, the app showed
+ *     it as connected-but-unpaired, and the already-active switch refusal
+ *     could never fire for it. Only one row can be active, so a non-active
+ *     slot always exists for the newcomer to displace.
+ *   - A non-active newcomer yields to nothing unless it is MAC-lower than
+ *     the MAC-highest NON-active slot (the documented MAC-lowest set,
+ *     unchanged for every non-active case). */
+static inline int lsHostCapEvictIndex(const lsHostRow* rows, int cap,
+                                      const char* newMac12, int newIsActive) {
+  if (rows == (const lsHostRow*)0 || cap < 1) return -1;
+  int worst = -1;
+  for (int i = 0; i < cap; i++) {
+    if (rows[i].active) continue;  // the connected host is not evictable
+    if (worst < 0 || lsHostMacLess(rows[worst].mac, rows[i].mac)) worst = i;
+  }
+  if (newIsActive) return worst;
+  if (worst < 0) return -1;  // defensive: an all-active set is unreachable
+  return lsHostMacLess(newMac12, rows[worst].mac) ? worst : -1;
 }
 
 /* OLED label: sanitized name truncated to LSHOST_OLED_NAME_MAX chars, then
@@ -304,23 +346,41 @@ static inline int lsHostLatchCrossedHost(const char* currentHostKey, const char*
  * reintroduced by the guard itself.
  *
  * Semantics (the fix, and the contract going forward):
- *   - the crossing decision is consulted ONLY when latchHeld (a latch-free
- *     pass cannot need a release — the bounce-storm churn contract is
- *     unchanged), and it compares the stored key BEFORE the refresh, so a
- *     hold that genuinely crosses a host change still releases on the first
- *     differing pass;
  *   - the stored key is refreshed to the current host key on EVERY pass,
- *     held or not, so a hold that STARTS on a host never compares against a
- *     stale key: between episodes the key simply tracks the live host.
+ *     held or not, so between episodes the key simply tracks the live host;
+ *   - the crossing decision is consulted ONLY on a pass where the hold was
+ *     ALREADY live on the previous pass (latchWasHeld, 4.9.9 review round 3),
+ *     and it compares the stored key BEFORE the refresh, so a hold engaged
+ *     under host A releases on the first pass that sees host B;
+ *   - a FIRST held pass is an ARM: no comparison at all — the refresh adopts
+ *     the current key. The 4.9.7 every-pass refresh still compared a hold's
+ *     first held pass against a key one episode behind whenever the host
+ *     changed inside the 1 s observation gap (the switch window admits its
+ *     target on the millisecond-granularity service, between two
+ *     btFeedbackLoop passes), killing the first drag/scroll started within a
+ *     second of the new host's connection. With the arm rule a hold that
+ *     starts on a host is never compared against any earlier episode's key
+ *     whenever the previous guard pass saw the latch-free state — the arm
+ *     adopts the live key first. KNOWN CONSERVATIVE RESIDUAL (4.9.9 review
+ *     round 4, behavior identical to every earlier shape): a hold RELEASED
+ *     and RE-ENGAGED within the same observation gap as a host change still
+ *     compares — the guard's last observation saw the previous hold live
+ *     (latchWasHeld stale 1) and cannot distinguish the re-engage from a
+ *     hold that truly crossed, so it releases. The kill is the conservative
+ *     reading of an ambiguous sub-second window; the user's next gesture
+ *     works. The documented none->host edge keeps its meaning (a hold armed
+ *     while absent carries "" and releases when a host arrives — a later
+ *     held pass compares "" against the host key).
  *
  * Copies currentHostKey into guardKey, NUL-terminated, bounded by
  * guardKeySize. NULL guardKey, zero size, or NULL currentHostKey are
  * defensive no-ops (same convention as lsHostLatchCrossedHost; the caller
  * maps an absent host to "" rather than NULL). Returns 1 when a held latch
- * must be released this pass.
+ * must be released this pass. The caller keeps the previous pass's
+ * latchHeld and passes it as latchWasHeld.
  */
-static inline int lsHostLatchGuardPass(const char* currentHostKey, char* guardKey, unsigned guardKeySize, int latchHeld) {
-  const int crossed = latchHeld ? lsHostLatchCrossedHost(currentHostKey, guardKey, 1) : 0;
+static inline int lsHostLatchGuardPass(const char* currentHostKey, char* guardKey, unsigned guardKeySize, int latchHeld, int latchWasHeld) {
+  const int crossed = (latchHeld && latchWasHeld) ? lsHostLatchCrossedHost(currentHostKey, guardKey, 1) : 0;
   if (guardKey != (char*)0 && guardKeySize > 0) {
     unsigned i = 0;
     if (currentHostKey != (const char*)0) {

@@ -11,6 +11,7 @@
 #include "LSPressureClassify.h"
 #include "LSPressureEngageFilter.h"
 #include "LSPressureOffsetFilter.h"
+#include "LSSerialRx.h"
 #include "LSSerialTxQueue.h"
 
 static int checks = 0;
@@ -638,49 +639,73 @@ static void test_latch_guard_pass_cadence() {
   // but must refresh the key. The user's FIRST hold then runs against the
   // real key and survives (this is the published-V4.9.6 regression).
   std::strcpy(key, "");
-  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", key, sizeof(key), 0) == 0);  // the refresh pass
+  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", key, sizeof(key), 0, 0) == 0);  // the refresh pass
   CHECK(std::strcmp(key, "A1B2C3D4E5F6") == 0);
-  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", key, sizeof(key), 1) == 0);  // the first hold survives
+  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", key, sizeof(key), 1, 0) == 0);  // the first hold survives (an ARM pass)
+
+  // 4.9.9 review round 3 (the sub-second-admission kill): the switch window
+  // admits its target between two 1 s passes, so a hold that STARTS after the
+  // new host connected presents at its first held pass with the stored key
+  // still holding the previous episode's value ("" here). The old shape
+  // compared and killed it; the ARM rule adopts the current key instead.
+  std::strcpy(key, "");
+  CHECK(lsHostLatchGuardPass("9DE25364404E", key, sizeof(key), 1, 0) == 0);  // first hold after a sub-second host change survives
+  CHECK(std::strcmp(key, "9DE25364404E") == 0);                              // ...and the key now tracks the new host
 
   // BT,1 host switch: the old shape armed the PREVIOUS host's key here — the
   // same swallowed first input. Latch-free passes track the new host.
   std::strcpy(key, "FFFFFFFFFFFF");
-  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", key, sizeof(key), 0) == 0);
+  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", key, sizeof(key), 0, 0) == 0);
   CHECK(std::strcmp(key, "A1B2C3D4E5F6") == 0);
-  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", key, sizeof(key), 1) == 0);
+  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", key, sizeof(key), 1, 0) == 0);
 
   // A host walks away and another bonds before the next hold: the key passes
   // through "" (none) and lands on the new host — still no stale comparison.
   std::strcpy(key, "A1B2C3D4E5F6");
-  CHECK(lsHostLatchGuardPass("", key, sizeof(key), 0) == 0);
+  CHECK(lsHostLatchGuardPass("", key, sizeof(key), 0, 0) == 0);
   CHECK(std::strcmp(key, "") == 0);
-  CHECK(lsHostLatchGuardPass("9DE25364404E", key, sizeof(key), 0) == 0);
-  CHECK(lsHostLatchGuardPass("9DE25364404E", key, sizeof(key), 1) == 0);
+  CHECK(lsHostLatchGuardPass("9DE25364404E", key, sizeof(key), 0, 0) == 0);
+  CHECK(lsHostLatchGuardPass("9DE25364404E", key, sizeof(key), 1, 0) == 0);
 
-  // The crossing protection is intact: a hold engaged on A that meets B on a
+  // The crossing protection is intact: a hold ARMED on A that meets B on a
   // later held pass still releases — the compare runs BEFORE the refresh on
   // the same pass, and the key lands on B so the release fires exactly once.
   std::strcpy(key, "A1B2C3D4E5F6");
-  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", key, sizeof(key), 1) == 0);  // hold armed on A
-  CHECK(lsHostLatchGuardPass("FFFFFFFFFFFF", key, sizeof(key), 1) == 1);  // host changed mid-hold: release
-  CHECK(std::strcmp(key, "FFFFFFFFFFFF") == 0);                           // the key tracks the new host
-  CHECK(lsHostLatchGuardPass("FFFFFFFFFFFF", key, sizeof(key), 1) == 0);  // no repeated cancel
+  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", key, sizeof(key), 1, 0) == 0);  // hold armed on A (wasHeld=0: the arm)
+  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", key, sizeof(key), 1, 1) == 0);  // still held under A: no release
+  CHECK(lsHostLatchGuardPass("FFFFFFFFFFFF", key, sizeof(key), 1, 1) == 1);  // host changed mid-hold: release
+  CHECK(std::strcmp(key, "FFFFFFFFFFFF") == 0);                              // the key tracks the new host
+  CHECK(lsHostLatchGuardPass("FFFFFFFFFFFF", key, sizeof(key), 1, 1) == 0);  // no repeated cancel
+
+  // The documented none->host edge keeps its meaning: a hold armed while NO
+  // host was connected carries "" and releases when a host arrives (the new
+  // host must not receive a button/wheel state the user never pressed on it).
+  std::strcpy(key, "");
+  CHECK(lsHostLatchGuardPass("", key, sizeof(key), 1, 0) == 0);              // armed under "" (no host)
+  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", key, sizeof(key), 1, 1) == 1);  // host arrives: release
 
   // A latch-free pass never releases, whatever the keys say (the bounce-storm
-  // churn contract), and still refreshes.
+  // churn contract), and still refreshes — including the pass right after a
+  // release, whose wasHeld is still 1.
   std::strcpy(key, "AAAAAAAAAAAA");
-  CHECK(lsHostLatchGuardPass("BBBBBBBBBBBB", key, sizeof(key), 0) == 0);
+  CHECK(lsHostLatchGuardPass("BBBBBBBBBBBB", key, sizeof(key), 0, 0) == 0);
+  CHECK(std::strcmp(key, "BBBBBBBBBBBB") == 0);
+  CHECK(lsHostLatchGuardPass("BBBBBBBBBBBB", key, sizeof(key), 0, 1) == 0);
   CHECK(std::strcmp(key, "BBBBBBBBBBBB") == 0);
 
   // Boot with NO host: the key stays "" and a hold on no host is not a crossing.
   std::strcpy(key, "");
-  CHECK(lsHostLatchGuardPass("", key, sizeof(key), 1) == 0);
+  CHECK(lsHostLatchGuardPass("", key, sizeof(key), 1, 0) == 0);
+  CHECK(lsHostLatchGuardPass("", key, sizeof(key), 1, 1) == 0);
 
-  // Buffer bounds: a short guardKey truncates and NUL-terminates.
+  // Buffer bounds: a short guardKey truncates and NUL-terminates (arm pass),
+  // and a later held pass compares against the truncated key.
   char small[5];
   std::strcpy(small, "ZZ");
-  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", small, sizeof(small), 1) == 1);  // held + differing keys: release
+  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", small, sizeof(small), 1, 0) == 0);  // arm: key truncated
   CHECK(std::strcmp(small, "A1B2") == 0);
+  CHECK(lsHostLatchGuardPass("FFFFFFFFFFFF", small, sizeof(small), 1, 1) == 1);  // held + differing keys: release
+  CHECK(std::strcmp(small, "FFFF") == 0);
 
   // Defensive shapes: NULL sink (no crossing — a NULL on either key is the
   // underlying helper's harmless no-op convention, pinned in
@@ -688,13 +713,13 @@ static void test_latch_guard_pass_cadence() {
   // episode to protect), zero size (key untouched), NULL current key (no
   // crossing; the key reads as cleared — the caller maps an absent host to ""
   // rather than NULL, so this only bounds a future caller's mistake).
-  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", (char*)0, 0, 1) == 0);
+  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", (char*)0, 0, 1, 1) == 0);
   char scratch[4];
   std::strcpy(scratch, "AA");
-  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", scratch, 0, 0) == 0);
+  CHECK(lsHostLatchGuardPass("A1B2C3D4E5F6", scratch, 0, 0, 0) == 0);
   CHECK(std::strcmp(scratch, "AA") == 0);
   std::strcpy(key, "OLD");
-  CHECK(lsHostLatchGuardPass((const char*)0, key, sizeof(key), 1) == 0);
+  CHECK(lsHostLatchGuardPass((const char*)0, key, sizeof(key), 1, 1) == 0);
   CHECK(std::strcmp(key, "") == 0);
 }
 
@@ -806,6 +831,157 @@ static void test_i2c_safe_mode_warning_line_names_the_missing_hardware() {
   CHECK(lsi2cSafeModeHardwareWarning(one, sizeof(one), 1, 1, 1, 1) < 0);
 }
 
+// 4.9.9 review round 3: the serial RX framing's overflow handling
+// (LSSerialRx.h). The old glue answered FAIL,1 on the 33rd byte and cleared
+// the buffer, but the REST of the host's frame kept accumulating and ran as
+// a NEW message on the delimiter (or the idle gap) — one frame, two
+// answers, and a flood whose tail spelled "SETTINGS" re-entered settings
+// mode against the flood recovery's own contract. The pinned contract: the
+// first LS_RX_MAX_LEN bytes answer once, everything up to the frame's end
+// (delimiter or idle gap) is swallowed exactly once, and the next frame
+// starts clean.
+static void test_serial_rx_framing_overflow_answers_once() {
+  int len = 0;
+  int discarding = 0;
+
+  // A legal 11-byte command still accumulates normally.
+  for (int i = 0; i < 11; i++) {
+    const LsRxAction a = lsrxFeedByte('A' + (i % 26), len, discarding, &len, &discarding);
+    CHECK(a == LS_RX_ACCUMULATE);
+    CHECK(len == i + 1);
+  }
+  CHECK(discarding == 0);
+
+  // Fill to exactly the cap: the 32nd byte accumulates, the 33rd overflows.
+  len = 0;
+  for (int i = 0; i < LS_RX_MAX_LEN; i++) {
+    CHECK(lsrxFeedByte('B', len, discarding, &len, &discarding) == LS_RX_ACCUMULATE);
+  }
+  CHECK(len == LS_RX_MAX_LEN);
+  CHECK(lsrxFeedByte('B', len, discarding, &len, &discarding) == LS_RX_OVERFLOW);
+  CHECK(len == 0);           // the buffer cleared — the caller answers once with the first 32
+  CHECK(discarding == 1);    // the rest of the frame is swallowed
+
+  // The drowned frame's tail is swallowed byte by byte — including a tail
+  // that spells a real command.
+  const char* tail = "SETTINGS";
+  for (const char* p = tail; *p != '\0'; p++) {
+    CHECK(lsrxFeedByte((int)*p, len, discarding, &len, &discarding) == LS_RX_NONE);
+    CHECK(len == 0);
+  }
+  CHECK(discarding == 1);    // still swallowing until the frame ends
+
+  // The frame's delimiter ENDS the swallow without dispatching anything
+  // (the overflow already answered — exactly one response per host frame).
+  CHECK(lsrxFeedByte('\n', len, discarding, &len, &discarding) == LS_RX_NONE);
+  CHECK(discarding == 0);
+  CHECK(len == 0);
+
+  // The NEXT frame is a clean start: it accumulates and dispatches normally.
+  len = 0;
+  CHECK(lsrxFeedByte('S', len, discarding, &len, &discarding) == LS_RX_ACCUMULATE);
+  CHECK(len == 1);
+
+  // A \r\n pair during the swallow: the \r ends the frame, the \n is the
+  // ordinary blank line.
+  len = 0;
+  discarding = 1;
+  CHECK(lsrxFeedByte('\r', len, discarding, &len, &discarding) == LS_RX_NONE);
+  CHECK(discarding == 0);
+  CHECK(lsrxFeedByte('\n', len, discarding, &len, &discarding) == LS_RX_NONE);
+  CHECK(discarding == 0);
+
+  // Blank lines never dispatch, discard-flagged or not.
+  CHECK(lsrxFeedByte('\n', 0, 0, &len, &discarding) == LS_RX_NONE);
+  CHECK(lsrxFeedByte('\r', 0, 0, &len, &discarding) == LS_RX_NONE);
+
+  // A complete dispatch resets the length through the helper's output (the
+  // caller clears the real buffer) and never touches the swallow flag.
+  len = 5;
+  CHECK(lsrxFeedByte('\n', len, 0, &len, &discarding) == LS_RX_DISPATCH);
+  CHECK(len == 0);
+  CHECK(discarding == 0);
+
+  // Defensive shape: NULL outputs are a no-op.
+  CHECK(lsrxFeedByte('X', 0, 0, (int*)0, (int*)0) == LS_RX_NONE);
+}
+
+// The legacy framing's idle rule for a discarded frame: a flood with no
+// delimiter ends when the stream goes quiet — the swallow clears at the gap
+// so the next bytes are a NEW message, not the drowned one's tail.
+static void test_serial_rx_framing_idle_gap_ends_a_discarded_frame() {
+  // Still swallowing, stream quiet for the full gap, buffer empty: clear.
+  CHECK(lsrxIdleEndsDiscard(1, 0, 50, 50) == 1);
+  CHECK(lsrxIdleEndsDiscard(1, 0, 200, 50) == 1);
+  // Not yet at the gap: keep swallowing.
+  CHECK(lsrxIdleEndsDiscard(1, 0, 49, 50) == 0);
+  CHECK(lsrxIdleEndsDiscard(1, 0, 0, 50) == 0);
+  // Not swallowing: no-op.
+  CHECK(lsrxIdleEndsDiscard(0, 0, 200, 50) == 0);
+  // Defensive invariant: a non-empty buffer never happens while discarding
+  // (the layer never accumulates then), but the helper keeps it explicit.
+  CHECK(lsrxIdleEndsDiscard(1, 3, 200, 50) == 0);
+}
+
+// 4.9.9 review round 3 (tests added round 4 — the helper shipped untested):
+// the enumeration cap's eviction decision (lsHostCapEvictIndex). The pinned
+// contract: the ACTIVE host is never evicted and an active newcomer always
+// takes a slot; a non-active newcomer only displaces the MAC-highest
+// NON-active row when it is MAC-lower (the documented MAC-lowest set,
+// unchanged for the non-active case).
+static void test_host_cap_eviction_keeps_active() {
+  lsHostRow rows[4];
+
+  // All non-active, newcomer MAC-lower than the highest: evicts it.
+  for (int i = 0; i < 4; i++) {
+    std::snprintf(rows[i].mac, sizeof(rows[i].mac), "00000000000%X", i);
+    rows[i].active = 0;
+  }
+  // rows: 0..3 ascending; the MAC-highest is index 3.
+  CHECK(lsHostCapEvictIndex(rows, 4, "000000000000", 0) == 3);
+
+  // All non-active, newcomer MAC-higher than everything: no eviction.
+  CHECK(lsHostCapEvictIndex(rows, 4, "00000000000F", 0) == -1);
+
+  // The active row is not evictable even when it is the MAC-highest: the
+  // worst slot becomes the MAC-highest NON-active row.
+  rows[3].active = 1;
+  CHECK(lsHostCapEvictIndex(rows, 4, "000000000000", 0) == 2);
+
+  // An ACTIVE newcomer always takes a slot — even the MAC-highest newcomer
+  // that would never qualify on its own MAC — and never displaces the other
+  // active row (only one row can be active, but the helper must not pick an
+  // active slot even if state were inconsistent).
+  CHECK(lsHostCapEvictIndex(rows, 4, "00000000000F", 1) == 2);
+  rows[3].active = 0;
+
+  // The active row sits mid-set: eviction skips it in both directions.
+  rows[1].active = 1;
+  CHECK(lsHostCapEvictIndex(rows, 4, "000000000000", 0) == 3);       // newcomer lower than all: evict the highest non-active (3)
+  CHECK(lsHostCapEvictIndex(rows, 4, "0000000000025", 0) == 3);      // newcomer between "...002" and "...003": still evicts 3
+  CHECK(lsHostCapEvictIndex(rows, 4, "0000000000035", 0) == -1);     // newcomer above "...003": nothing non-active is higher
+  CHECK(lsHostCapEvictIndex(rows, 4, "00000000000E", 0) == -1);      // newcomer above everything: no eviction
+  rows[1].active = 0;
+
+  // Degenerate shapes: NULL rows, zero cap, and the all-active defensive
+  // case (unreachable — only one row can be active — must refuse, not
+  // evict).
+  CHECK(lsHostCapEvictIndex((const lsHostRow*)0, 4, "000000000000", 0) == -1);
+  lsHostRow single[1];
+  std::snprintf(single[0].mac, sizeof(single[0].mac), "00000000000A");
+  single[0].active = 0;
+  CHECK(lsHostCapEvictIndex(single, 0, "000000000000", 0) == -1);
+  single[0].active = 1;
+  CHECK(lsHostCapEvictIndex(single, 1, "000000000000", 0) == -1);  // no non-active slot exists: refuse
+  CHECK(lsHostCapEvictIndex(single, 1, "00000000000B", 1) == -1);  // active newcomer with only an active slot: refuse (defensive)
+
+  // lsHostMacLess agrees with byte-wise ordering, including the prefix rule.
+  CHECK(lsHostMacLess("000000000001", "000000000002") == 1);
+  CHECK(lsHostMacLess("000000000002", "000000000001") == 0);
+  CHECK(lsHostMacLess("0000000000", "000000000001") == 1);   // shorter prefix sorts first (the sort's convention)
+  CHECK(lsHostMacLess("000000000001", "000000000001") == 0); // equal
+}
+
 int main() {
   static_assert(!std::is_copy_constructible<LSCircularBuffer<int>>::value,
                 "owning circular buffers must not be shallow-copyable");
@@ -834,6 +1010,9 @@ int main() {
   test_i2c_scan_retry_budget_and_early_exit();
   test_i2c_sns_mask_digit_order_matches_heartbeat();
   test_i2c_safe_mode_warning_line_names_the_missing_hardware();
+  test_serial_rx_framing_overflow_answers_once();
+  test_serial_rx_framing_idle_gap_ends_a_discarded_frame();
+  test_host_cap_eviction_keeps_active();
 
   std::printf("%d checks, %d failures\n", checks, failures);
   return failures == 0 ? 0 : 1;

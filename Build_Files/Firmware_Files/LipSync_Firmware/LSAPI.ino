@@ -20,6 +20,7 @@
 //***API FUNCTIONS***// - DO NOT CHANGE
 #include "LSApiDeclarations.h"  // Explicit declarations for the API surface (roadmap item 5) — the function table below references functions defined further down the merged tabs
 #include "LSSerialTxQueue.h"
+#include "LSSerialRx.h"         // 4.9.9 round 3: the RX framing's pure, host-pinned decision layer (lsrxFeedByte/lsrxIdleEndsDiscard)
 typedef void (*FunctionPointer)(bool, bool, String);      // Type definition for API function pointer
 
 typedef struct {                                  // Type definition for API function list
@@ -234,6 +235,7 @@ _functionList apiFunction[] = { //Let compiler determine number of functions
 // gone entirely.
 const unsigned long SERIAL_FRAMING_GAP_MS = 50;   // Idle that ends a legacy (bare) message
 const size_t SERIAL_RX_MAX_LEN = 32;              // Longest legal command is 11 bytes; past this it is a flood
+static_assert(SERIAL_RX_MAX_LEN == LS_RX_MAX_LEN, "SERIAL_RX_MAX_LEN and LSSerialRx.h's LS_RX_MAX_LEN must agree — the framing semantics and the host tests read the same constant");
 String serialRxBuf = "";
 unsigned long serialRxBufLastByteMs = 0;
 
@@ -258,15 +260,46 @@ void serialTxService() {
 
 bool serialTxEnqueueLine(const char* line, size_t length) {
   // Preserve the stock CDC behavior: output generated before DTR opens is
-  // discarded, not replayed as stale unsolicited traffic on the next session.
+  // discarded, not replayed as stale unsolicited traffic on the next
+  // session (the 4.6.4 anti-replay rule). The boot-time one-shot
+  // diagnostics that must reach the first host use serialTxDiagLine below;
+  // everything else keeps the discard — including the boot getters' own
+  // response-shaped readback (initJoystick's IZ/OZ/CS/SL reads and the
+  // auto-center's IN,1), which the round-3 buffering window would have
+  // replayed into every first session against the 4.5.29 healthy-boots-
+  // print-nothing contract (review round 4).
   if (!Serial) return false;
   if (!serialTxQueue.enqueueLine(line, length)) return false;
   serialTxService();
   return true;
 }
 
+bool serialTxEnqueueDiagLine(const char* line, size_t length) {
+  // 4.9.9 review round 3, reshaped in round 4: the BOOT-DIAGNOSTIC enqueue —
+  // the one-shot pre-attach lines whose whole purpose is to reach the first
+  // host that opens the port (the 4.9.8 fix-E I2C heal note,
+  // hardwareErrorCheck's per-device ERROR lines, the poll-timer registration
+  // audit, the safe-mode warnings). The 4.6.4 anti-replay gate silently
+  // dropped every one of them whenever the host had not asserted DTR by
+  // enqueue time — the fix-E comments claimed they "drain once the port is
+  // up", which the gate made false. This variant buffers instead: the first
+  // host that opens the port reads THIS boot's diagnostics. Bounded by the
+  // queue's own drop-oldest (4096 B; the boot set is a few hundred bytes).
+  // Post-attach it behaves exactly like serialTxEnqueueLine.
+  if (Serial) {
+    if (!serialTxQueue.enqueueLine(line, length)) return false;
+    serialTxService();
+    return true;
+  }
+  return serialTxQueue.enqueueLine(line, length);  // buffered pre-attach; drained by the first DTR-open service
+}
+
 bool serialTxEnqueueLine(const String &line) {
   return serialTxEnqueueLine(line.c_str(), line.length());
+}
+
+bool serialTxEnqueueDiagLine(const String &line) {
+  return serialTxEnqueueDiagLine(line.c_str(), line.length());
 }
 
 // Process one delimited message. Returns the settings-mode flag for the
@@ -323,28 +356,48 @@ bool processSerialMessage(String commandString, bool settingsFlag) {
 //*********************************************************************//
 bool serialSettings(bool enabled) {
   bool settingsFlag = enabled;
+  // 4.9.9 review round 3: the swallow flag for an over-long frame. The old
+  // overflow path answered once and cleared the buffer, but the REST of the
+  // host's frame kept accumulating and ran as a NEW message on the frame's
+  // delimiter (or the idle gap) — one frame, two answers, and a flood whose
+  // tail spelled "SETTINGS" re-entered settings mode against the flood
+  // recovery's own contract. The decision logic lives in LSSerialRx.h
+  // (host-pinned); this flag is its only persistent state here.
+  static int rxDiscarding = 0;
 
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
     serialRxBufLastByteMs = millis();
 
-    if (c == '\n' || c == '\r') {
-      if (serialRxBuf.length() == 0) continue;  // Blank line (e.g. the \n of a \r\n pair)
-      String message = serialRxBuf;
-      serialRxBuf = "";
-      settingsFlag = processSerialMessage(message, settingsFlag);
-      Serial.flush();
-    } else {
-      serialRxBuf += c;
-      if (serialRxBuf.length() > SERIAL_RX_MAX_LEN) {
-        // A flood with no terminator: discard and answer once (echo truncated).
-        // 4.8.7 review: the unknown-command errno, not the SUCCESS errno —
-        // an over-length line is a malformed command, not the "settings mode
-        // not enabled" signal.
+    int newLen = serialRxBuf.length();
+    int newDiscarding = rxDiscarding;
+    const LsRxAction action = lsrxFeedByte((int)c, serialRxBuf.length(), rxDiscarding, &newLen, &newDiscarding);
+    rxDiscarding = newDiscarding;
+    switch (action) {
+      case LS_RX_NONE:
+        // Blank line, or the swallowed tail of an already-answered overflow.
+        break;
+      case LS_RX_ACCUMULATE:
+        serialRxBuf += c;
+        break;
+      case LS_RX_DISPATCH: {
+        String message = serialRxBuf;
+        serialRxBuf = "";
+        settingsFlag = processSerialMessage(message, settingsFlag);
+        Serial.flush();
+        break;
+      }
+      case LS_RX_OVERFLOW: {
+        // A flood with no terminator: discard and answer once (echo
+        // truncated) — and actually discard, per LSSerialRx.h. 4.8.7 review:
+        // the unknown-command errno, not the SUCCESS errno — an over-length
+        // line is a malformed command, not the "settings mode not enabled"
+        // signal.
         String overflow = serialRxBuf.substring(0, SERIAL_RX_MAX_LEN);
         serialRxBuf = "";
         printResponseInt(true, true, false, 1, overflow, false, 0);
         settingsFlag = false;
+        break;
       }
     }
   }
@@ -355,6 +408,14 @@ bool serialSettings(bool enabled) {
     serialRxBuf = "";
     settingsFlag = processSerialMessage(message, settingsFlag);
     Serial.flush();
+  }
+  // 4.9.9 review round 3: an idle gap also ends a DISCARDED frame — a flood
+  // with no delimiter stops, the stream goes quiet, and the next bytes are a
+  // new message rather than the drowned one's tail.
+  if (rxDiscarding
+      && lsrxIdleEndsDiscard(rxDiscarding, serialRxBuf.length(),
+                             millis() - serialRxBufLastByteMs, SERIAL_FRAMING_GAP_MS)) {
+    rxDiscarding = 0;
   }
 
   return settingsFlag;
@@ -743,15 +804,27 @@ int getOperatingMode(bool responseEnabled, bool apiEnabled) {
   int tempOperatingMode;
   tempOperatingMode = mem.readInt(CONF_SETTINGS_FILE, commandKey);
 
+  // 4.9.9 review round 3 (read-truth doctrine, the getCursorSpeed shape):
+  // capture the read verdict BEFORE the heal write clobbers isLastReadOk —
+  // a failed read must answer the IN-FORCE mode (g_operatingMode, loaded at
+  // boot and kept honest by the setters), not a fabricated compiled default
+  // answered as SUCCESS. The concrete hazard: a Gamepad device whose OM,0
+  // read fails mid-session answers "1" (Mouse); the app's model now
+  // disagrees with the device and a user mode change runs storeModePair(1,..)
+  // over the stored Gamepad pair.
+  const bool omReadOk = mem.isLastReadOk();
   if ((tempOperatingMode < CONF_OPERATING_MODE_MIN) || (tempOperatingMode > CONF_OPERATING_MODE_SETTABLE_MAX)) {  // SAFE is not a stored value (4.5.7 review)
     tempOperatingMode = CONF_OPERATING_MODE_DEFAULT;
     // Heal only a genuinely out-of-range STORED value (the getModelNumber
     // pattern): a transient failed read also converts to 0, and rewriting
     // the key from it would overwrite the user's real mode on the wire AND
     // at the next boot.
-    if (mem.isLastReadOk()) {
+    if (omReadOk) {
       mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempOperatingMode);
     }
+  }
+  if (!omReadOk) {
+    tempOperatingMode = g_operatingMode;  // the in-force mode, not a readback
   }
 
   printResponseInt(responseEnabled, apiEnabled, true, 0, "OM,0", true, tempOperatingMode);
@@ -795,26 +868,39 @@ void setOperatingMode(bool responseEnabled, bool apiEnabled, int inputOperatingM
   if ((inputOperatingMode >= CONF_OPERATING_MODE_MIN) && (inputOperatingMode <= CONF_OPERATING_MODE_SETTABLE_MAX)) {  // SETTABLE_MAX excludes SAFE (4.5.7 review)
     if ((g_comMode == CONF_COM_MODE_BLE) && (inputOperatingMode == CONF_OPERATING_MODE_GAMEPAD)){
       printResponseInt(responseEnabled, apiEnabled, false, 3, "OM,1", true, inputOperatingMode);    // Return error if user tries to change to Bluetooth mode while in Gamepad mode
-    } else if (mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputOperatingMode)) {
-      // The settings-size budget guard can refuse the write (LSMemory) — a
-      // refused write must never report SUCCESS or change the live mode, or
-      // the app's readout and the device would disagree after a reboot.
-      printResponseInt(responseEnabled, apiEnabled, true, 0, "OM,1", true, inputOperatingMode);
-      // THE 4.5.7 FIX: g_operatingMode is NOT assigned here anymore.
-      // changeOperatingMode() compares its argument against g_operatingMode
-      // and resets the device when they differ — assigning the global
-      // BEFORE the call (4.1.0 left the call commented out; uncommenting
-      // it without reordering) made the comparison always true, so the
-      // reset-on-change NEVER fired: a serial OM,1:2 left the gamepad HID
-      // interface never-begun while the live mode claimed gamepad — every
-      // report went out the mouse interface (the release toolchain's
-      // TinyUSB hardwires instance 0), with telemetry counting the
-      // misrouted reports as successes. The global now flips only inside
-      // changeOperatingMode, exactly as its contract reads; the ack above
-      // reaches the host during the reset's deliberate shutdown dwell.
-      changeOperatingMode(inputOperatingMode);
     } else {
-      printResponseInt(responseEnabled, apiEnabled, false, 3, "OM,1", true, inputOperatingMode);
+      // 4.9.9 review round 4: gate the reset BEFORE the store/ack (the CM,1
+      // shape — every endpoint that resets answers exactly once on every
+      // path). A refused gate answers FAIL,3 with nothing stored and the
+      // live mode/interfaces untouched; a retry once the window closes runs
+      // the whole flow. (The gate is instant when no init is in flight.)
+      if (inputOperatingMode != g_operatingMode && !softwareResetGate()) {
+        printResponseInt(responseEnabled, apiEnabled, false, 3, "OM,1", true, inputOperatingMode);
+        return;
+      }
+      if (mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputOperatingMode)) {
+        // The settings-size budget guard can refuse the write (LSMemory) — a
+        // refused write must never report SUCCESS or change the live mode, or
+        // the app's readout and the device would disagree after a reboot.
+        printResponseInt(responseEnabled, apiEnabled, true, 0, "OM,1", true, inputOperatingMode);
+        // THE 4.5.7 FIX: g_operatingMode is NOT assigned here anymore.
+        // changeOperatingMode() compares its argument against g_operatingMode
+        // and resets the device when they differ — assigning the global
+        // BEFORE the call (4.1.0 left the call commented out; uncommenting
+        // it without reordering) made the comparison always true, so the
+        // reset-on-change NEVER fired: a serial OM,1:2 left the gamepad HID
+        // interface never-begun while the live mode claimed gamepad — every
+        // report went out the mouse interface (the release toolchain's
+        // TinyUSB hardwires instance 0), with telemetry counting the
+        // misrouted reports as successes. The global now flips only inside
+        // changeOperatingMode, exactly as its contract reads; the ack above
+        // reaches the host during the reset's deliberate shutdown dwell.
+        // 4.9.9 review round 4: the gate above ran before this store, so a
+        // reached-for reset always follows.
+        changeOperatingMode(inputOperatingMode);
+      } else {
+        printResponseInt(responseEnabled, apiEnabled, false, 3, "OM,1", true, inputOperatingMode);
+      }
     }
   }
   else {
@@ -980,18 +1066,25 @@ void setCursorSpeed(bool responseEnabled, bool apiEnabled, String optionalParame
 int getScrollLevel(bool responseEnabled, bool apiEnabled) {
   String commandKey = "SL";
   int tempScrollLevel = CONF_SCROLL_LEVEL_DEFAULT;
+  bool slReadOk = true;
   if (CONF_API_ENABLED) {
     tempScrollLevel = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+    slReadOk = mem.isLastReadOk();  // 4.9.9 round 3: capture before any heal write clobbers the flag
     if ((tempScrollLevel < CONF_SCROLL_LEVEL_MIN) || (tempScrollLevel > CONF_SCROLL_LEVEL_MAX)) {
       tempScrollLevel = CONF_SCROLL_LEVEL_DEFAULT;
-      if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+      if (slReadOk) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
         mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempScrollLevel);
       }
     }
-    
+
   }
   //js.setOutputRange(tempScrollLevel);
-  printResponseInt(responseEnabled, apiEnabled, true, 0, "SL,0", true, tempScrollLevel);
+  // 4.9.9 review round 3 (read-truth doctrine — see getOperatingMode): the
+  // WIRE answers the in-force level (g_scrollLevel — boot-loaded in
+  // initJoystick, kept honest by the setter). The RETURN stays the install
+  // value (compiled default on a failed boot read) for the boot consumer.
+  printResponseInt(responseEnabled, apiEnabled, true, 0, "SL,0", true,
+                   slReadOk ? tempScrollLevel : g_scrollLevel);
 
   return tempScrollLevel;
 }
@@ -1237,10 +1330,12 @@ void setJoystickInitialization(bool responseEnabled, bool apiEnabled) {
     return;
   }
   // 4.9.4 (round 4): the same window gate CA,1 carries — a center flow
-  // freezes the cursor and disables the joystick poll, and the switch
-  // window's tick is serviced from the main loop, so the two would run
-  // concurrently and the window's close would act on a device whose input
-  // pipeline the center flow deliberately owns. Refused with the same named
+  // freezes the cursor and owns the sensor's sample window (the joystick
+  // poll keeps running during a center — it always has — but its output is
+  // gated), and the switch window's tick is serviced from the main loop, so
+  // the two would run concurrently and the window's close would act on a
+  // device whose input pipeline the center flow is mid-way through.
+  // Refused with the same named
   // note; the app's waiter surfaces the refusal as a clean error and the
   // retry is manual (re-run the calibration once the window closes — the
   // final-diff-audit corrected this comment's claim of an automatic retry;
@@ -1471,6 +1566,13 @@ void setJoystickCalibration(bool responseEnabled, bool apiEnabled) {
   // immediate ack — a host retry inside that window used to pass the
   // step-0-set flag, js.clear() the accumulating state, and double-chain.
   g_calibrationRunning = true;
+  // 4.9.9 review round 3: persist the chain's initiator for the internal
+  // step-5 center — the center flow's own payload carries only the CENTER
+  // initiator, so without this a center failure inside a host-requested
+  // calibration aborted with MANUAL and the CA,1 waiter timed out.
+  g_calibrationFromApi = (apiEnabled != 0);
+  // (the registration-refusal branch below clears both flags with the rest
+  // of the acceptance state — 4.9.9 review round 4)
   // The initiator rides the chain's payload (CONF_CALIB_API_FLAG): the
   // per-corner lines print SUCCESS only for a host-requested calibration
   // (CA,1:1) and MANUAL for a Hub-menu one — the 4.5.2 initiator contract.
@@ -1505,6 +1607,7 @@ void setJoystickCalibration(bool responseEnabled, bool apiEnabled) {
     canOutputAction = true;
     g_resetCenterComplete = true;
     g_calibrationRunning = false;
+    g_calibrationFromApi = false;  // 4.9.9 review round 4: the refused flow's initiator dies with it (class-2 hygiene — the three internal-center abort readers key on g_calibrationRunning, so this is dead-state cleanup)
     screen.calibrationAbortedPage();
     printResponseInt(responseEnabled, apiEnabled, false, 3, "CA,1", true, 1);
   }
@@ -1540,8 +1643,17 @@ void setJoystickCalibration(bool responseEnabled, bool apiEnabled, String option
 // the setters ignore it as before.
 bool loadJoystickDeadzonePair(float &innerDeadzone, float &outerDeadzone) {
   JsonObject settings = mem.readObject(CONF_SETTINGS_FILE);
-  innerDeadzone = settings["IZ"].as<float>();
-  outerDeadzone = settings["OZ"].as<float>();
+  // 4.9.9 review round 3: type-gate both keys before as<float>() — the same
+  // hardening LSMemory::readPoint got ("as<float>() COERCES — a corrupt-but-
+  // parseable element (a string, null, boolean...)"). Without it a bit-rotted
+  // "0.42" string coerced into a real number that answered true from a
+  // "read"; with it the pair fails validity and heals to the compiled
+  // defaults like any other corrupt value. (The firmware only ever writes
+  // floats, so this needs flash corruption to matter — the readPoint note.)
+  const bool izIsFloat = settings["IZ"].is<float>();
+  const bool ozIsFloat = settings["OZ"].is<float>();
+  innerDeadzone = izIsFloat ? settings["IZ"].as<float>() : 0.0f;
+  outerDeadzone = ozIsFloat ? settings["OZ"].as<float>() : 0.0f;
 
   bool valid = mem.isLastReadOk() &&
                isfinite(innerDeadzone) && isfinite(outerDeadzone) &&
@@ -2592,13 +2704,20 @@ int getJoystickAcceleration(bool responseEnabled, bool apiEnabled) {
   int tempJoystickAccelerationLevel = CONF_JOY_ACCELERATION_LEVEL_DEFAULT;
   if (CONF_API_ENABLED) {
     tempJoystickAccelerationLevel = mem.readInt(CONF_SETTINGS_FILE, commandKey);
+    const bool avReadOk = mem.isLastReadOk();  // 4.9.9 round 3: capture before any heal write clobbers the flag
     if ((tempJoystickAccelerationLevel < CONF_JOY_ACCELERATION_LEVEL_MIN) || (tempJoystickAccelerationLevel > CONF_JOY_ACCELERATION_LEVEL_MAX)) {
       tempJoystickAccelerationLevel = CONF_JOY_ACCELERATION_LEVEL_DEFAULT;
-      if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+      if (avReadOk) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
         mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempJoystickAccelerationLevel);
       }
     }
-    
+    // 4.9.9 review round 3 (read-truth doctrine — see getOperatingMode): the
+    // WIRE answers the in-force level (`acceleration` — boot-loaded in
+    // initAcceleration, kept honest by the setter) when the read failed;
+    // the RETURN keeps the install value for the boot consumer.
+    if (!avReadOk) {
+      tempJoystickAccelerationLevel = acceleration;
+    }
   }
   printResponseInt(responseEnabled, apiEnabled, true, 0, "AV,0", true, tempJoystickAccelerationLevel);
 
@@ -2721,11 +2840,19 @@ int getCommunicationMode(bool responseEnabled, bool apiEnabled) {
   int tempComMode;
   tempComMode = mem.readInt(CONF_SETTINGS_FILE, commandKey);
 
+  // 4.9.9 review round 3 (read-truth doctrine — see getOperatingMode):
+  // capture the verdict before the heal write, answer the IN-FORCE mode on
+  // a failed read. No boot consumer takes this return (initCommunicationMode
+  // loads memory directly), so the honest value serves wire and callers.
+  const bool cmReadOk = mem.isLastReadOk();
   if ((tempComMode < CONF_COM_MODE_MIN) || (tempComMode > CONF_COM_MODE_MAX)) {
     tempComMode = CONF_COM_MODE_DEFAULT;
-    if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+    if (cmReadOk) {
       mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempComMode);
     }
+  }
+  if (!cmReadOk) {
+    tempComMode = g_comMode;  // the in-force mode, not a readback
   }
 
   printResponseInt(responseEnabled, apiEnabled, true, 0, "CM,0", true, tempComMode);
@@ -2770,30 +2897,45 @@ void setCommunicationMode(bool responseEnabled, bool apiEnabled, int inputCommun
   if ((inputCommunicationMode >= CONF_COM_MODE_MIN) && (inputCommunicationMode <= CONF_COM_MODE_MAX)) {
     if ((inputCommunicationMode == CONF_COM_MODE_BLE) && (g_operatingMode == CONF_OPERATING_MODE_GAMEPAD)){
       printResponseInt(responseEnabled, apiEnabled, false, 3, "CM,1", true, inputCommunicationMode);    // Return error if user tries to change to Bluetooth mode while in Gamepad mode
-    } else if (mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputCommunicationMode)) {
-      // Store first, switch second: a refused store (settings budget,
-      // LSMemory) must not flip the live mode the next boot would forget.
-      g_comMode = inputCommunicationMode;
-      printResponseInt(responseEnabled, apiEnabled, true, 0, "CM,1", true, inputCommunicationMode);
-
-      // 4.5.8 BENCH FIX — the live interface hand-off is GONE; a mode change
-      // now works like the operating-mode change: save, ack, software reset,
-      // and the next boot begins the right interface fresh. The bench caught
-      // the live hand-off dead-hanging the firmware twice (session logs
-      // 2026-10-25): the pre-hand-off setLedDefault() called
-      // Bluefruit.connected() on a never-begun SoftDevice (never returned —
-      // no ack, 30 s watchdog death), and even with that guarded, a runtime
-      // SoftDevice enable mid-session remained the fragile path. The reset
-      // flow is the one the bench validated (OM,1:x worked perfectly twice);
-      // the app's reconnect-after-reset flow handles the port drop. Same-mode
-      // writes stay a no-op ack (idempotent, the app's restore flow relies on
-      // it); the menu's mode change already reset (finishChangeMode), so this
-      // is consistent behavior, not new.
-      if (previousComMode != inputCommunicationMode) {
-        softwareReset();  // ack already printed; the reset flow is bench-proven
-      }
     } else {
-      printResponseInt(responseEnabled, apiEnabled, false, 3, "CM,1", true, inputCommunicationMode);
+      // 4.9.9 review round 4: gate the reset BEFORE the store, the live
+      // mutation and the ack. The 4.5.7 trap this file documents — a live
+      // mode claiming a mode the interfaces never entered — is exactly what
+      // a post-ack refusal would recreate (the old shape acked SUCCESS,
+      // flipped g_comMode, and only then called the reset). A refused gate
+      // therefore answers FAIL,3 with NOTHING mutated (the live mode, the
+      // interfaces and the stored value all stay as they are); a retry once
+      // the window closes runs the whole flow.
+      const bool resetPending = (previousComMode != inputCommunicationMode);
+      if (resetPending && !softwareResetGate()) {
+        printResponseInt(responseEnabled, apiEnabled, false, 3, "CM,1", true, inputCommunicationMode);
+        return;
+      }
+      if (mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputCommunicationMode)) {
+        // Store first, switch second: a refused store (settings budget,
+        // LSMemory) must not flip the live mode the next boot would forget.
+        g_comMode = inputCommunicationMode;
+        printResponseInt(responseEnabled, apiEnabled, true, 0, "CM,1", true, inputCommunicationMode);
+
+        // 4.5.8 BENCH FIX — the live interface hand-off is GONE; a mode change
+        // now works like the operating-mode change: save, ack, software reset,
+        // and the next boot begins the right interface fresh. The bench caught
+        // the live hand-off dead-hanging the firmware twice (session logs
+        // 2026-10-25): the pre-hand-off setLedDefault() called
+        // Bluefruit.connected() on a never-begun SoftDevice (never returned —
+        // no ack, 30 s watchdog death), and even with that guarded, a runtime
+        // SoftDevice enable mid-session remained the fragile path. The reset
+        // flow is the one the bench validated (OM,1:x worked perfectly twice);
+        // the app's reconnect-after-reset flow handles the port drop. Same-mode
+        // writes stay a no-op ack (idempotent, the app's restore flow relies on
+        // it); the menu's mode change already reset (finishChangeMode), so this
+        // is consistent behavior, not new.
+        if (resetPending) {
+          softwareReset();  // the gate already ran — instant, and the reset always follows
+        }
+      } else {
+        printResponseInt(responseEnabled, apiEnabled, false, 3, "CM,1", true, inputCommunicationMode);
+      }
     }
 
   }
@@ -2877,13 +3019,19 @@ void setModePreset(bool responseEnabled, bool apiEnabled, int inputPreset) {
 
   const bool changed = (g_operatingMode != targetOperatingMode) ||
                        (g_comMode != targetCommunicationMode);
+  // 4.9.9 review round 4: gate the reset BEFORE the store/ack (see CM,1) —
+  // a refused gate answers FAIL,3 with nothing stored or mutated.
+  if (changed && !softwareResetGate()) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "MP,1", true, inputPreset);
+    return;
+  }
   if (!storeModePair(targetOperatingMode, targetCommunicationMode)) {
     printResponseInt(responseEnabled, apiEnabled, false, 3, "MP,1", true, inputPreset);
     return;
   }
 
   printResponseInt(responseEnabled, apiEnabled, true, 0, "MP,1", true, inputPreset);
-  if (changed) softwareReset();
+  if (changed) softwareReset();  // the gate already ran — instant
 }
 
 void setModePreset(bool responseEnabled, bool apiEnabled, String optionalParameter) {
@@ -2934,14 +3082,26 @@ int getSoundMode(bool responseEnabled, bool apiEnabled) {
   int tempSoundMode;
   tempSoundMode = mem.readInt(CONF_SETTINGS_FILE, commandKey);
 
+  const bool smReadOk = mem.isLastReadOk();  // 4.9.9 round 3: capture before any heal write clobbers the flag
   if ((tempSoundMode < CONF_SOUND_MODE_MIN) || (tempSoundMode > CONF_SOUND_MODE_MAX)) {
     tempSoundMode = CONF_SOUND_MODE_DEFAULT;
-    if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+    if (smReadOk) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
       mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempSoundMode);
     }
   }
+  if (smReadOk) {
+    g_soundMode = tempSoundMode;  // keep the live global honest on a real read — a failed read must not rewrite it (the LM note)
+  }
 
-  printResponseInt(responseEnabled, apiEnabled, true, 0, "SM,0", true, tempSoundMode);
+  // 4.9.9 review round 3 (read-truth doctrine — see getOperatingMode): the
+  // WIRE answers the IN-FORCE tier — the buzzer object's own level, which is
+  // what the device is actually running (buzzer.begin installed it from the
+  // boot read; setSoundModeLevel and the Hub toggle keep it current). The
+  // global assignment above only runs its honest part on a successful read
+  // (see the LM note); the RETURN keeps the install value for the
+  // boot/screen consumers.
+  printResponseInt(responseEnabled, apiEnabled, true, 0, "SM,0", true,
+                   smReadOk ? tempSoundMode : buzzer.getSoundModeLevel());
 
   return tempSoundMode;
 }
@@ -3028,18 +3188,30 @@ int getLightMode(bool responseEnabled, bool apiEnabled) {
   int tempLightMode;
   tempLightMode = mem.readInt(CONF_SETTINGS_FILE, commandKey);
 
+  const bool lmReadOk = mem.isLastReadOk();  // 4.9.9 round 3: capture before any heal write clobbers the flag
   if ((tempLightMode < CONF_LIGHT_MODE_MIN) || (tempLightMode > CONF_LIGHT_MODE_MAX)) {
     tempLightMode = CONF_LIGHT_MODE_DEFAULT;
-    if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+    if (lmReadOk) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
       mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempLightMode);
     }
   }
-  g_lightMode = tempLightMode;  // Keep the live global honest (the input-state
-                                // LED mode reads it; before this it was only
-                                // ever set by setLightMode, so a boot with a
-                                // stored mode read as 0/None until first write)
+  // Keep the live global honest (the input-state LED mode reads it; before
+  // this it was only ever set by setLightMode, so a boot with a stored mode
+  // read as 0/None until first write).
+  // 4.9.9 review round 3 (read-truth doctrine): the assignment is gated on
+  // the read verdict — a failed read must not rewrite the live LED mode with
+  // the fabricated default (evaluateOutputAction keys the input-state LEDs
+  // on it). The in-force value is captured BEFORE the assignment for the
+  // wire answer below.
+  const int inForceLightMode = lmReadOk ? tempLightMode : g_lightMode;
+  if (lmReadOk) {
+    g_lightMode = tempLightMode;
+  }
 
-  printResponseInt(responseEnabled, apiEnabled, true, 0, "LM,0", true, tempLightMode);
+  // 4.9.9 review round 3 (read-truth doctrine — see getOperatingMode): the
+  // WIRE answers the in-force mode; the RETURN keeps the install value for
+  // the boot/screen consumers.
+  printResponseInt(responseEnabled, apiEnabled, true, 0, "LM,0", true, inForceLightMode);
 
   return tempLightMode;
 }
@@ -3128,14 +3300,20 @@ int getLightBrightnessLevel(bool responseEnabled, bool apiEnabled) {
   int tempLightLevel;
   tempLightLevel = mem.readInt(CONF_SETTINGS_FILE, commandKey);
 
+  const bool llReadOk = mem.isLastReadOk();  // 4.9.9 round 3: capture before any heal write clobbers the flag
   if ((tempLightLevel < CONF_LED_BRIGHTNESS_LEVEL_MIN) || (tempLightLevel > CONF_LED_BRIGHTNESS_LEVEL_MAX)) {
     tempLightLevel = CONF_LED_BRIGHTNESS_LEVEL_DEFAULT;
-    if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+    if (llReadOk) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
       mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempLightLevel);
     }
   }
 
-  printResponseInt(responseEnabled, apiEnabled, true, 0, "LL,0", true, tempLightLevel);
+  // 4.9.9 review round 3 (read-truth doctrine — see getOperatingMode): the
+  // WIRE answers the in-force level (the LED object's own level — the same
+  // 1-10 scale, boot-installed and kept honest by the setter); the RETURN
+  // keeps the install value for the boot/screen consumers.
+  printResponseInt(responseEnabled, apiEnabled, true, 0, "LL,0", true,
+                   llReadOk ? tempLightLevel : led.getLedBrightnessLevel());
 
   return tempLightLevel;
 }
@@ -4279,6 +4457,19 @@ int lsHostExecuteSwitch(int targetRow, const char* expectedMac12,
     if (armed) {
       lsHostRestoreAutoRestart();
       lsHostDisarmSwitchWindow();
+      // 4.9.9 review round 3 (the B3 class, same shape as the begin-failure
+      // and close paths): a REFUSED disconnect is usually the CONN_COUNT
+      // state — the link already tearing down, its DISCONNECTED event
+      // consumed while the stock auto-restart was suspended. Without this,
+      // nothing ever restarts advertising: the radio sits silently dark
+      // after the FAIL,3 until the user retries a BT command. The one-shot
+      // ensure covers the still-on-air reading, the deferred restart covers
+      // the event-pending gap, and the grace reset keeps an already-elapsed
+      // HID-watchdog grace from surviving onto a same-handle reconnect —
+      // the executor's own contract ("every failure path restores stock
+      // radio state"), now actually true on this path.
+      if (!Bluefruit.connected()) lsHostEnsureAdvertising();
+      lsHostArmDeferredAdvRestart();
     }
     return LSHOST_REFUSE_RADIO;
   }
@@ -4367,9 +4558,10 @@ int getDebugMode(bool responseEnabled, bool apiEnabled) {
   int tempDebugMode;
   tempDebugMode = mem.readInt(CONF_SETTINGS_FILE, commandKey);
 
+  const bool dmReadOk = mem.isLastReadOk();  // 4.9.9 round 3: capture before any heal write clobbers the flag
   if ((tempDebugMode < CONF_DEBUG_MODE_MIN) || (tempDebugMode > CONF_DEBUG_MODE_MAX)) {
     tempDebugMode = CONF_DEBUG_MODE_DEFAULT;
-    if (mem.isLastReadOk()) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
+    if (dmReadOk) {  // heal a stored value only — never rewrite from a failed read (getModelNumber pattern)
       mem.writeInt(CONF_SETTINGS_FILE, commandKey, tempDebugMode);
     }
   }
@@ -4381,7 +4573,12 @@ int getDebugMode(bool responseEnabled, bool apiEnabled) {
   // deliberately disabled. The getter is a pure read; initDebug and
   // setDebugMode own the state change.
 
-  printResponseInt(responseEnabled, apiEnabled, true, 0, "DM,0", true, tempDebugMode);
+  // 4.9.9 review round 3 (read-truth doctrine — see getOperatingMode): the
+  // WIRE answers the in-force mode (g_debugMode — boot-loaded in initDebug,
+  // kept honest by the setter); the RETURN keeps the install value for the
+  // boot consumer.
+  printResponseInt(responseEnabled, apiEnabled, true, 0, "DM,0", true,
+                   dmReadOk ? tempDebugMode : g_debugMode);
 
   return tempDebugMode;
 }
@@ -4419,6 +4616,21 @@ void getDebugMode(bool responseEnabled, bool apiEnabled, String optionalParamete
 //*********************************//
 void setDebugMode(bool responseEnabled, bool apiEnabled, int inputDebugMode) {
   String commandKey = "DM";
+
+  // 4.9.9 review round 3: an in-flight calibration/center flow owns the
+  // joystick and scroll poll timers — step 0 disables them so the flow
+  // solely owns the sensor (performJoystickCalibrationStep), and
+  // setDebugState's restore branch re-enables them for any non-joystick
+  // debug value, putting a 20 ms joystickLoop I2C poll back under a corner
+  // reading mid-window. The 4.5.7 getter note fixed exactly this class for
+  // reads ("re-enabling the poll a running calibration deliberately
+  // disabled"); the setter keeps the same gate. Refuse BEFORE the store so
+  // the persisted DM and the live state both stay the flow's (the sibling
+  // IN,1/CA,1 flow-refusal shape: FAIL,3, one answer).
+  if (g_calibrationRunning || g_centerRunning) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "DM,1", true, inputDebugMode);
+    return;
+  }
 
   if (((inputDebugMode >= CONF_DEBUG_MODE_MIN) && (inputDebugMode <= CONF_DEBUG_MODE_MAX))
       && mem.writeInt(CONF_SETTINGS_FILE, commandKey, inputDebugMode)) {
@@ -4625,8 +4837,15 @@ void runTest(bool responseEnabled, bool apiEnabled, String optionalParameter) {
 // Return     : void
 //***************************//
 void softReset(bool responseEnabled, bool apiEnabled) {
+  // 4.9.9 review round 4: gate BEFORE the ack — a refused gate answers
+  // FAIL,3 (one honest answer) instead of SUCCESS followed by a reset that
+  // never happens.
+  if (!softwareResetGate()) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "SR,1", true, 1);
+    return;
+  }
   printResponseInt(responseEnabled, apiEnabled, true, 0, "SR,1", true, 1);
-  softwareReset();
+  softwareReset();  // the gate already ran — instant
 }
 
 //***FACTORY RESET API FUNCTION***//
@@ -4684,8 +4903,16 @@ bool resetSettings(bool responseEnabled, bool apiEnabled) {
 // Return     : void
 void resetSettings(bool responseEnabled, bool apiEnabled, String optionalParameter) {
   if (optionalParameter.length() == 1 && optionalParameter.toInt() == 1) {
+    // 4.9.9 review round 4: gate BEFORE the settings wipe — a refused gate
+    // answers FAIL,3 and leaves every stored value and the live state
+    // untouched (the ack-then-no-reset shape would have reset the settings
+    // and then skipped the restart).
+    if (!softwareResetGate()) {
+      printResponseInt(responseEnabled, apiEnabled, false, 3, "RS,1", true, 1);
+      return;
+    }
     if (resetSettings(responseEnabled, apiEnabled) && apiEnabled) {
-      softwareReset();
+      softwareReset();  // the gate already ran — instant
     }
   }
 }
@@ -4749,6 +4976,15 @@ void doFactoryReset(bool responseEnabled, bool apiEnabled) {
 // Return     : void
 void doFactoryReset(bool responseEnabled, bool apiEnabled, String optionalParameter) {
   if (optionalParameter.length() == 1 && optionalParameter.toInt() == 1) {
+    // 4.9.9 review round 4: gate BEFORE the format — a refused gate answers
+    // FAIL,3 and leaves every stored value, bond and live state untouched
+    // (the old shape formatted and reseeded flash, acked SUCCESS, and could
+    // then skip the restart, leaving factory flash under stale live
+    // globals).
+    if (!softwareResetGate()) {
+      printResponseInt(responseEnabled, apiEnabled, false, 3, "FR,1", true, 1);
+      return;
+    }
     doFactoryReset(responseEnabled, apiEnabled);
   }
 }

@@ -123,11 +123,22 @@ void initializeBluefruit(const char* s) {
   (void) sd_softdevice_is_enabled(&sdAlreadyEnabled);
   g_bleSdWasEnabled = (sdAlreadyEnabled != 0) ? 1 : 0;
   if (sdAlreadyEnabled) {
+    // 4.9.9 review round 3: the disable→flag-store gap is a retention race.
+    // A loop-task stamp that reads g_softDeviceEnabled==true (still the
+    // setup-seeded value) and issues its sd_power_gpregret_* SVC after the
+    // disable below lands reaches the core's FreeRTOS SVC trampoline with
+    // the SD DOWN — the exact non-dispatching hazard the 4.6.6 window
+    // machinery exists to prevent. Open the init window across the disable
+    // so every gated retention writer skips (lipsyncRetentionUnsafe() is
+    // now window-based, covering both this sub-window and begin()'s), and
+    // close it only after the flag store completes.
+    g_bleInitWindow = true;
     (void) sd_softdevice_disable();  // MBR-serviced SVC: legal whether or not the SD is up
     // 4.6.6: the SD is DOWN from this instant — drop the flag (setup seeded
     // it true for this exact leftover case) so no retention write takes the
     // SVC path into a disabled SoftDevice on the way to begin()'s re-enable.
     g_softDeviceEnabled = false;
+    g_bleInitWindow = false;
   }
   // 4.5.17 bench round 11: THE PRIORITY MODEL, CORRECTED BY THE BENCH. The
   // classic "app must use 4-7 with the SoftDevice" rule is WRONG for this
@@ -565,12 +576,14 @@ uint8_t lsHostEnumerate(lsHostRow* rows, uint8_t cap) {
     if (filled < cap) {
       rows[filled++] = row;
     } else {
-      // Keep the cap MAC-lowest rows: replace the largest if this is smaller.
-      uint8_t worst = 0;
-      for (uint8_t i = 1; i < cap; i++) {
-        if (strcmp(rows[i].mac, rows[worst].mac) > 0) worst = i;
-      }
-      if (strcmp(row.mac, rows[worst].mac) < 0) rows[worst] = row;
+      // 4.9.9 review round 3: the eviction decision moved to the pure,
+      // host-tested layer (lsHostCapEvictIndex in LSHostSwitch.h). Same
+      // MAC-lowest-set semantics for non-active rows; the ACTIVE host is
+      // now never evicted (a >cap bond set used to push the connected host
+      // outside the enumeration — BT,5 read "no active host" and the
+      // already-active refusal could never fire for it).
+      const int evict = lsHostCapEvictIndex(rows, (int)cap, row.mac, row.active);
+      if (evict >= 0) rows[evict] = row;
     }
   }
   dirFile.close();
@@ -1165,6 +1178,22 @@ bool lsHostSwitchWindowBoundExpired(void) {
   if (millis() - g_switchWindowStartMs < LSHOST_SWITCH_WINDOW_TIMEOUT_MS) return false;
   lsHostCloseSwitchWindow();
   return true;
+}
+
+// 4.9.9 review round 3: the shared "the radio may now be dark" tail. The
+// begin-failure, cancel and close paths inline this shape (arm the deferred
+// advertising restart when nothing is connected, then end the HID
+// watchdog's grace tracking); the executor's disconnect-refused path
+// (LSAPI.ino) now calls this too — the B3 class: a DISCONNECTED event
+// consumed while the stock auto-restart was suspended leaves nothing that
+// will ever restart advertising, and an already-elapsed grace must not
+// survive onto a same-handle reconnect of the dying link.
+void lsHostArmDeferredAdvRestart(void) {
+  if (!Bluefruit.connected()) {
+    g_switchAdvRestartPending = true;
+    g_switchAdvRestartPendingMs = millis();
+  }
+  lsHidWatchdogResetGrace();
 }
 
 // Per-tick during a switch window (polled from btFeedbackLoop at 1 s):

@@ -114,7 +114,12 @@
 #define NOTE_DS8 4978
 
 class LSBuzzer {
-  public: 
+  public:
+    // 4.9.9 review round 3: the in-force sound tier — the object's own level
+    // (installed by buzzer.begin's boot read, updated by setSoundModeLevel
+    // and the Hub toggle). The SM getter answers this on a failed flash
+    // read: the read-truth doctrine's "answer what is actually running".
+    int getSoundModeLevel() const { return _soundModeLevel; }
     LSBuzzer();
     void begin();
     void update();
@@ -301,8 +306,9 @@ void LSBuzzer::setSoundModeLevel(int inputSoundMode){
 // 
 // Return     : void
 //*********************************//
-void LSBuzzer::playStartupSound(){ 
+void LSBuzzer::playStartupSound(){
   if (_buzzerOn && (_soundModeLevel != CONF_SOUND_MODE_OFF)){
+    clear();  // 4.9.9 review round 3: the queue is exclusive state — cancel a stale cue before sounding (the playReadySound rule)
     tone(CONF_BUZZER_PIN, NOTE_F5, 200);
   }
 }
@@ -358,6 +364,7 @@ void LSBuzzer::playErrorSound(){
   // loop only for the ready cue's two bounded follow-up steps; playErrorSound
   // itself stays synchronous so error audio completes before error LEDs start.
   if (!_buzzerOn || (_soundModeLevel == CONF_SOUND_MODE_OFF)) return;
+    clear();  // 4.9.9 review round 3: a queued ready-cue note must not fire over (or after) the error pair
     tone(CONF_BUZZER_PIN, NOTE_G4, 500);
     delay(500);
     tone(CONF_BUZZER_PIN, NOTE_C4, 500);
@@ -388,6 +395,12 @@ void LSBuzzer::playErrorSound(){
 //*********************************//
 void LSBuzzer::playErrorCue(){
   if (!_buzzerOn || (_soundModeLevel == CONF_SOUND_MODE_OFF)) return;
+  // 4.9.9 review round 3: clear a pending ready-cue first — the ready cue's
+  // queued C6/silence entries (firing at +500/+750 ms) otherwise cut this
+  // 150 ms refusal tone short when the cue is still draining, and this tone
+  // equally truncated the cue. The queue is exclusive state (clear()'s own
+  // docstring); playReadySound and setSoundModeLevel already follow the rule.
+  clear();
   tone(CONF_BUZZER_PIN, NOTE_G4, 150);
 }
 
@@ -406,6 +419,7 @@ void LSBuzzer::playShutdownSound(){
   // queued notes. The block is bounded (~1 s) and the device is about to
   // reboot anyway.
   if (_buzzerOn && (_soundModeLevel != CONF_SOUND_MODE_OFF)) {
+    clear();  // 4.9.9 review round 3: no queued note may fire over (or after) the shutdown sequence
     tone(CONF_BUZZER_PIN, NOTE_C6, 500);
     delay(250);
     tone(CONF_BUZZER_PIN, NOTE_G5, 500);       
@@ -426,6 +440,7 @@ void LSBuzzer::playShutdownSound(){
 //*********************************//
 void LSBuzzer::calibCornerTone(){
   if (_buzzerOn && (_soundModeLevel != CONF_SOUND_MODE_OFF)){
+    clear();  // 4.9.9 review round 3: the queue is exclusive state (the playReadySound rule)
     tone(CONF_BUZZER_PIN, NOTE_A4, 300);
   }
 }
@@ -441,6 +456,7 @@ void LSBuzzer::calibCornerTone(){
 //*********************************//
 void LSBuzzer::calibCenterTone(){
   if (_buzzerOn && (_soundModeLevel != CONF_SOUND_MODE_OFF)){
+    clear();  // 4.9.9 review round 3: the queue is exclusive state (the playReadySound rule)
     tone(CONF_BUZZER_PIN, NOTE_A6, 500);
   }
 }
@@ -464,6 +480,7 @@ void LSBuzzer::modeEngageTone(bool scrollMode){
   if (!_buzzerOn || (_soundModeLevel != CONF_SOUND_MODE_ALL)) {
     return;
   }
+  clear();  // 4.9.9 review round 3: a pending ready-cue entry must not cut the 60 ms engage chirp short
   tone(CONF_BUZZER_PIN, scrollMode ? NOTE_E6 : NOTE_C5, 60);
 }
 

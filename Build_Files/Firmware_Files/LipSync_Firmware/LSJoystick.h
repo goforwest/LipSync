@@ -160,6 +160,18 @@ class LSJoystick {
     pointIntType pointIntFromMagnitudeAngle(float inputMagnitude, float inputPointAngle);
     int sgn(float val);                                                   // Get the sign of the value.
     pointFloatType _magnetInputCalibration[JOY_CALIBR_ARRAY_SIZE];        // Array of calibration points.
+    // 4.9.9 review round 3: per-slot "a real sample has been stored this
+    // window" flag. getInputMax's max-accumulate used to compare every
+    // reading against the zeroed slot, whose center-relative magnitude is
+    // |center| — the neutral's distance from the SENSOR ORIGIN, not a
+    // deflection. On a unit whose magnet rests far enough off origin
+    // (the documented near-{30,30} compensated-neutral class) that spurious
+    // threshold exceeds every real corner (13-30 mT from center), so NO
+    // sample passed the gate, every corner fell back to the ±13 default,
+    // and every recalibration shipped a stiff, barely-responsive cursor.
+    // First-valid-wins: the first reading of a window seeds the slot, and
+    // the max-over-window comparison then runs deflection vs deflection.
+    bool _cornerSeeded[JOY_CALIBR_ARRAY_SIZE];
     pointFloatType _rawPoint;                                             // Raw x and y values used for debugging purposes.
     pointIntType _inputPoint;                                             // Mapped and filtered x and y values
     pointIntType _outputPoint;                                            // Output x and y values
@@ -243,6 +255,7 @@ LSJoystick::LSJoystick() {
   // read is honest.
   for (int calibIndex = 0; calibIndex < JOY_CALIBR_ARRAY_SIZE; calibIndex++) {
     _magnetInputCalibration[calibIndex] = {0.0f, 0.0f};
+    _cornerSeeded[calibIndex] = false;  // 4.9.9 round 3: the seed flags reset with their slots
   }
   _rawPoint = {0.0f, 0.0f};
   _inputPoint = {0, 0};
@@ -334,6 +347,9 @@ void LSJoystick::clear() {
   _magnetInputCalibration[2] = {0.00, 0.00};
   _magnetInputCalibration[3] = {0.00, 0.00};
   _magnetInputCalibration[4] = {0.00, 0.00};
+  for (int calibIndex = 0; calibIndex < JOY_CALIBR_ARRAY_SIZE; calibIndex++) {
+    _cornerSeeded[calibIndex] = false;  // 4.9.9 round 3: cleared with the slots they arm
+  }
 
 
   _joystickRawBuffer.pushElement({0.0, 0.0});           // Initialize _joystickRawBuffer
@@ -830,8 +846,19 @@ pointFloatType LSJoystick::getInputMax(int quad) {
   // Make sure it's a valid quadrant and if new point has larger magnitude from center ( calibration timer loop )
 
 
-  if( magnitudePoint(tempCalibrationPoint, _magnetInputCalibration[0]) > magnitudePoint(_magnetInputCalibration[quad], _magnetInputCalibration[0])){           // The point with larger magnitude is sent as output 
+  // 4.9.9 review round 3: first-valid-wins seeding. The old gate compared
+  // every reading against the zeroed slot, whose center-relative magnitude
+  // is |center| — the magnet's resting distance from the SENSOR ORIGIN, not
+  // a deflection — so on an off-origin-neutral unit the gate could exceed
+  // every real corner (13-30 mT from center) and the window stored nothing
+  // but the ±13 default (the stiff-cursor recalibration class; see
+  // _cornerSeeded). The first reading of a window now seeds the slot, and
+  // the max-over-window comparison runs deflection vs deflection from then
+  // on — identical semantics once seeded, no spurious initial threshold.
+  if (!_cornerSeeded[quad]
+      || magnitudePoint(tempCalibrationPoint, _magnetInputCalibration[0]) > magnitudePoint(_magnetInputCalibration[quad], _magnetInputCalibration[0])){           // The point with larger magnitude is sent as output
     _magnetInputCalibration[quad] = tempCalibrationPoint;
+    _cornerSeeded[quad] = true;
   }
   
   return _magnetInputCalibration[quad];
@@ -852,6 +879,7 @@ void LSJoystick::setInputMax(int quad, pointFloatType inputPoint) {
   if (quad < 0 || quad >= JOY_CALIBR_ARRAY_SIZE) return;
   // Update the calibration point
   _magnetInputCalibration[quad] = inputPoint;
+  _cornerSeeded[quad] = true;  // a stored point is a valid seed (default-corner fallback, reload restores)
 }
 
 //*********************************//
@@ -867,6 +895,7 @@ void LSJoystick::zeroInputMax(int quad) {
   if (quad < 0 || quad >= JOY_CALIBR_ARRAY_SIZE) return;
   // Reset or zero the calibration point
   _magnetInputCalibration[quad] = {0, 0};
+  _cornerSeeded[quad] = false;  // 4.9.9 round 3: the fresh window is unseeded — its first real reading seeds it
 }
 
 //*********************************//

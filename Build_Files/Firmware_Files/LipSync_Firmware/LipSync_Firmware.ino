@@ -126,6 +126,7 @@ LSTimer<ledStateStruct> ledStateTimer;
 int usbConnectTimerId[1] = {-1};
 LSTimer<int> usbConnectTimer;
 static void usbConnectRearm(unsigned long delayMs);  // 4.6.6: delete-before-arm one-shot re-arm — defined before usbCheckConnection; called from setup() (no Arduino auto-prototype reliance, the 4.3.0 discipline)
+void usbEventDrain();  // 4.9.9 review round 3: emit the TinyUSB mount/unmount debug lines from the LOOP task (defined at the callbacks) — the hooks run in the TinyUSB task, whose direct Serial.print interleaved with the TX queue's chunked writes at chunk granularity
 
 unsigned int g_usbConnectDelay = CONF_USB_HID_INIT_DELAY;
 unsigned long g_usbNotReadySinceMs = 0;  // When the current HID-not-ready stretch began; 0 = none in progress
@@ -475,7 +476,23 @@ void bleVerdictPersist() {  // LOOP-CONTEXT ONLY (see the 4.5.21 note above)
     const size_t written = verdictFile.write(rec, sizeof(rec));
     delay(1);
     verdictFile.close();
-    if (written == sizeof(rec)) {
+    // 4.9.9 review round 3: read-back verify before the rename — the same
+    // rule every settings writer carries (LSMemory verifyTempWrite: File::
+    // close() returns void and swallows close-time errors, so the written
+    // count alone can bless a truncated record). A torn record that passed
+    // the rename would sit on /bleverdict.dat until the next boot's consume
+    // — which rejects it on the magics/size and loses the verdict. The
+    // verify makes the rename happen only on a byte-exact temp file; the
+    // failure direction is unchanged (absent verdict = the diagnostic's
+    // benign loss).
+    bool verdictVerified = false;
+    if (written == sizeof(rec) && verdictFile.open(BLE_VERDICT_TMP_FILE, FILE_O_READ)) {
+      uint8_t verify[8];
+      const size_t got = verdictFile.read(verify, sizeof(verify));
+      verdictFile.close();
+      verdictVerified = (got == sizeof(rec)) && (memcmp(verify, rec, sizeof(rec)) == 0);
+    }
+    if (verdictVerified) {
       if (!InternalFS.rename(BLE_VERDICT_TMP_FILE, BLE_VERDICT_FILE)) {
         InternalFS.remove(BLE_VERDICT_TMP_FILE);
       }
@@ -524,6 +541,7 @@ bool g_resetCenterComplete = false;  // global variable for center reset status
 bool g_centerRunning = false;        // center sample buffer/timer ids are shared; serialize center and full-calibration flows
 bool g_calibrationError = false;     // Global variable for error in full calibration
 bool g_calibrationRunning = false;   // 4.5.7 review: a full-calibration chain is in flight — CA,0/EX reads must not overwrite the accumulating corner slots (see getJoystickCalibration)
+bool g_calibrationFromApi = false;   // 4.9.9 review round 3: the ACCEPTED chain's initiator, persisted for the internal step-5 center. The center flow's own payload carries only the CENTER initiator (it is a sub-step invoked internally, so its flag is false) — the three internal-center abort sites in performJoystickCenter read THIS flag so a host CA,1 waiter resolves FAIL,3 instead of an unsolicited MANUAL line (the 4.5.2 initiator contract). Set at acceptance in setJoystickCalibration, cleared at step 6 and in abortJoystickCalibration.
 bool g_calibrationCenterStep = false;  // 4.5.7 review: the calibration chain's OWN internal step-5 center is starting (synchronous bypass for the center-flow in-flight gate — both chains share the calibrationTimerId[] variables, so a concurrent center would clobber the corner reading-timer id and silently drop the corner's persistence + ack)
 
 bool settingsEnabled = false;  // Serial input settings command mode enabled or disabled
@@ -895,7 +913,7 @@ void setup() {
       String timerError = "ERROR: poll timer ";
       timerError += String(timerIdx);
       timerError += " failed to register — that loop WILL NOT RUN";
-      serialTxEnqueueLine(timerError);
+      serialTxEnqueueDiagLine(timerError);
     }
   }
 
@@ -1069,6 +1087,10 @@ void loop() {
   usbmouse.service();
   btmouse.service();
   gamepad.service();
+
+  // 4.9.9 review round 3: the TinyUSB mount/unmount debug events, emitted
+  // from THIS task (the hooks only record them — see tud_mount_cb).
+  usbEventDrain();
 
   // 4.8.1: the mouse's unmount cleanup raised its take-and-clear flag — the
   // USB host went away while click/drag state was held. End the DRAG mode
@@ -1315,7 +1337,7 @@ void hardwareErrorCheck(void) {
     // Display not connected / detected
     buzzer.playErrorSound();
     static const char displayError[] = "ERROR: Display not detected";
-    serialTxEnqueueLine(displayError, sizeof(displayError) - 1);
+    serialTxEnqueueDiagLine(displayError, sizeof(displayError) - 1);
     ledError(3);
     g_safeModeEnabled = true;
     g_safeModeReason = CONF_SAFE_MODE_REASON_HARDWARE;
@@ -1325,7 +1347,7 @@ void hardwareErrorCheck(void) {
     // All joystick sensors not detected
     buzzer.playErrorSound();
     static const char cableError[] = "ERROR: No sensors detected in joystick. Check interface cable.";
-    serialTxEnqueueLine(cableError, sizeof(cableError) - 1);
+    serialTxEnqueueDiagLine(cableError, sizeof(cableError) - 1);
     g_safeModeEnabled = true;
     g_safeModeReason = CONF_SAFE_MODE_REASON_HARDWARE;
     
@@ -1338,15 +1360,15 @@ void hardwareErrorCheck(void) {
     buzzer.playErrorSound();
     if (!g_joystickSensorConnected) {
       static const char joystickError[] = "ERROR: Joystick sensor not detected.";
-      serialTxEnqueueLine(joystickError, sizeof(joystickError) - 1);
+      serialTxEnqueueDiagLine(joystickError, sizeof(joystickError) - 1);
     }
     if (!g_mouthpiecePressureSensorConnected) {
       static const char mouthpieceError[] = "ERROR: Mouthpiece Pressure Sensor not detected.";
-      serialTxEnqueueLine(mouthpieceError, sizeof(mouthpieceError) - 1);
+      serialTxEnqueueDiagLine(mouthpieceError, sizeof(mouthpieceError) - 1);
     }
     if (!g_ambientPressureSensorConnected) {
       static const char ambientError[] = "ERROR: Ambient Pressure Sensor not detected.";
-      serialTxEnqueueLine(ambientError, sizeof(ambientError) - 1);
+      serialTxEnqueueDiagLine(ambientError, sizeof(ambientError) - 1);
     }
     
   }
@@ -1456,7 +1478,7 @@ void checkSafeMode(void) {
     g_safeModeEnabled = true;
     g_safeModeReason = CONF_SAFE_MODE_REASON_HANG;
     static const char hangWarning[] = "WARNING: SAFE MODE ENABLED - Repeated witnessed loop hangs";
-    serialTxEnqueueLine(hangWarning, sizeof(hangWarning) - 1);
+    serialTxEnqueueDiagLine(hangWarning, sizeof(hangWarning) - 1);
 
   } else {
     g_safeModeEnabled = false;
@@ -1488,13 +1510,13 @@ void toggleSafeMode(bool safeModeEnabled) {
       case CONF_SAFE_MODE_REASON_INPUT:
       {
         static const char inputWarning[] = "WARNING: SAFE MODE ENABLED - Hub Buttons";
-        serialTxEnqueueLine(inputWarning, sizeof(inputWarning) - 1);
+        serialTxEnqueueDiagLine(inputWarning, sizeof(inputWarning) - 1);
         break;
       }
       case CONF_SAFE_MODE_REASON_WATCHDOG:
       {
         static const char watchdogWarning[] = "WARNING: SAFE MODE ENABLED - Watchdog";
-        serialTxEnqueueLine(watchdogWarning, sizeof(watchdogWarning) - 1);
+        serialTxEnqueueDiagLine(watchdogWarning, sizeof(watchdogWarning) - 1);
         break;
       }
       case CONF_SAFE_MODE_REASON_HARDWARE:
@@ -1512,17 +1534,17 @@ void toggleSafeMode(bool safeModeEnabled) {
             g_joystickSensorConnected, g_mouthpiecePressureSensorConnected,
             g_ambientPressureSensorConnected, g_displayConnected);
         if (hardwareWarningLen > 0) {
-          serialTxEnqueueLine(hardwareWarning, (size_t)hardwareWarningLen);
+          serialTxEnqueueDiagLine(hardwareWarning, (size_t)hardwareWarningLen);
         } else {
           static const char hardwareWarningFallback[] = "WARNING: SAFE MODE ENABLED - Hardware";
-          serialTxEnqueueLine(hardwareWarningFallback, sizeof(hardwareWarningFallback) - 1);
+          serialTxEnqueueDiagLine(hardwareWarningFallback, sizeof(hardwareWarningFallback) - 1);
         }
         break;
       }
       default:
       {
         static const char safeWarning[] = "WARNING: SAFE MODE ENABLED";
-        serialTxEnqueueLine(safeWarning, sizeof(safeWarning) - 1);
+        serialTxEnqueueDiagLine(safeWarning, sizeof(safeWarning) - 1);
         break;
       }
          
@@ -2155,16 +2177,44 @@ void usbCheckConnection(void) {
 //
 // Return     : void
 //****************************************//
+// 4.9.9 review round 3: the hooks record the event; the LOOP task emits the
+// line (usbEventDrain, called from loop()). TinyUSB runs these callbacks in
+// its own FreeRTOS task — a direct Serial.print here interleaved with
+// serialTxService()'s chunked writes from the loop task at chunk granularity
+// (the exact line-corruption class the TX queue was built to eliminate).
+// Single aligned volatile stores from the USB task, taken-and-cleared by the
+// loop task: an event landing mid-drain re-raises its bit.
+volatile uint8_t g_usbEventPending = 0;  // bit0 = configured, bit1 = unconfigured
+volatile unsigned long g_usbEventConfiguredMs = 0;
+volatile unsigned long g_usbEventUnconfiguredMs = 0;
+
 extern "C" void tud_mount_cb(void) {
   if (!USB_DEBUG) return;
-  Serial.print("USB-EVT: configured at ");
-  Serial.println(millis());
+  g_usbEventConfiguredMs = millis();
+  g_usbEventPending |= 0x1;
 }
 
 extern "C" void tud_umount_cb(void) {
   if (!USB_DEBUG) return;
-  Serial.print("USB-EVT: unconfigured at ");
-  Serial.println(millis());
+  g_usbEventUnconfiguredMs = millis();
+  g_usbEventPending |= 0x2;
+}
+
+void usbEventDrain() {
+  if (g_usbEventPending == 0) return;
+  const uint8_t pending = g_usbEventPending;
+  // 4.9.9 review round 4 (lossy-clear fix): clear only the bits being
+  // drained — an event raised in the TinyUSB task between the read and the
+  // clear must survive (a whole-word store would erase it).
+  g_usbEventPending &= (uint8_t)~pending;
+  if (pending & 0x1) {
+    Serial.print("USB-EVT: configured at ");
+    Serial.println(g_usbEventConfiguredMs);
+  }
+  if (pending & 0x2) {
+    Serial.print("USB-EVT: unconfigured at ");
+    Serial.println(g_usbEventUnconfiguredMs);
+  }
 }
 
 
@@ -2213,13 +2263,17 @@ void initOperatingMode() {
 //              boot. 4.9.1 (dead-store removal): persistence happens in the
 //              CALLERS before this call (OM/CM store the pair, the menu's
 //              finishChangeMode runs storeModePair), and softwareReset()
-//              never returns — the trailing g_operatingMode assignment this
-//              function used to carry was unreachable, and its "this is
-//              where the mode is set" shape was a trap for exactly the
-//              future editor who adds a bail-out return to softwareReset()
-//              (the assignment would then flip the global AFTER
-//              usbmouse.end()/btmouse.end() ran — the 4.5.7 "live mode
-//              claims a mode the interfaces never entered" bug, recreated).
+//              only returns when it REFUSED — 4.9.9 review round 4: the BLE
+//              init-window gate can bail out (named on the wire) without
+//              touching anything, so the trailing g_operatingMode assignment
+//              this function used to carry must STAY gone (the assignment
+//              would flip the global AFTER usbmouse.end()/btmouse.end() ran
+//              on the accepted path — the 4.5.7 "live mode claims a mode the
+//              interfaces never entered" bug, recreated — and on the refused
+//              path it would claim a mode whose interfaces were never
+//              begun at all). The serial OM endpoint gates the reset BEFORE
+//              its store/ack, so a refusal leaves the stored value as the
+//              only forward effect (it lands at the next boot).
 //
 // Parameters : inputOperatingMode : int : The operating mode to change to
 //
@@ -2227,7 +2281,11 @@ void initOperatingMode() {
 //****************************************//
 void changeOperatingMode(int inputOperatingState) {
   if (inputOperatingState != g_operatingMode) {
-    softwareReset();  // never returns
+    // 4.9.9 review round 4: softwareReset() returns without resetting when
+    // the BLE init window is still open (refused, named on the wire) — but
+    // the OM endpoint's gate has already run before this call, so this site
+    // can only observe an instant, always-reset gate.
+    softwareReset();
   }
 }
 
@@ -2980,8 +3038,24 @@ void evaluateOutputAction(inputStateStruct actionState, unsigned long actionMaxE
     releaseOutputAction();
     canEvaluateAction = false;
   }  // Detected input release after defined time limits.
-  else if (actionState.secondaryState == INPUT_SEC_STATE_RELEASED && actionState.elapsedTime > effectiveWindowMs(actionMaxEndTime)) {
+  else if (actionState.secondaryState == INPUT_SEC_STATE_RELEASED
+           && (actionState.elapsedTime > effectiveWindowMs(actionMaxEndTime)
+               || actionState.elapsedTime > effectiveWindowMs(CONF_INPUT_WINDOW_MAX_DEFAULT_MS))) {
     // Set Led color to default
+    // 4.9.9 review round 3: the second bound covers the dead zone upstream
+    // #58 opened. sapActionMaxTime is the whole SAP table's max — the hard
+    // rows' 60000 — so the old single bound delayed this reset from the
+    // regular windows' ceiling (8 s, mapped) to 60 s: a regular hold
+    // released between the last regular window and a minute matched no row
+    // (no action, no LED there) and never reached this reset either, so the
+    // STARTED hold paint (solid color, or the LM=3 window fill — a static
+    // paint with no idle repaint anywhere) stayed up until the user's next
+    // gesture. For the button/switch tables this bound equals
+    // actionMaxEndTime (their rows end at the same 8000), so their behavior
+    // is unchanged; for SAP the mapped regular ceiling is the honest
+    // "nothing more will fire" point — a hard hold that already fired its
+    // row repaints the action LED right after this reset in the row loop
+    // below, exactly as its release always has.
     setLedDefault();
   }
 
@@ -3600,7 +3674,10 @@ void performJoystickCenter(int* args) {
       g_centerRunning = false;
       if (screen.showCenterResetComplete) screen.centerResetFailedPage();
       printResponseInt(true, centerInitFromApi, false, 3, "IN,1", true, 1);
-      if (g_calibrationRunning) abortJoystickCalibration(false, "center reading timer refused");
+      // 4.9.9 review round 3: the enclosing chain's initiator (persisted at
+      // acceptance), not the center sub-step's own false — a host CA,1 must
+      // receive its FAIL,3 even when the failure fires inside the center.
+      if (g_calibrationRunning) abortJoystickCalibration(g_calibrationFromApi, "center reading timer refused");
       if (g_startupCenterReset) {
         g_startupCenterReset = false;
         readyToUse();
@@ -3621,7 +3698,7 @@ void performJoystickCenter(int* args) {
       g_centerRunning = false;
       if (screen.showCenterResetComplete) screen.centerResetFailedPage();
       printResponseInt(true, centerInitFromApi, false, 3, "IN,1", true, 1);
-      if (g_calibrationRunning) abortJoystickCalibration(false, "center completion timer refused");
+      if (g_calibrationRunning) abortJoystickCalibration(g_calibrationFromApi, "center completion timer refused");  // 4.9.9 round 3: the chain's persisted initiator, not the sub-step's false
       if (g_startupCenterReset) {
         g_startupCenterReset = false;
         readyToUse();
@@ -3653,7 +3730,12 @@ void performJoystickCenter(int* args) {
     g_centerRunning = false;
 
     if (!centerUpdated && g_calibrationRunning) {
-      abortJoystickCalibration(false, "center did not collect five valid samples");
+      // 4.9.9 review round 3: the enclosing chain's initiator (persisted at
+      // acceptance), not the center sub-step's own false — this is the most
+      // reachable internal-center abort (any flaky-bus class that costs one
+      // of the five valid samples) and a host CA,1 waiter must resolve
+      // FAIL,3, not time out against an unsolicited MANUAL line.
+      abortJoystickCalibration(g_calibrationFromApi, "center did not collect five valid samples");
       return;
     }
 
@@ -3703,6 +3785,7 @@ void abortJoystickCalibration(bool calibFromApi, const char* reason) {
   calibrationError += reason;
   serialTxEnqueueLine(calibrationError);
   g_calibrationRunning = false;
+  g_calibrationFromApi = false;  // 4.9.9 round 3: cleared AFTER the ack below consumed the caller's copy of it
   g_calibrationCenterStep = false;
 
   // A corner may have been zeroed before the refusal. Reload all persisted
@@ -3712,6 +3795,10 @@ void abortJoystickCalibration(bool calibFromApi, const char* reason) {
   pollTimer.enable(pollTimerId[CONF_TIMER_INPUT]);
   if (!g_safeModeEnabled) {
     screen.enableTimeout();
+    // 4.9.9 review round 4: the debug poll comes back (step 0 paused it for
+    // the flow — see performJoystickCalibrationStep). Safe mode never
+    // reaches this branch's restore, matching its deliberate shutdown.
+    pollTimer.enable(pollTimerId[CONF_TIMER_DEBUG]);
     // Restore the swap with the same debug gate the swap itself uses (the
     // 4.6.6 DM=1 contract): a DM=1 debug stream owns the joystick poll, so
     // the calibration must not silently re-enable it alongside the debug
@@ -3773,6 +3860,15 @@ void performJoystickCalibration(int* args) {
     // (g_calibrationRunning was set at chain acceptance — see setJoystickCalibration)
     pollTimer.disable(pollTimerId[CONF_TIMER_JOYSTICK]);  // Temporarily disable joystick data polling timer
     pollTimer.disable(pollTimerId[CONF_TIMER_SCROLL]);    // 4.5.7 review: scroll mode is a latch that survives release — without this, a scroll-latched device kept running joystickLoop through the scroll tick for the whole calibration (sensor I2C traffic during the shutdown, and live scroll events after the step-5 center re-enabled output). Step 6 already re-enables it (normal boots only).
+    // 4.9.9 review round 4 (the symmetric direction of the DM,1 mid-flow
+    // refusal): a DM=1..5 debug stream accepted BEFORE the flow is a second
+    // live sensor consumer — debugLoop's 100 ms js.update() (DM=1) or
+    // pressure/button samplers run straight through the corner/center
+    // reading windows, the exact double-consumer class the flow-owns-the-
+    // sensor doctrine closes. The flow pauses the debug poll for its
+    // duration; step 6 and abortJoystickCalibration restore it (safe mode's
+    // deliberate shutdown stays untouched — see their guards).
+    pollTimer.disable(pollTimerId[CONF_TIMER_DEBUG]);
     if (!g_safeModeEnabled) {
       // 4.5.7 review: safe mode never shuts the INPUT poll down (it is the
       // only hardware input there — how the safe menu is navigable), so the
@@ -3839,6 +3935,7 @@ void performJoystickCalibration(int* args) {
   else  // STEP 6: Calibration ended
   {
     g_calibrationRunning = false;
+    g_calibrationFromApi = false;  // 4.9.9 round 3: the chain's initiator dies with the chain
     setLedState(LED_ACTION_BLINK, CONF_JOY_CALIB_START_LED_COLOR, CONF_JOY_CALIB_LED_NUMBER, CONF_JOY_CALIB_STEP_BLINK, CONF_JOY_CALIB_STEP_BLINK_DELAY, led.getLedBrightness());  // Turn off Led's
     performLedAction(ledCurrentState);
     js.setMinimumRadius();  // Update the minimum cursor operating radius
@@ -3857,6 +3954,12 @@ void performJoystickCalibration(int* args) {
       // against whatever hardware toggleSafeMode shut down, and re-arm the
       // 5-minute timeout the safe menu deliberately disables.
       screen.enableTimeout();  // The run may have been menu-driven — see step 0
+      // 4.9.9 review round 4: the debug poll comes back (step 0 paused it
+      // for the flow — the symmetric direction of the DM,1 mid-flow
+      // refusal). g_debugMode cannot have changed mid-flow (the DM,1 setter
+      // now refuses while a flow runs), so this restores exactly the state
+      // step 0 paused.
+      pollTimer.enable(pollTimerId[CONF_TIMER_DEBUG]);
       // Restore the swap with the same debug gate the swap itself uses (the
       // 4.6.6 DM=1 contract — see abortJoystickCalibration's matching fix).
       if (outputAction == CONF_ACTION_SCROLL && g_debugMode != CONF_DEBUG_MODE_JOYSTICK) {
@@ -4393,9 +4496,11 @@ void checkI2C() {
         if (passesDone > 0) {
           // A pass-1 NACK that a later pass healed is exactly the state the
           // field episode could only diagnose from the app's BH rows — name
-          // it on the wire (queued: the USB attach is still ahead of us, the
-          // line drains once the port is up). First-pass success stays
-          // SILENT (the healthy-boots-print-nothing contract).
+          // it on the wire (queued pre-attach: the TX queue's boot-diagnostics
+          // window, 4.9.9 review round 3, buffers it for the first host that
+          // opens the port; the 4.6.4 anti-replay gate would otherwise drop
+          // it). First-pass success stays SILENT (the
+          // healthy-boots-print-nothing contract).
           char healNote[80];  // worst case: "INFO: I2C scan: " + the longest name
                               // ("Mouthpiece Pressure Sensor", 26) + " answered on pass 3 of 3" = 67
           const int healNoteLen = snprintf(healNote, sizeof(healNote),
@@ -4403,7 +4508,7 @@ void checkI2C() {
                                            probes[probeIdx].name, passesDone + 1,
                                            (int)CONF_I2C_SCAN_PASSES);
           if (healNoteLen > 0) {
-            serialTxEnqueueLine(healNote, (size_t)healNoteLen);
+            serialTxEnqueueDiagLine(healNote, (size_t)healNoteLen);
           }
         }
       }
@@ -4412,8 +4517,11 @@ void checkI2C() {
   } while (lsi2cScanWantsAnotherPass(passesDone, (uint8_t)(LSI2C_SNS_ALL & ~foundMask)));
 
   // Final verdicts — written once, after the scan budget, in the legacy
-  // string shape (the raw prints land in TinyUSB's pre-attach discard window;
-  // the wire-visible copies are hardwareErrorCheck's queued ERROR lines).
+  // string shape (the raw prints land in TinyUSB's pre-attach discard
+  // window; the wire-visible copies are hardwareErrorCheck's ERROR lines,
+  // which reach the wire through the TX queue's boot-diagnostics buffering
+  // window — 4.9.9 review round 3; the 4.6.4 anti-replay gate used to drop
+  // them whenever the host had not asserted DTR by enqueue time).
   for (uint8_t probeIdx = 0; probeIdx < probeCount; probeIdx++) {
     if (foundMask & probes[probeIdx].snsBit) {
       *probes[probeIdx].connected = true;
@@ -4886,13 +4994,18 @@ void btFeedbackLoop() {
   // stack is down, nothing is connected, or the peer is unbonded); STORED
   // BOND identity (stable across an RPA host's rotation).
   static char s_latchGuardHostMac[LSHOST_MAC_CHARS + 1] = "";
+  // 4.9.9 review round 3: the previous pass's latch state — the guard's arm
+  // rule needs it (a FIRST held pass arms under the current key instead of
+  // comparing against the stored one; see lsHostLatchGuardPass).
+  static bool s_latchGuardWasHeld = false;
   const bool latchHeld = (outputAction == CONF_ACTION_DRAG || outputAction == CONF_ACTION_SCROLL);
   char activeHostMac[LSHOST_MAC_CHARS + 1];
   const bool haveActiveHost = lsHostActiveMac(activeHostMac);
   const char* currentHostKey = haveActiveHost ? activeHostMac : "";
-  if (lsHostLatchGuardPass(currentHostKey, s_latchGuardHostMac, sizeof(s_latchGuardHostMac), latchHeld ? 1 : 0)) {
+  if (lsHostLatchGuardPass(currentHostKey, s_latchGuardHostMac, sizeof(s_latchGuardHostMac), latchHeld ? 1 : 0, s_latchGuardWasHeld ? 1 : 0)) {
     cancelSapOutputHold();  // (b) the connected host changed under a held latch — the latch must not cross
   }
+  s_latchGuardWasHeld = latchHeld;
 
   //if (USB_DEBUG) { Serial.println(tempIsConnected); }
   // 4.9.4 (round 3): the LED transition narration is suppressed for the
@@ -5062,8 +5175,52 @@ void performLedAction(ledStateStruct* args) {
 //
 // Return     : none
 //******************************************//
+// 4.9.9 review round 4 (the split of round 3's in-place guard): the
+// endpoints that mutate live state or print an ack before resetting
+// (OM/CM/MP/SR/RS/FR) call THIS first — on refusal nothing has been mutated
+// and the endpoint answers FAIL,3. The menu paths call softwareReset()
+// directly, whose own gate keeps them protected.
+bool softwareResetGate() {
+  // 4.9.9 review round 3 (the guard enterUpdateMode has always had): serial
+  // dispatch AND the Hub menu are both reachable while the BLE init task is
+  // inside Bluefruit.begin() (the menu input poll lives from setup; the
+  // bench-documented wedged-SVC stall can stretch the window to seconds).
+  // softwareReset()'s teardown would run Bluefruit teardown on the loop
+  // task while the init task drives begin() on its own stack — undefined
+  // behavior with the SD mid-enable, realistically a HardFault (the core's
+  // handler resets instantly), which beats the intended SREQ and loses the
+  // SR/CM/RS/FR ack. Wait the window out bounded, then fail SAFE like UM:
+  // name the refusal, leave the device up, let a retry (or the 30 s DOG on
+  // a truly wedged init) finish the job.
+  {
+    const unsigned long srWaitDeadlineMs = millis() + 2000;
+    while (lipsyncRetentionUnsafe() && (long)(srWaitDeadlineMs - millis()) > 0) {
+      if (g_watchdogArmed) watchdogLoop();  // the wait runs inside a dispatch/menu handler — keep the feed explicit
+      delay(10);
+    }
+  }
+  if (lipsyncRetentionUnsafe()) {
+    // The witness exemption must not survive a refused shutdown: the format
+    // path (FR) pre-sets the flag for its own window, and a refusal here
+    // leaves the device very much alive.
+    g_shutdownInProgress = false;
+    serialTxEnqueueLine("ERROR: restart refused — the BLE init window is still open; retry in a moment");
+    return false;
+  }
+  return true;
+}
+
 void softwareReset() {
   if (USB_DEBUG) { Serial.println("USBDEBUG: softwareReset()"); }
+
+  // 4.9.9 review round 4: the endpoints gate BEFORE their mutations/acks
+  // (softwareResetGate); this second gate is instant for them (the window
+  // cannot reopen — the init task runs once per boot) and is the sole
+  // protection for the direct menu callers.
+  if (!softwareResetGate()) {
+    return;
+  }
+
   g_shutdownInProgress = true;
   bootTrailStamp(5);  // witness v7: a software reset is starting — the next boot's pt=5 names this path
 
