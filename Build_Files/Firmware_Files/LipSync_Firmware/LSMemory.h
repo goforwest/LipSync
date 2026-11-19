@@ -131,14 +131,13 @@ LSMemory::LSMemory() {
 // Return     : void
 //*********************************//
 void LSMemory::begin() {
-  // 4.9.1: a failed mount is named on the wire. The old unchecked begin()
+  // A failed mount is named on the wire. The old unchecked begin()
   // made a dead filesystem completely silent — the device ran on compiled
   // defaults, every read failed, every setter answered bare FAIL,3, and no
-  // line ever named the root cause (the exact dies-silently-at-the-first-FS-
-  // operation class the 4.5.22 rescue build was created for). Serial output
-  // before DTR opens is discarded, so this line is visible to an attached
-  // monitor (USB_DEBUG benches) — but the boot trail and the setters'
-  // FAIL pattern now have a printed cause to point at.
+  // line ever named the root cause. Serial output before DTR opens is
+  // discarded, so this line is visible to an attached monitor (USB_DEBUG
+  // benches) — but the boot trail and the setters' FAIL pattern now have a
+  // printed cause to point at.
   if (!InternalFS.begin()) {
     Serial.println("ERROR: LittleFS mount FAILED — settings persist nothing this boot (reads/writes will fail)");
   }

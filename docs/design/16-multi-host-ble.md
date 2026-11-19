@@ -570,8 +570,7 @@ from docs.
 ## Q12. BENCH OUTCOME (2026-11-07) — the Q4 contingency is superseded
 
 The bench ran the full Q4 ladder plus its contingencies across 15 firmware
-iterations (full record: `Build_Files/bench-16-multi-host-results-2026-11-07.txt`;
-every mechanism bench-proven on the wire, macOS + Windows hosts):
+iterations; every mechanism was bench-proven on the wire (macOS + Windows hosts):
 
 1. **The Q4 whitelist contingency is NOT implementable on S140 6.1.1.**
    `sd_ble_gap_adv_set_configure` refuses whitelist-filtered connectable
