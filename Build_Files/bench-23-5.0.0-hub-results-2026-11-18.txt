@@ -1,0 +1,62 @@
+bench-23 — LipSync 5.0.0 first hub session (live wire tests, 2026-11-18)
+Device: Seeed XIAO nRF52840 Sense, /dev/cu.usbmodem1101, flashed with the
+V5.0.0 tree (commit 42fda64). Driver: lipsync-wire.py conventions (one
+client, SETTINGS handshake per command, fixed-wall-clock drains).
+
+RESULT: 17/17 test groups PASS. No destructive test was run (user opt-out).
+
+Boot / identity
+  [PASS] pre-command drain silent — the healthy-boot contract holds on 5.0.0
+  [PASS] VN,0:5.0.0; ID f783be64; MN 1
+  [PASS] getters in range: OM=1 CM=2 SL=7 AV=7 DM=0 SM=1 LM=3 LL=10 SS=7
+         IZ=0.07 OZ=0.95 (read over the session; every answer once)
+
+Bus health / the 4.9.9-5.0.0 diagnostics
+  [PASS] BH,0:0 — 30-field row parses; field 29 vdd=3328 mV (the rail
+         self-measurement live on a nominal rail); recoveries=0, bus up
+
+5.0.0 wire behaviors (the round-3..5 fix set, live)
+  [PASS] overflow swallow: 40-byte flood -> exactly ONE FAIL,1:<first 32>;
+         the following VN answered clean (no double answer, no swallowed frame)
+  [PASS] settings-mode re-entry attack: 33 bytes + "SETTINGS" tail -> the tail
+         was swallowed (no SUCCESS,0:SETTINGS for it); a following EXIT
+         answered FAIL,0 (unknown outside settings) — the mode stayed off
+  [PASS] same-mode gate skip: CM,1:2 while already CM=2 acked instantly
+         (no 2 s softwareResetGate stall — the gate only arms on a real change)
+  [PASS] center flow: IN,1:1 -> SUCCESS,0:IN,1:1.92|-14.99 (honest completion)
+  [PASS] DM,1 INSIDE the flow -> FAIL,3:DM,1:0 (the new flow gate, live);
+         DM,1 after the flow -> SUCCESS,0:DM,1:0 (idempotent)
+  [PASS] CM round-trip 2 -> 1 -> 2: two deliberate resets straight through
+         softwareResetGate (instant pass with the window closed); both boots
+         healthy; mode persisted across both
+  [PASS] SR,1: ack -> 3 s dwell -> reset -> port drop -> SILENT reboot ->
+         VN,0:5.0.0 (the shared choke point + the 4.9.1 drain, live)
+
+Bluetooth host surface (read-only)
+  [PASS] BT,0:0 -> 2 bonds; BT,0:1 "Hamoudi___s Laptop" connected/active;
+         BT,0:2 "DESKTOP-FBIVLCV" idle — wire-name sanitization verified live
+  [NOT RUN] BT,1 switch / BT,2 forget — destructive to the user's links and
+         bonds (user opted out); the switch-window machinery remains
+         bench-covered by the 4.8.x/4.9.x rounds
+
+Hub menu remote
+  [PASS] CH,1:1 open / CH,1:3 next (row 0->1->2) / CH,0:0 state / CH,1:2
+         select / CH,1:4 close (idempotent on a closed menu) — CH,5 pushes on
+         every state change; out-of-range control (CH,1:0) refused FAIL,3
+  [NOTE] the menu closed itself twice between test processes — the user was
+         at the device (physical input); wire state was consistent at every
+         observation, no strand. Tester note: CLOSE is CH,1:4
+         (CONF_MENU_CONTROL_CLOSE=4); CH,1:0 is out of range (MIN=1).
+
+Settings export
+  [PASS] EX,0:0 -> 39 lines framed SUCCESS,0:EX,0:BEGIN / SIZE / END
+
+Deliberately not run
+  - CA,1 full calibration (would rewrite the user's stored corners if the
+    corners are not sipped on cue; the DM-mid-flow gate was validated via
+    the center flow, same flag pair) — offered, user opted out
+  - FR factory reset, BT,2 forget, BT,1 switch — destructive; user opted out
+  - The getter read-truth failure paths and the softwareResetGate REFUSAL
+    path are not reachable from a live serial client (they need a flash-read
+    failure / a reset inside the ~2 s BLE init window) — host-pinned and
+    code-verified instead
