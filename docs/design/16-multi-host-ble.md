@@ -1,5 +1,16 @@
 # Upstream #16 — Multi-host Bluetooth switching: design document (Phase 1)
 
+> **(5.0.1 audit) PROVENANCE BANNER.** This is a DESIGN-PHASE document kept
+> for its reasoning trail (the softdevice-capability measurements, the
+> adversarial review, and the trial ladder in the final-verdict section all
+> remain the authoritative record of WHY the shipped design is what it is).
+> Its status lines below describe the moment it was written and are left
+> verbatim on purpose; its `file:line` citations are FROZEN at design-phase
+> commit `377e4d1` and have drifted as the files evolved (spot-checked at
+> the 5.0.1 audit: 4 of 6 were stale). Re-derive any citation from the
+> current tree before relying on it; the implementation's own comments are
+> the live record.
+
 - **Issue:** https://github.com/makersmakingchange/LipSync/issues/16 — "independently switch
   between multiple Bluetooth devices (e.g., a laptop, smartphone) … using the Hub interface,
   without having to access the host devices."

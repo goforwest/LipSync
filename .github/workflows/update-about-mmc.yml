@@ -15,11 +15,24 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # (5.0.1 audit) A concurrent push to the default branch made this run's
+    # push fail non-fast-forward (the compress workflow carries a rebase
+    # retry; this one-shot is small enough that serializing is enough).
+    concurrency:
+      group: update-about-mmc
+      cancel-in-progress: false
 
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
 
+      # (5.0.1 audit) The fetch deliberately follows the UPSTREAM MOVING
+      # branch — pinning a foreign repo's main-branch README to a commit SHA
+      # would freeze the section this workflow exists to keep current — so
+      # the supply-chain surface is closed by VALIDATING the payload's shape
+      # instead: the spliced content must be the MMC About section (its
+      # heading and the upstream markers present, no script/iframe/HTML
+      # tags, bounded size), or the run refuses before anything is written.
       - name: Fetch shared About MMC section
         run: |
           curl --silent --show-error --location --fail \
@@ -49,9 +62,22 @@ jobs:
           if not match or not match.group(1).strip():
               raise SystemExit('Downloaded README did not contain a non-empty About MMC section')
 
+          # (5.0.1 audit) Shape validation on the spliced payload — the
+          # section must look like the MMC About section and carry no active
+          # content before it is allowed into this repository's README.
+          section = match.group(1).strip()
+          if len(section) > 20000:
+              raise SystemExit('Downloaded About MMC section is unreasonably large')
+          if 'Makers Making Change' not in section:
+              raise SystemExit('Downloaded About MMC section does not name the program — refusing to splice')
+          if re.search(r'<\s*(script|iframe|object|embed|link|meta)\b', section, re.I):
+              raise SystemExit('Downloaded About MMC section carries active HTML — refusing to splice')
+          if section.count('](') > 200:
+              raise SystemExit('Downloaded About MMC section carries an implausible number of links — refusing to splice')
+
           before, rest = readme.split(start, 1)
           _, after = rest.split(end, 1)
-          replacement = f'{start}\n{match.group(1).strip()}\n{end}'
+          replacement = f'{start}\n{section}\n{end}'
           Path('README.md').write_text(before + replacement + after)
           PY
 

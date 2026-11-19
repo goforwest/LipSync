@@ -241,6 +241,7 @@ bool lsHostSwitchWindowOpen(void);     // 4.9.0: is a switch window open? (the B
 void lsHidWatchdogLoop(void);  // HID-subscription watchdog (btFeedbackLoop, 1 s): cycle a bonded link whose mouse CCCD never enables (bounded 3, grace 5 s); no-op unless BLE is up and no window is open
 extern int g_comMode;          // 0 = None, 1 = USB, 2 = Wireless (defined in LipSync_Firmware.ino; the watchdog reads it)
 bool lsHostForgetByMac(const char* mac12);  // remove one bond file (explicit InternalFS.remove + absence verification — the lib's void bond_remove_key cannot report failure)
+void lsHostForgetRecheckPass(void);  // (5.0.1 audit) forget-resurrection guard (btFeedbackLoop, 1 s): re-remove a bond file the stack's deferred bond save recreated after a forget (bounded, self-naming)
 void lsHostPushState(bool force = false);  // MANUAL,0:BT,4/BT,5 pushes with change-detect + silent boot prime (the CH,5 contract); force skips the prime for the forget paths
 void lsHostRefusalLine(String commandKey, int reason, int row);  // named ERROR line for a refusal
 

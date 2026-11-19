@@ -201,7 +201,8 @@ static void test_pressure_offset_boot_baseline_rejects_held_gestures() {
   CHECK(unbounded.resultOffset() > 5.99f && unbounded.resultOffset() < 6.01f);
 }
 
-static void drain_queue(LSSerialTxQueue<32>& queue, char* output, size_t& length, size_t chunkLimit) {
+template <size_t Capacity>
+static void drain_queue(LSSerialTxQueue<Capacity>& queue, char* output, size_t& length, size_t chunkLimit) {
   while (queue.size() > 0) {
     const size_t chunk = queue.nextChunkSize(chunkLimit);
     const char* source = queue.readPointer();
@@ -251,6 +252,57 @@ static void test_serial_queue_never_truncates_an_inflight_line() {
   drain_queue(queue, wire, wireLength, 32);
   wire[wireLength] = '\0';
   CHECK(std::string(wire) == "1234567890\nnewest-response\n");
+}
+
+// (5.0.1 audit) The pre-attach diagnostic watermark: lines enqueued through
+// enqueueProtectedLine are the 4.9.9-round-4 debt owed to the first host —
+// prioritizeRequest must keep them whole (the old shape cleared them
+// wholesale when the host's first request beat the CDC drain), everything
+// behind them still drops, and the debt shrinks byte-for-byte as it drains.
+static void test_serial_queue_keeps_the_pre_attach_diag_debt() {
+  LSSerialTxQueue<64> queue;
+  CHECK(queue.enqueueProtectedLine("WARNING: safe mode", 18));
+  CHECK(queue.enqueueProtectedLine("ERROR: JOYSTICK missing", 23));
+  // A stale non-diag line enqueued behind the debt still drops.
+  CHECK(queue.enqueueLine("DEBUG,1", 7));
+
+  queue.prioritizeRequest();
+  char wire[128] = {};
+  size_t wireLength = 0;
+  drain_queue(queue, wire, wireLength, 64);
+  wire[wireLength] = '\0';
+  CHECK(std::string(wire) == "WARNING: safe mode\nERROR: JOYSTICK missing\n");
+
+  // The debt is drained: prioritization is stale-clearing again.
+  CHECK(queue.enqueueLine("DEBUG,2", 7));
+  queue.prioritizeRequest();
+  CHECK(queue.size() == 0);
+
+  // Partial drain shrinks the debt byte-for-byte: a request that arrives
+  // mid-drain cannot drop the unread remainder of a protected line.
+  CHECK(queue.enqueueProtectedLine("INFO: one", 9));
+  CHECK(queue.enqueueProtectedLine("INFO: two", 9));
+  CHECK(queue.enqueueLine("DEBUG,3", 7));
+  const size_t midChunk = queue.nextChunkSize(5);  // consume "INFO:" — part of the first protected line
+  CHECK(midChunk == 5);
+  queue.consume(midChunk);
+  queue.prioritizeRequest();
+  wireLength = 0;
+  drain_queue(queue, wire, wireLength, 64);
+  wire[wireLength] = '\0';
+  CHECK(std::string(wire) == " one\nINFO: two\n");
+
+  // The in-progress remainder of a protected line is protected too: the
+  // watermark path keeps the transmission front by construction.
+  CHECK(queue.enqueueProtectedLine("INFO: three", 11));
+  const size_t headChunk = queue.nextChunkSize(4);
+  queue.consume(headChunk);
+  CHECK(queue.lineInProgress());
+  queue.prioritizeRequest();
+  wireLength = 0;
+  drain_queue(queue, wire, wireLength, 64);
+  wire[wireLength] = '\0';
+  CHECK(std::string(wire) == ": three\n");
 }
 
 // Upstream #58: the hard sip/puff band classifier. Numeric states mirror
@@ -994,6 +1046,7 @@ int main() {
   test_pressure_offset_only_accepts_stable_neutral_samples();
   test_pressure_offset_boot_baseline_rejects_held_gestures();
   test_serial_queue_never_truncates_an_inflight_line();
+  test_serial_queue_keeps_the_pre_attach_diag_debt();
   test_hard_band_classification_semantics();
   test_host_name_sanitization();
   test_host_row_sort_is_deterministic();

@@ -524,19 +524,35 @@ JsonObject LSMemory::readObject(String fileString){
   // the next boot.
   _lastReadOk = !deserializationError && !doc.isNull() && doc.is<JsonObject>();
   if (deserializationError) {
-    static bool reportedDeserializeFailure = false;
-    if (!reportedDeserializeFailure) {
-      reportedDeserializeFailure = true;
-      String errorLine = "ERROR: deserializeJson() failed (reported once per boot): ";
+    // (5.0.1 audit) The once-per-boot suppression is per FILE: readObject
+    // serves both settings files (/settings.dat and /settings2.dat), and a
+    // shared flag let the first failure silence the OTHER file's
+    // corruption for the whole boot — the hard-band file could sit dead
+    // (every getter answering the in-force value as SUCCESS, read-truth
+    // doctrine) with nothing naming it on the wire until the next boot
+    // healed it.
+    static bool reportedDeserializeFailure[2] = { false, false };
+    const bool isFile2 = fileString == CONF_SETTINGS2_FILE;
+    if (!reportedDeserializeFailure[isFile2 ? 1 : 0]) {
+      reportedDeserializeFailure[isFile2 ? 1 : 0] = true;
+      String errorLine = "ERROR: deserializeJson() failed (";
+      errorLine += fileString;
+      errorLine += ", reported once per boot): ";
       errorLine += deserializationError.f_str();
       serialTxEnqueueLine(errorLine);
     }
   } else if (doc.isNull() || !doc.is<JsonObject>()) {
-    static bool reportedInvalidType = false;
-    if (!reportedInvalidType) {
-      reportedInvalidType = true;
+    static bool reportedInvalidType[2] = { false, false };
+    const bool isFile2 = fileString == CONF_SETTINGS2_FILE;
+    if (!reportedInvalidType[isFile2 ? 1 : 0]) {
+      reportedInvalidType[isFile2 ? 1 : 0] = true;
+      static const char typeError2[] = "ERROR: /settings2.dat is not a JSON object (reported once per boot)";
       static const char typeError[] = "ERROR: settings file is not a JSON object (reported once per boot)";
-      serialTxEnqueueLine(typeError, sizeof(typeError) - 1);
+      if (isFile2) {
+        serialTxEnqueueLine(typeError2, sizeof(typeError2) - 1);
+      } else {
+        serialTxEnqueueLine(typeError, sizeof(typeError) - 1);
+      }
     }
     _lastReadOk = false;
   }

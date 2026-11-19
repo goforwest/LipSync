@@ -42,6 +42,18 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # (5.0.1 audit) workflow_dispatch is triggerable from any ref — a
+      # dispatch on a TAG ref checks out a detached HEAD, and the push below
+      # then fails loudly ("not currently on a branch"). Fail-closed already,
+      # so this is clarity, not correctness: name the misfire instead of
+      # shipping a red run whose error reads like a push failure.
+      - name: Require a branch ref
+        if: github.ref_type != 'branch'
+        run: |
+          echo "::error title=Run on a non-branch ref::workflow_dispatch fired on ref_type=${{ github.ref_type }} ('${{ github.ref_name }}'). The compress bot commits to a branch — dispatch it from a branch." >&2
+          exit 1
+
+
       - name: Zip Firmware Files
         run: |
           cd Build_Files/Firmware_Files

@@ -2139,6 +2139,7 @@ void usbCheckConnection(void) {
     usbmouse.timedOut = false;  // Stale latch: the interface is ready, the episode is over
     usbmouse.consecutiveSkips = 0;  // 4.5.7 review: the skip counter must reset with the latch, or the first transient not-ready tick after recovery re-latches after ONE skip instead of three
     gamepad.timedOut = false;
+    gamepad.consecutiveSkips = 0;  // (5.0.1 audit) same reset as the mouse: gamepad reports suspended in mouse/debug mode never clear the latch themselves
     g_usbConnectDelay = CONF_USB_HID_INIT_DELAY;
 
     // Connection healthy. The page clear used to be one-shot — this branch
@@ -2477,11 +2478,27 @@ void initRestrictions() {
 //
 // Return     : void
 //****************************************//
+// (5.0.1 audit) A boundary's value as the NEXT-LOWER boundary's ordering
+// ceiling: the stored value when it is 0 (default) or within its own range,
+// otherwise the compiled default — because its own verdict below will heal
+// an out-of-range stored value to 0 (= default), and the lower boundary's
+// comparison must not read the pre-heal raw value. The old inline
+// substitutions read the RAW next-higher stored value, so a hand-edited /
+// corrupt out-of-range WL (say 250 ms, below LONG_MIN) made a perfectly
+// valid customized WS (2000 >= 250) read as inverted: the user's WS was
+// erased AND persisted as 0 even though the effective pair (2000 < the
+// 3000 default the WL heal produces) was correctly ordered.
+static unsigned long effectiveWindowCeiling(unsigned long stored, unsigned long minMs, unsigned long maxMs, unsigned long defaultMs) {
+  if (stored == 0) return defaultMs;
+  if (stored < minMs || stored > maxMs) return defaultMs;
+  return stored;
+}
+
 void sanitizeInputWindows() {
   unsigned long shortEff = (g_inputWindowShortMs > 0) ? g_inputWindowShortMs : CONF_INPUT_WINDOW_SHORT_DEFAULT_MS;
   if (g_inputWindowShortMs > 0
       && (g_inputWindowShortMs < CONF_INPUT_WINDOW_SHORT_MIN_MS || g_inputWindowShortMs > CONF_INPUT_WINDOW_SHORT_MAX_MS
-          || shortEff >= ((g_inputWindowLongMs > 0) ? g_inputWindowLongMs : CONF_INPUT_WINDOW_LONG_DEFAULT_MS))) {
+          || shortEff >= effectiveWindowCeiling(g_inputWindowLongMs, CONF_INPUT_WINDOW_LONG_MIN_MS, CONF_INPUT_WINDOW_LONG_MAX_MS, CONF_INPUT_WINDOW_LONG_DEFAULT_MS))) {
     g_inputWindowShortMs = 0;
     mem.writeInt(CONF_SETTINGS_FILE, "WS", 0);
   }
@@ -2489,7 +2506,7 @@ void sanitizeInputWindows() {
   shortEff = (g_inputWindowShortMs > 0) ? g_inputWindowShortMs : CONF_INPUT_WINDOW_SHORT_DEFAULT_MS;
   if (g_inputWindowLongMs > 0
       && (g_inputWindowLongMs < CONF_INPUT_WINDOW_LONG_MIN_MS || g_inputWindowLongMs > CONF_INPUT_WINDOW_LONG_MAX_MS
-          || longEff <= shortEff || longEff >= ((g_inputWindowMaxMs > 0) ? g_inputWindowMaxMs : CONF_INPUT_WINDOW_MAX_DEFAULT_MS))) {
+          || longEff <= shortEff || longEff >= effectiveWindowCeiling(g_inputWindowMaxMs, CONF_INPUT_WINDOW_MAX_MIN_MS, CONF_INPUT_WINDOW_MAX_MAX_MS, CONF_INPUT_WINDOW_MAX_DEFAULT_MS))) {
     g_inputWindowLongMs = 0;
     mem.writeInt(CONF_SETTINGS_FILE, "WL", 0);
   }
@@ -3093,7 +3110,17 @@ void evaluateOutputAction(inputStateStruct actionState, unsigned long actionMaxE
         && actionState.elapsedTime < effectiveWindowMs(actionProperty[actionIndex].inputActionEndTime)) {
       
       // Get action index
-      if (screen.isMenuActive()) {
+      // (5.0.1 audit) Safe mode NEVER reads the menu column, menu active or
+      // not: the safe menu registers with _isActive = true from boot, so the
+      // bare isMenuActive() check handed the MENU column's STOP_MENU cells
+      // (the S2 3-8 s hold, the S12 sub-1-s combo) to a safe boot — an
+      // ordinary hold-and-release dismissed the safe menu, activateMenu()
+      // refuses in safe mode, the safe columns' open cells are deliberately
+      // NOTHING, the menu timeout is disabled, and the serial open path is
+      // also refused: the device's only button-only Restart/Factory-Reset
+      // surface was unreachable until a power cycle. The safe column carries
+      // the full navigation language (NEXT/SELECT) for exactly this state.
+      if (screen.isMenuActive() && !g_safeModeEnabled) {
         tempActionIndex = actionProperty[actionIndex].menuOutputActionNumber;
       } else {
         switch (g_operatingMode) {
@@ -3178,8 +3205,10 @@ void evaluateOutputAction(inputStateStruct actionState, unsigned long actionMaxE
              && actionState.secondaryState == INPUT_SEC_STATE_STARTED
              && actionState.elapsedTime >= effectiveWindowMs(actionProperty[actionIndex].inputActionStartTime)
              && actionState.elapsedTime < effectiveWindowMs(actionProperty[actionIndex].inputActionEndTime)) {
-      // Get action index
-      if (screen.isMenuActive()) {
+      // Get action index — (5.0.1 audit) same safe-mode precedence rule as
+      // the release site above: the safe menu is never governed by the menu
+      // column, or its STOP_MENU cells dismiss it with no way back.
+      if (screen.isMenuActive() && !g_safeModeEnabled) {
         tempActionIndex = actionProperty[actionIndex].menuOutputActionNumber;
       } else {
         switch (g_operatingMode) {
@@ -4892,6 +4921,11 @@ void btFeedbackLoop() {
     }
     return;
   }
+
+  // (5.0.1 audit) The forget-resurrection guard rides this 1 s cadence —
+  // a bond file the stack's deferred bond save recreated after a forget is
+  // re-removed here (see lsHostForgetByMac's arming site).
+  lsHostForgetRecheckPass();
 
   // Get the current bluetooth connection state
   bool tempIsConnected = btmouse.isConnected();

@@ -1191,8 +1191,15 @@ pointIntType LSJoystick::applyRadialDeadzone(pointIntType inputPoint, float inpu
 
   } else { // (innerDeadzoneValue < inputPointMagnitude < outerDeadzoneValue)
     // Map the input magnitudes between the lower and outer deadzones to between 0 and the maximum value
-    
-    int outputMagnitude = mapRoundInt(inputPointMagnitude, innerDeadzoneValue, outerDeadzoneValue, 0, JOY_INPUT_XY_MAX);
+
+    // (5.0.1 audit) Round the float magnitude BEFORE the map: the old call
+    // relied on the implicit float->int conversion at mapRoundInt's int
+    // parameter, which TRUNCATES — every in-band output magnitude sat up to
+    // 1 unit (of 1024) below the ideal, and a deflection just past the
+    // inner deadzone (inner + 0.4) rounded back to a zero output. Rounding
+    // first keeps the map's endpoints continuous: a rounded value equal to
+    // either boundary maps exactly to the neighboring branch's output.
+    int outputMagnitude = mapRoundInt((int)lroundf(inputPointMagnitude), innerDeadzoneValue, outerDeadzoneValue, 0, JOY_INPUT_XY_MAX);
     outputPoint = pointIntFromMagnitudeAngle(outputMagnitude, inputPointAngle);
 
   }

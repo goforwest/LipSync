@@ -99,6 +99,7 @@ jobs:
             "Adafruit LPS2X@2.0.6" \
             "Adafruit LPS35HW@1.0.6" \
             "Adafruit SSD1306@2.5.17" \
+            "Adafruit TinyUSB Library@3.7.3" \
             "Adafruit Unified Sensor@1.1.15" \
             "ArduinoJson@7.4.3"
 
@@ -108,28 +109,49 @@ jobs:
       # local builds and releases compile the same source. LPS2X/LPS35HW are
       # still installed above at the declared release versions as a provenance
       # pin, but the byte-matched bounded copies in Libraries/ take precedence.
+      #
+      # (5.0.1 audit) TinyUSB MUST be pinned here and must match the
+      # hardware-validated build: the Seeed core 1.1.13 bundles
+      # Adafruit_TinyUSB_Arduino 1.7.0, and on a runner without the user-dir
+      # copy the release silently linked THAT ancient stack — every local /
+      # Maker-Guide build (user-installed TinyUSB, "latest version 3.4.2+"
+      # per the 4.1.0 fix) links the modern one. The two images are not
+      # interchangeable builds of the same firmware (the 5.0.0 tag day
+      # release differed from every validated build by ~8.5 KB of linked
+      # code), and the bench-23 hardware validation ran against the
+      # user-library build. 3.7.3 is the exact version the 5.0.0 bench
+      # session validated; refresh it together with the Maker Guide's
+      # TinyUSB instruction, never leave it to runner state.
 
       - name: Install adafruit-nrfutil (post-compile DFU packaging)
         run: pip3 install 'adafruit-nrfutil==0.5.3.post16'
 
       - name: Run the host test suite (ASan/UBSan)
         run: |
+          set -o pipefail  # the suites' exit codes must survive the tee below
           # (4.5.7 review) The release notes cite "host suite N/N under
           # ASan/UBSan" as release evidence — this step makes it true in CI
           # instead of by convention: the LSTimer regression suite compiles
           # the REAL LSTimer.h against host shims and fails the build on any
           # check failure.
+          # (5.0.1 audit) The suites' CHECK COUNTS are asserted too: exit 0
+          # alone cannot see a future edit that drops a test function from
+          # main() — the release would go green with a silently smaller
+          # suite while CHANGES.txt still cites 385/168. Bump these greps
+          # together with the suites themselves.
           c++ -std=c++17 -g -fsanitize=address,undefined \
             -IBuild_Files/Firmware_Files/LipSync_Firmware \
             -IBuild_Files/Firmware_Files/Libraries/Wire \
             -o lstimer_host_tests \
             Build_Files/Firmware_Files/host_tests/lstimer_host_tests.cpp
-          ./lstimer_host_tests
+          ./lstimer_host_tests | tee /tmp/lstimer.out
+          grep -q '168 checks, 0 failures' /tmp/lstimer.out
           c++ -std=c++17 -g -fsanitize=address,undefined \
             -IBuild_Files/Firmware_Files/LipSync_Firmware \
             -o core_host_tests \
             Build_Files/Firmware_Files/host_tests/core_host_tests.cpp
-          ./core_host_tests
+          ./core_host_tests | tee /tmp/core.out
+          grep -q '399 checks, 0 failures' /tmp/core.out
 
       - name: Read firmware version and verify the tag matches
         run: |

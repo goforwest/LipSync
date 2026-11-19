@@ -291,7 +291,13 @@ bool serialTxEnqueueDiagLine(const char* line, size_t length) {
     serialTxService();
     return true;
   }
-  return serialTxQueue.enqueueLine(line, length);  // buffered pre-attach; drained by the first DTR-open service
+  // (5.0.1 audit) Buffered pre-attach lines extend the TX queue's protected
+  // watermark: the first request's prioritizeRequest() must keep this owed
+  // prefix instead of clearing it (see LSSerialTxQueue.h). The wrapper's own
+  // Serial-closed branch IS the protection window — once the port opens
+  // (Serial true), new diagnostics enqueue like every other narration line
+  // via the enqueueLine path above.
+  return serialTxQueue.enqueueProtectedLine(line, length);  // buffered pre-attach; drained by the first DTR-open service
 }
 
 bool serialTxEnqueueLine(const String &line) {
@@ -1476,7 +1482,19 @@ void getJoystickCalibration(bool responseEnabled, bool apiEnabled) {
       js.setInputMax(i, calibrationPointArray[i]);
     }
   }
-  if (!calibrationInFlight && !sensorless && storedCornersUsable) {
+  if (!calibrationInFlight && !sensorless) {
+    // (5.0.1 audit) The radius pass no longer keys on storedCornersUsable.
+    // The old gate skipped setMinimumRadius() whenever one stored corner
+    // failed the read/plausibility gate — and combined with a boot whose
+    // center step also failed (evaluateInputCenter false leaves the radius
+    // at its zero-initialized 0.0), the radius could stay 0 forever: every
+    // reading clamps onto a radius-0 "circle", mapFloatInt's degenerate
+    // guard answers the midpoint for every axis, and the cursor is silently
+    // DEAD with nothing on the wire naming it. setMinimumRadius() is
+    // self-flooring (JOY_MIN_CALIB_RADIUS) and center-relative, so it is
+    // safe with fallback/degenerate corners — running it here guarantees a
+    // usable (if conservative) radius on every sensorful boot. The FAIL,3
+    // response for unusable stored corners is unchanged below.
     js.setMinimumRadius();  // Update the minimum cursor operating radius
     js.reprocessLastReading();  // A stationary stick must reflect reloaded corners immediately
   }
@@ -1641,7 +1659,17 @@ void setJoystickCalibration(bool responseEnabled, bool apiEnabled, String option
 // happened (read truth) — the getters use it to keep a failed read from
 // rewriting the live deadzones (the read-truth doctrine, getSapDisabled);
 // the setters ignore it as before.
-bool loadJoystickDeadzonePair(float &innerDeadzone, float &outerDeadzone) {
+// (5.0.1 audit) Document-returning twin of loadJoystickDeadzonePair: the
+// setters need the SAME read the validation ran on — the old setters
+// validated against this read's pair but stored through writeFloat's own
+// independent readObject(), and a transient read failure between the two
+// validated the input against the fabricated default pair while the store
+// landed on the REAL one (an inverted IZ/OZ persisted with SUCCESS on the
+// wire; the next load healed both keys to defaults — user values lost, live
+// cursor inverted until then). Reading once and mutating that document
+// closes the interleaving window; the doc handle stays valid until the next
+// mem.readObject() call (LSMemory's shared member document).
+static bool loadJoystickDeadzonePairDoc(JsonObject &settingsDoc, float &innerDeadzone, float &outerDeadzone) {
   JsonObject settings = mem.readObject(CONF_SETTINGS_FILE);
   // 4.9.9 review round 3: type-gate both keys before as<float>() — the same
   // hardening LSMemory::readPoint got ("as<float>() COERCES — a corrupt-but-
@@ -1675,7 +1703,13 @@ bool loadJoystickDeadzonePair(float &innerDeadzone, float &outerDeadzone) {
       mem.writeObject(CONF_SETTINGS_FILE, "IZ/OZ", settings);
     }
   }
+  settingsDoc = settings;
   return mem.isLastReadOk();
+}
+
+bool loadJoystickDeadzonePair(float &innerDeadzone, float &outerDeadzone) {
+  JsonObject settingsDoc;
+  return loadJoystickDeadzonePairDoc(settingsDoc, innerDeadzone, outerDeadzone);
 }
 
 //*** GET JOYSTICK DEADZONE FUNCTION***//
@@ -1739,24 +1773,35 @@ void getJoystickInnerDeadzone(bool responseEnabled, bool apiEnabled, String opti
 //*********************************//
 void setJoystickInnerDeadzone(bool responseEnabled, bool apiEnabled, float inputDeadzone) {
   String deadzoneCommand = "IZ";
+  // (5.0.1 audit) ONE read owns the whole decision — see
+  // loadJoystickDeadzonePairDoc. The old shape validated against read #1 but
+  // stored through writeFloat's independent read #2: a transient read
+  // failure between them validated the input against the fabricated default
+  // pair and persisted it over the real one (SUCCESS on the wire, inverted
+  // live pair, next-load heal discarding the user's values). Read the
+  // document once, validate against its own values, mutate it, write it —
+  // the storeModePair shape.
+  JsonObject settingsDoc;
   float currentInnerDeadzone;
   float currentOuterDeadzone;
-  loadJoystickDeadzonePair(currentInnerDeadzone, currentOuterDeadzone);
+  const bool dzReadOk = loadJoystickDeadzonePairDoc(settingsDoc, currentInnerDeadzone, currentOuterDeadzone);
   (void)currentInnerDeadzone;
-  if ((isfinite(inputDeadzone) &&
+  if (dzReadOk && !settingsDoc.isNull() &&
+      (isfinite(inputDeadzone) &&
        (inputDeadzone > CONF_JOY_DEADZONE_MIN) &&
        (inputDeadzone < CONF_JOY_DEADZONE_MAX) &&
-       (inputDeadzone < currentOuterDeadzone))
-      && mem.writeFloat(CONF_SETTINGS_FILE, deadzoneCommand, inputDeadzone)) {
+       (inputDeadzone < currentOuterDeadzone))) {
+    settingsDoc["IZ"] = inputDeadzone;
     // The store and the live value only land together: a refused store
     // (settings budget, LSMemory) falls to the FAIL,3 branch below.
-    js.setInnerDeadzone(true, inputDeadzone);
-    js.reprocessLastReading();
-    printResponseFloat(responseEnabled, apiEnabled, true, 0, "IZ,1", true, inputDeadzone);
+    if (mem.writeObject(CONF_SETTINGS_FILE, deadzoneCommand, settingsDoc)) {
+      js.setInnerDeadzone(true, inputDeadzone);
+      js.reprocessLastReading();
+      printResponseFloat(responseEnabled, apiEnabled, true, 0, "IZ,1", true, inputDeadzone);
+      return;
+    }
   }
-  else {
-    printResponseFloat(responseEnabled, apiEnabled, false, 3, "IZ,1", true, inputDeadzone);
-  }
+  printResponseFloat(responseEnabled, apiEnabled, false, 3, "IZ,1", true, inputDeadzone);
 }
 //***SET JOYSTICK DEADZONE API FUNCTION***//
 // Function   : setJoystickInnerDeadzone
@@ -1834,23 +1879,28 @@ void getJoystickOuterDeadzone(bool responseEnabled, bool apiEnabled, String opti
 //*********************************//
 void setJoystickOuterDeadzone(bool responseEnabled, bool apiEnabled, float inputUpperDeadZone) {
   String outerDeadzoneCommand = "OZ";
+  // (5.0.1 audit) ONE read owns the whole decision — see
+  // setJoystickInnerDeadzone and loadJoystickDeadzonePairDoc.
+  JsonObject settingsDoc;
   float currentInnerDeadzone;
   float currentOuterDeadzone;
-  loadJoystickDeadzonePair(currentInnerDeadzone, currentOuterDeadzone);
+  const bool dzReadOk = loadJoystickDeadzonePairDoc(settingsDoc, currentInnerDeadzone, currentOuterDeadzone);
   (void)currentOuterDeadzone;
-  if ((isfinite(inputUpperDeadZone) &&
+  if (dzReadOk && !settingsDoc.isNull() &&
+      (isfinite(inputUpperDeadZone) &&
        (inputUpperDeadZone > CONF_JOY_DEADZONE_MIN) &&
        (inputUpperDeadZone < CONF_JOY_DEADZONE_MAX) &&
-       (inputUpperDeadZone > currentInnerDeadzone))
-      && mem.writeFloat(CONF_SETTINGS_FILE, outerDeadzoneCommand, inputUpperDeadZone)) {
+       (inputUpperDeadZone > currentInnerDeadzone))) {
+    settingsDoc["OZ"] = inputUpperDeadZone;
     // See setJoystickInnerDeadzone: a refused store must not report SUCCESS.
-    js.setOuterDeadzone(true, inputUpperDeadZone);
-    js.reprocessLastReading();
-    printResponseFloat(responseEnabled, apiEnabled, true, 0, "OZ,1", true, inputUpperDeadZone);
+    if (mem.writeObject(CONF_SETTINGS_FILE, outerDeadzoneCommand, settingsDoc)) {
+      js.setOuterDeadzone(true, inputUpperDeadZone);
+      js.reprocessLastReading();
+      printResponseFloat(responseEnabled, apiEnabled, true, 0, "OZ,1", true, inputUpperDeadZone);
+      return;
+    }
   }
-  else {
-    printResponseFloat(responseEnabled, apiEnabled, false, 3, "OZ,1", true, inputUpperDeadZone);
-  }
+  printResponseFloat(responseEnabled, apiEnabled, false, 3, "OZ,1", true, inputUpperDeadZone);
 }
 //***SET JOYSTICK OUTER DEADZONE API FUNCTION***//
 // Function   : setJoystickOuterDeadzone
@@ -4717,6 +4767,17 @@ void exportSettings(bool responseEnabled, bool apiEnabled) {
   long settingsSize = mem.size(CONF_SETTINGS_FILE);
   printResponseString(responseEnabled, apiEnabled, true, 0, "EX,0", true,
                       String("SIZE:") + String(settingsSize) + String("/") + String(CONF_SETTINGS_FILE_BUDGET));
+
+  // (5.0.1 audit) The hard-band file gets the same visibility: since 4.7.0
+  // the hard sip/puff band persists under its OWN budget in
+  // /settings2.dat, and a bench debugging hard-band persistence (the
+  // documented 4.1.0-FR orphan trade) could not distinguish "settings2
+  // healthy" from "settings2 absent/refused" — a missing file read as a
+  // healthy SIZE line alone. -1 = absent (possible only until the boot
+  // seed writes it, or while a reseed is refused).
+  long settings2Size = mem.size(CONF_SETTINGS2_FILE);
+  printResponseString(responseEnabled, apiEnabled, true, 0, "EX,0", true,
+                      String("SIZE2:") + String(settings2Size) + String("/") + String(CONF_SETTINGS2_FILE_BUDGET));
 
   getModelNumber(responseEnabled, apiEnabled);
   getVersionNumber(responseEnabled, apiEnabled);

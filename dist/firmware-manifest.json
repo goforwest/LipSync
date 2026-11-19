@@ -1,23 +1,23 @@
 {
-  "firmwareVersion": "5.0.0",
+  "firmwareVersion": "5.0.1",
   "tag": "",
   "fqbn": "Seeeduino:nrf52:xiaonRF52840",
-  "builtAt": "2026-11-18T22:49:17+00:00",
+  "builtAt": "2026-11-19T19:38:34+00:00",
   "files": {
     "dfu": {
-      "fileName": "LipSync_Firmware_5.0.0_dfu.zip",
-      "size": 382767,
-      "sha256": "7a0841938c039329e9be08070c1fbc66e0a356e2af1908bcd52078f9c1dfd8dd"
+      "fileName": "LipSync_Firmware_5.0.1_dfu.zip",
+      "size": 385919,
+      "sha256": "42100a0609689706017ecb5bb36d5e272e1a1efd1ede9d841935836aa6fded81"
     },
     "uf2": {
-      "fileName": "LipSync_Firmware_5.0.0.uf2",
-      "size": 763904,
-      "sha256": "fa37c9d07829d5034e8573144624b3e7173cd768c818671729c4320e4db91810"
+      "fileName": "LipSync_Firmware_5.0.1.uf2",
+      "size": 770560,
+      "sha256": "736e5aa95c4dd9c533a19b9174ccae800d4cc923901f228eb3170c91489454e9"
     },
     "hex": {
-      "fileName": "LipSync_Firmware_5.0.0.hex",
-      "size": 1074234,
-      "sha256": "aaad34e54c312fc33463ed458e582f13127cd069744e145c4ca9bd20086c2b81"
+      "fileName": "LipSync_Firmware_5.0.1.hex",
+      "size": 1083099,
+      "sha256": "399051e58f27284cc88239ff252ee52074930a35270b5c7f8933d2b0630af2d0"
     }
   }
 }

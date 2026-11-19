@@ -37,6 +37,24 @@ BLEDis bledis;
 BLEHidAdafruit blehid;
 volatile bool needsInitialization = true;  // Written by the BLE init task, read by the loop task
 
+// (5.0.1 audit) The HID-watchdog's grace anchor must end at every CONNECT
+// event, not only when the watchdog's 1 s poll happens to observe a
+// link-less gap: a drop→reconnect inside one poll gap (bench 4.8.14 —
+// macOS reclaims the link sub-second) hands the fresh link the SAME
+// handle number, and the poll's handle-change re-key never fires — the
+// fresh link inherited the dead link's already-elapsed anchor and could be
+// cycled mid-CCCD-restore with zero grace. The vendored lib's peripheral
+// connect callback (BLEPeriph _connect_cb, NULL before this) fires at the
+// CONNECT event in the BLE task; it only raises this flag, and the
+// watchdog's next poll pass consumes it and re-keys — the same
+// record-here-act-in-the-loop-task shape the TinyUSB mount/unmount
+// callbacks use (no SoftDevice or kernel calls from the BLE task).
+static volatile bool g_bleLinkConnectEvent = false;
+static void lsblePeriphConnectEvent(uint16_t conn_hdl) {
+  (void) conn_hdl;
+  g_bleLinkConnectEvent = true;
+}
+
 class LSBLEMouse {
 
   public:
@@ -211,6 +229,11 @@ void initializeBluefruit(const char* s) {
   g_bleInitWindow = false;
   if (USB_DEBUG) { Serial.println("BOOT: BLE stack up"); }
   Bluefruit.Periph.setConnInterval(9, 16);  // min = 9*1.25=11.25 ms, max = 16*1.25=20ms
+  // (5.0.1 audit) Register the connect event the HID watchdog's grace
+  // re-key consumes (lsblePeriphConnectEvent above). The lib's own
+  // setConnInterval call inside blehid.begin() later overrides the
+  // interval values — this callback registration is independent of that.
+  Bluefruit.Periph.setConnectCallback(lsblePeriphConnectEvent);
   Bluefruit.setTxPower(4);                  // Check bluefruit.h for supported values
   Bluefruit.setName(s);
   bledis.setManufacturer("MakersMakingChange");
@@ -617,6 +640,14 @@ bool lsHostAnyConnected() {
 // (absent after = removed), so a failed removal refuses the BT,2/Hub forget
 // (FAIL,3 + named line) instead of acking SUCCESS for a host that is still
 // bonded.
+// (5.0.1 audit) The forget-resurrection guard's state (see the arming site
+// in lsHostForgetByMac below and the 1 s pass in lsHostForgetRecheckPass).
+static char g_forgetRecheckFname[48] = "";  // bond file a just-succeeded forget must see STAY absent ("" = disarmed)
+static unsigned long g_forgetRecheckArmedMs = 0;
+static uint8_t g_forgetRecheckRemoves = 0;  // re-applications spent (bounded)
+static const unsigned long LS_FORGET_RECHECK_WINDOW_MS = 4000;  // ada-callback quiescence: several poll passes
+static const uint8_t LS_FORGET_RECHECK_MAX_REMOVES = 2;
+
 bool lsHostForgetByMac(const char* mac12) {
   if (mac12 == NULL || strlen(mac12) != LSHOST_MAC_CHARS) return false;
   ble_gap_addr_t id;
@@ -631,7 +662,51 @@ bool lsHostForgetByMac(const char* mac12) {
            id.addr[0], id.addr[1], id.addr[2], id.addr[3], id.addr[4], id.addr[5]);
   if (!InternalFS.exists(fname)) return true;  // already absent — forget is idempotent
   if (!InternalFS.remove(fname)) return false;
-  return !InternalFS.exists(fname);  // verify — a "removed but still there" is a refusal, not a SUCCESS
+  const bool gone = !InternalFS.exists(fname);  // verify — a "removed but still there" is a refusal, not a SUCCESS
+  if (gone) {
+    // (5.0.1 audit) Arm the deferred-bond-save resurrection guard: the
+    // vendored saver runs LATER, on the ada-callback thread (AUTH_STATUS
+    // success → bond_save_keys → ada_callback → bond_save_keys_dfr, which
+    // removes-then-rewrites the file unconditionally). A forget landing
+    // between that queueing and the write executing is silently undone —
+    // the file reappears AFTER this forget acked SUCCESS. A pairing only
+    // completes while its link is up, so the window is narrow but real
+    // (the documented B6 self-heal: the host unpairs and auto-re-pairs
+    // exactly while the user forgets it). lsHostForgetRecheckPass (1 s
+    // poll) re-removes a resurrected file, bounded, and names itself.
+    snprintf(g_forgetRecheckFname, sizeof(g_forgetRecheckFname), "%s", fname);
+    g_forgetRecheckArmedMs = millis();
+    g_forgetRecheckRemoves = 0;
+  }
+  return gone;
+}
+
+// (5.0.1 audit) The forget-resurrection guard's 1 s pass — called from
+// btFeedbackLoop (the cadence lsHostPushState already runs at). State and
+// rationale at the lsHostForgetByMac arming site above.
+void lsHostForgetRecheckPass(void) {
+  if (g_forgetRecheckFname[0] == '\0') return;
+  if (InternalFS.exists(g_forgetRecheckFname)) {
+    if (g_forgetRecheckRemoves < LS_FORGET_RECHECK_MAX_REMOVES) {
+      g_forgetRecheckRemoves++;
+      const bool removed = InternalFS.remove(g_forgetRecheckFname) && !InternalFS.exists(g_forgetRecheckFname);
+      serialTxEnqueueLine(removed
+        ? "INFO: forget re-applied — the stack's deferred bond save had recreated the bond file"
+        : "ERROR: forget could not re-remove the recreated bond file; the host is still bonded");
+      if (!removed) {
+        g_forgetRecheckFname[0] = '\0';  // stop; the enumeration reports the honest (still-bonded) state
+        return;
+      }
+      g_forgetRecheckArmedMs = millis();  // keep watching — another deferred save may still be queued
+      return;
+    }
+    serialTxEnqueueLine("ERROR: a forgotten host's bond file kept reappearing — a re-pair was in flight; forget it again once the link settles");
+    g_forgetRecheckFname[0] = '\0';
+    return;
+  }
+  if (millis() - g_forgetRecheckArmedMs >= LS_FORGET_RECHECK_WINDOW_MS) {
+    g_forgetRecheckFname[0] = '\0';  // absent through the whole window: the forget held
+  }
 }
 
 // The push half of the BT surface (the CH,5 pattern): whenever the host list
@@ -1562,6 +1637,25 @@ void lsHidWatchdogLoop(void) {
   if (needsInitialization) return;
   if (g_comMode != CONF_COM_MODE_BLE) return;
   if (g_switchWindowOpen) return;  // the window's tick owns the radio
+
+  // (5.0.1 audit) A CONNECT the 1 s poll never observed ends the previous
+  // link's grace HERE: consume the callback's flag and re-key before any
+  // decision. A drop→reconnect inside one poll gap reuses the same handle
+  // number, so the handle-change re-key below cannot fire for it — without
+  // this consumption the fresh link inherited the dead link's elapsed
+  // anchor and could be disconnected with zero grace, mid-CCCD-restore.
+  // Re-keying on every connect is exactly the anchor's contract ("the
+  // grace belongs to the link it started on"): a fresh link always starts
+  // a fresh grace AND a fresh cycle budget.
+  if (g_bleLinkConnectEvent) {
+    g_bleLinkConnectEvent = false;
+    lsHidWatchdogResetGrace();
+    g_hidWdCycles = 0;
+    g_hidWdRefused = 0;
+    g_hidWdRefusedCap = false;
+    g_hidWdCappedLogged = false;
+    return;  // the fresh grace starts on the next pass — one 1 s delay against a 5 s grace
+  }
 
   if (!Bluefruit.connected()) {
     lsHidWatchdogResetGrace();

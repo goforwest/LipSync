@@ -829,7 +829,13 @@ void LSScreen::drawUsbErrorPageOnce() {
     }
     return;
   }
-  _usbErrorPageShown = true;
+  // (5.0.1 audit) The menu owns the glass — do NOT latch the episode as
+  // "shown" here. The old latch made the once-per-episode gate suppress
+  // every later draw, including after the menu closed with the outage still
+  // on: the OLED then sat on the menu's last frame for the rest of the
+  // episode with no USB error shown at all. Leaving the latch unset costs
+  // one cheap gate re-entry per connection check (nothing draws while
+  // !_isActive) and lets the page paint as soon as the menu closes.
 }
 
 bool LSScreen::resetUsbErrorPage() {
@@ -844,9 +850,18 @@ bool LSScreen::resetUsbErrorPage() {
   // ready page can actually land; the caller re-arms while it cannot.
   if (!_usbErrorPageShown) return true;
   if (!_usbErrorPagePainted) {
-    // The latch was set but nothing ever reached the OLED (headless unit, or
-    // every draw was gated) — nothing on screen needs fixing.
+    // The latch was set but nothing ever reached the OLED (headless unit,
+    // every draw was gated, or — (5.0.1 audit) — the menu owned the glass
+    // for the episode's start) — nothing on screen needs CLEARING, but the
+    // episode still ends with the glass on whatever the menu left there.
+    // When the panel is available and idle, paint the ready page so
+    // recovery is visible symmetrically with the painted path below;
+    // otherwise (menu open, headless, bus held, display demoted) return
+    // true unchanged — readyToUse() still runs, and the next episode
+    // repaints.
     _usbErrorPageShown = false;
+    if (_isActive || !g_displayConnected || !Wire.busHealthy() || !_displayHealthy) return true;
+    splashScreen2();
     return true;
   }
   if (_isActive || !g_displayConnected || !Wire.busHealthy() || !_displayHealthy) return false;
@@ -2522,13 +2537,21 @@ void LSScreen::centerResetFailedPage(void) {
 void LSScreen::fullCalibrationPage(void) {
   if (!_begun) return;
   _currentMenu = FULL_CALIB_PAGE;  // Name the run (4.5.7 review): CH,0:0 answers the page actually shown for a mid-run poll; a mid-run Select has no case here (dropped) until the prompts/completion re-register real menus
-  // 4.5.7 review: mirror centerResetPage's sensor guard — without the
-  // joystick sensor the flow's chain never runs (calibrationTimer is only
-  // pumped when the sensor is connected), and this page would sit
-  // indefinitely (no continuation, and the safe-mode menu timeout is
-  // disabled). The serial CA,1:1 path still gets its honest FAIL,3 from
-  // setJoystickCalibration's own guard; the menu path returns to the menu.
+  // (5.0.1 audit) Draw the refusal BEFORE the early return — mirror
+  // centerResetPage's draw-first ordering. The old shape returned before
+  // any draw, so the confirm page the user (or remote) had just selected
+  // stayed frozen on the glass for the whole 2 s dwell with no
+  // acknowledgment, and nothing named the reason. The flow itself is still
+  // refused exactly as before (the chain never runs without the sensor —
+  // calibrationTimer is only pumped when it is connected; the serial
+  // CA,1:1 path gets its honest FAIL,3 from setJoystickCalibration's own
+  // guard; the menu path returns to the menu).
   if (!g_joystickSensorConnected) {
+    setupDisplay();
+    _display.println("Joystick");
+    _display.println("sensor");
+    _display.println("missing");
+    flushDisplay();
     scheduleTransition(2000, screenReturnToMenuTransitionDone);
     return;
   }
@@ -3226,7 +3249,15 @@ void LSScreen::btSwitchConfirmPage() {
   const uint8_t count = lsHostEnumerate(rows, LSHOST_ENUM_CAP);
   char label[24] = "this host";
   if (_btTargetRow >= 1 && _btTargetRow <= (int)count) {
-    lsHostOledLabel(&rows[_btTargetRow - 1], label, sizeof(label));
+    // (5.0.1 audit) Cap the label at 22 (name effectively 16 + " (XX)"): the
+    // target row renders at size 1 where 21 glyphs fit the 128-px panel, and
+    // the (XX) suffix IS the discriminator this page exists to show — a
+    // 22-char label (17-char name) at the old x=12 origin put both digits
+    // and the closing paren off-panel, leaving two same-named hosts
+    // indistinguishable at the final confirm (the exact 4.8.7 case, still
+    // reachable through the origin arithmetic: 12 px + 21 glyphs x 6 px =
+    // 138 > 128).
+    lsHostOledLabel(&rows[_btTargetRow - 1], label, 22);
     // Capture the target's identity (4.8.1): the 2 s dwell that follows is
     // exactly the window where the MAC-sorted table can renumber (a host
     // pairs while advertising, a forget lands over serial). finishBtSwitch
@@ -3265,10 +3296,12 @@ void LSScreen::btSwitchConfirmPage() {
   // at size 2 (~10 chars on the 128-px panel) the "(XX)" discriminator drew
   // past the edge, leaving two same-named hosts indistinguishable at the
   // final confirm. Draw the page directly: the target renders at size 1
-  // (21 chars fit), one size-2 cell in so the cursor column's blank overlay
-  // cannot clip it; rows 0/2/3 keep the displayMenu shape (headers without
-  // the leading cell, selectable rows with it — displayCursor's overlay
-  // expects exactly that).
+  // from the panel's left edge (21 glyphs x 6 px = 126 <= 128), and the
+  // label itself is built with the matching 22-byte cap above so the whole
+  // "name (XX)" including both discriminator digits is always on-panel;
+  // rows 0/2/3 keep the displayMenu shape (headers without the leading
+  // cell, selectable rows with it — displayCursor's overlay expects
+  // exactly that).
   // (4.9.0 review) the second `if (!_begun) return;` here was dead —
   // nothing between the two checks can clear _begun — and is removed with
   // the honest-ack rationale it duplicated.
@@ -3278,7 +3311,7 @@ void LSScreen::btSwitchConfirmPage() {
   _display.setCursor(0, 0);
   _display.println(_btConfirmText[0]);  // "Switch to"
   _display.setTextSize(1);
-  _display.setCursor(CHAR_PIXEL_WIDTH_S2, CHAR_PIXEL_HEIGHT_S2);
+  _display.setCursor(0, CHAR_PIXEL_HEIGHT_S2);
   _display.println(_btConfirmText[1]);  // the target: "name (XX)" — full label fits at size 1
   _display.setTextSize(2);
   _display.setCursor(0, 2 * CHAR_PIXEL_HEIGHT_S2);
@@ -3730,6 +3763,14 @@ void LSScreen::safeModePage(int safeModeReason) {
           // to the safe menu — same error list, same error code, same
           // recovery path, none of the intermediate pages' timer windows.
           _display.println(" Hardware");
+          // (5.0.1 audit) The missing-device names drop to size 1: the page
+          // header already spends both size-2 rows ("SAFE MODE: " +
+          // " Hardware"), so a THIRD missing sensor drew at y=64 — off the
+          // 64-px panel, invisible. The classic all-sensors-dead boot named
+          // only two of its three dead devices here; the full set survived
+          // only as ERROR-015 on the next page and over serial. Three
+          // size-1 rows (8 px each) fit y=32..55.
+          _display.setTextSize(1);
           _hardwareErrorCode = 0;
           if (!g_joystickSensorConnected) {
             _display.println(" JOYSTICK");

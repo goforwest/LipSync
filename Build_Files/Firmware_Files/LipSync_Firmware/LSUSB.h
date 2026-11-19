@@ -176,6 +176,10 @@ class LSUSBGamepad {
     inline bool isConnected(void);
     bool usbRetrying = false;
     bool timedOut = false;
+    // (5.0.1 audit) The gamepad twin of the mouse's busy-persistence state —
+    // see CONF_MOUSE_EP_BUSY_SKIP_MS and LSUSBGamepad::send().
+    uint8_t consecutiveSkips = 0;     // Not-ready ticks in a row — persistence separates a transient busy endpoint from a real outage
+    unsigned long _firstBusyMs = 0;   // When the current busy streak began (the latch is wall time, not attempt count)
     // HID telemetry — the gamepad twin of LSUSBMouse's counters (bench
     // 2026-10-18, gamepad-mode validation): in gamepad mode BH,0:0 used to
     // read the MOUSE's interface unconditionally, so hidReady read 0 and
@@ -478,16 +482,38 @@ void LSUSBGamepad::send(void)
   // retry path instead and skip this report.
   reportAttempts++;  // Counted before the gate: a refused report is the diagnostic signal, not a non-event
   if (!isReady()) {
-    usbRetrying = true;
-    // Refused while the host had already configured the composite — the
-    // configured-but-HID-dead signature (bench 2026-10-16). A simple latch
-    // is enough here: the retry/re-enumeration machinery is driven by
-    // usbRetrying through usbCheckConnection, exactly as before; the latch
-    // only makes the refusal visible in BH. Cleared by any accepted report.
-    if (USBDevice.mounted()) timedOut = true;
+    // (5.0.1 audit) The mouse's 4.9.1 latch, mirrored (LSUSBMouse::mouseReport):
+    // a not-ready endpoint is not always an outage — a report still in flight
+    // (the host a millisecond from polling the interrupt endpoint) reads busy
+    // too, and a serial burst can stretch that window by a tick. The old shape
+    // latched usbRetrying/timedOut on the FIRST busy tick, so one transient
+    // busy tick latched an episode whose next armed usbCheckConnection ran
+    // gamepad.begin() and drew the No-USB page on a healthy device (the exact
+    // false-error flash the 60 ms wall-time gate was built for on the mouse
+    // path, bench 2026-10-16). Persistence is WALL TIME: a busy endpoint frees
+    // within a tick or two, a real outage never does. Skipped busy ticks cost
+    // nothing — the pending report carries the state and service() re-sends
+    // it when the endpoint frees.
+    if (consecutiveSkips == 0) _firstBusyMs = millis();
+    if (consecutiveSkips < 255) consecutiveSkips++;
+    if (millis() - _firstBusyMs < (unsigned long)CONF_MOUSE_EP_BUSY_SKIP_MS) {
+      _reportPending = true;
+      return;
+    }
+    // Episode start: latch the timeout state (consumed by errorCheck and
+    // usbCheckConnection) and hand recovery to the connect machinery ONCE —
+    // the latch keeps the handoff (and any nested send from begin()) from
+    // recursing. In gamepad mode nothing else re-arms the check chain after
+    // a healthy boot, so this handoff is what brings recovery up at all
+    // (the mouse's latch has made the same call since 4.9.1).
+    if (!timedOut) {
+      timedOut = true;
+      usbCheckConnection();
+    }
     _reportPending = true;
     return;
   }
+  consecutiveSkips = 0;
   if (GamepadReport(&_report, sizeof(_report))) {
     reportSuccesses++;
     countReportMovement();
