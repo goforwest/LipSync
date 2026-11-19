@@ -690,8 +690,14 @@ void lsHostForgetRecheckPass(void) {
     if (g_forgetRecheckRemoves < LS_FORGET_RECHECK_MAX_REMOVES) {
       g_forgetRecheckRemoves++;
       const bool removed = InternalFS.remove(g_forgetRecheckFname) && !InternalFS.exists(g_forgetRecheckFname);
+      // (round-2 audit) The cause is a DISJUNCTION the code cannot
+      // distinguish: the stack's deferred bond save from a pairing that
+      // completed at forget time, OR the user (or the documented B6
+      // auto-re-pair host) deliberately re-pairing inside the watch window.
+      // Say both, so a deliberate re-pair's deletion is not mis-read as a
+      // mechanical resurrection.
       serialTxEnqueueLine(removed
-        ? "INFO: forget re-applied — the stack's deferred bond save had recreated the bond file"
+        ? "INFO: forget re-applied — the bond file was recreated (deferred bond save or an in-window re-pair)"
         : "ERROR: forget could not re-remove the recreated bond file; the host is still bonded");
       if (!removed) {
         g_forgetRecheckFname[0] = '\0';  // stop; the enumeration reports the honest (still-bonded) state
@@ -700,7 +706,7 @@ void lsHostForgetRecheckPass(void) {
       g_forgetRecheckArmedMs = millis();  // keep watching — another deferred save may still be queued
       return;
     }
-    serialTxEnqueueLine("ERROR: a forgotten host's bond file kept reappearing — a re-pair was in flight; forget it again once the link settles");
+    serialTxEnqueueLine("ERROR: a forgotten host's bond file kept reappearing (deferred bond save or an in-window re-pair) — forget it again once the link settles");
     g_forgetRecheckFname[0] = '\0';
     return;
   }

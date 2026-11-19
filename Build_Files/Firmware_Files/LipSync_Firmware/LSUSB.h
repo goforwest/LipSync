@@ -267,6 +267,15 @@ void LSUSBMouse::wakeup(void)
 
 bool LSUSBMouse::mouseReport(int8_t b, int8_t x, int8_t y, int8_t wheel, int8_t pan)
 {
+  // (5.0.1 round-2 audit) Never touch an unregistered interface: the HID
+  // instance's endpoint index defaults to 0 until begin() registers it —
+  // the index whichever OTHER interface (the gamepad's) took. A remapped
+  // switch action (B1..B8 are mouse-column-admissible in the SA-GC
+  // allowlist) or a menu-driven release arriving in gamepad/BLE mode used
+  // to stage a mouse report onto that instance — host-side garbage and
+  // cross-contaminated BH telemetry. A report attempt from a never-begun
+  // interface is a non-event, not a refusal signal.
+  if (!_begun) return false;
 	// Never block on HID readiness. The old while(!isReady()) delay(1) spin
   // sat on the joystick-poll path and the connect-retry path, so any window
   // where the HID interface was not ready while the serial session was
@@ -480,6 +489,12 @@ void LSUSBGamepad::send(void)
   // 5-second spin refired on every send while the interface was down,
   // freezing the whole firmware against its serial session. Flag the
   // retry path instead and skip this report.
+  // (5.0.1 round-2 audit) Same unregistered-instance gate as the mouse:
+  // LEFT_CLICK/DRAG remaps are gamepad-column-admissible, and the gamepad's
+  // endpoint index defaults to 0 — the MOUSE's interface — until begin()
+  // registers it. A report attempt from a never-begun interface is a
+  // non-event, not a refusal signal (and cannot latch an episode).
+  if (!_begun) return;
   reportAttempts++;  // Counted before the gate: a refused report is the diagnostic signal, not a non-event
   if (!isReady()) {
     // (5.0.1 audit) The mouse's 4.9.1 latch, mirrored (LSUSBMouse::mouseReport):

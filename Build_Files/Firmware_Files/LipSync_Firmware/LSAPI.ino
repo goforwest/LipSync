@@ -1463,10 +1463,11 @@ void getJoystickCalibration(bool responseEnabled, bool apiEnabled) {
   bool calibrationInFlight = g_calibrationRunning;
   // 4.6.6: a failed/implausible stored-corner read must never flow into
   // setInputMax — readPoint now reports validity, and a slot that fails the
-  // gate falls back to the LIVE stored corner (no I/O) with the flag
-  // clearing the radius/reprocess pass: a settings read failure used to
-  // silently reset every corner to {0,0} live, including inside
-  // abortJoystickCalibration's reload-to-persisted path.
+  // gate falls back to the LIVE stored corner (no I/O): a settings read
+  // failure used to silently reset every corner to {0,0} live, including
+  // inside abortJoystickCalibration's reload-to-persisted path. (5.0.1
+  // audit: the flag no longer clears the radius/reprocess pass — see the
+  // call site below; the radius now recomputes on every sensorful read.)
   bool storedCornersUsable = true;
   for (int i = 1; i < 5; i++)
   {
@@ -4124,6 +4125,19 @@ void controlHubMenu(bool responseEnabled, bool apiEnabled, int inputMenuControl)
         screen.nextMenuItem();
         break;     
       case CONF_MENU_CONTROL_CLOSE:
+        // (5.0.1 round-2 audit) The close door is the safe menu's other
+        // dismiss path — the same class the action-table STOP_MENU cells
+        // were: safe mode owns its display (activateMenu refuses; the safe
+        // columns' open cells are NOTHING; the timeout is disabled; nothing
+        // re-registers safeModeMenu once its continuation has fired), so a
+        // remote CH,1:4 used to deactivate the safe menu with no way back
+        // until a power cycle. Answer the refusal honestly, mirroring the
+        // OPEN gate above; closeMenu itself also refuses (defense in depth).
+        if (g_safeModeEnabled) {
+          printResponseInt(responseEnabled, apiEnabled, false, 3, "CH,1", true, inputMenuControl);
+          serialTxEnqueueLine("ERROR: menu close refused — safe mode owns the display (use the Hub buttons: Restart / Factory Reset)");
+          return;
+        }
         // Freeze-aware close (4.5.5 follow-up): a close arriving while a
         // scheduled transition or boot dwell page owns the display is
         // dropped — executing it early would flip the menu-active flag off

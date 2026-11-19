@@ -65,6 +65,13 @@ class LSSerialTxQueue {
           // line must fit, or this new line is refused without corruption.
           preserveHeadLineOnly();
           if (freeSpace() < needed) return false;
+        } else if (_diagWatermark > 0 && _count > _diagWatermark) {
+          // (round-2 audit) The owed pre-attach prefix sits at the tail:
+          // shed the NEWEST whole lines first, so the debt survives as long
+          // as anything else can give (whole lines only — the wire never
+          // desyncs). Only a queue that is entirely owed bytes falls
+          // through to the oldest-line drop, the graceful last resort.
+          dropNewestWholeLine();
         } else if (!dropOldestWholeLine()) {
           return false;
         }
@@ -76,15 +83,23 @@ class LSSerialTxQueue {
     }
 
     // (5.0.1 audit) Enqueue a line AND extend the protected pre-attach
-    // diagnostic watermark by its bytes. The caller passes a line only
+    // diagnostic watermark by its FULL length. The caller passes a line only
     // while it is still owed to the not-yet-attached first host (the
     // serialTxEnqueueDiagLine wrapper's Serial-closed branch); post-attach
     // diagnostics enqueue through enqueueLine like every other narration —
     // they are not part of the first-host debt.
+    // (round-2 audit) The extension is the line's own byte count, NOT the
+    // queue's net _count delta: enqueueLine's make-space path already
+    // debited the watermark for any dropped protected line
+    // (dropOldestWholeLine/preserveHeadLineOnly), and a net-delta add here
+    // subtracted those bytes a SECOND time — a boot whose protected prefix
+    // exceeded the queue walked the watermark to 0 while protected bytes
+    // remained, and the next prioritizeRequest then cleared them wholesale
+    // (the original bug, resurrected at exactly the overflow the buffer is
+    // sized against).
     bool enqueueProtectedLine(const char* line, size_t length) {
-      const size_t before = _count;
       if (!enqueueLine(line, length)) return false;
-      _diagWatermark += (_count - before);
+      _diagWatermark += (length + 1);  // the line plus its terminating newline
       return true;
     }
 
@@ -173,6 +188,37 @@ class LSSerialTxQueue {
       // (5.0.1 audit) The dropped bytes were the NEWEST ones (behind the
       // first line); the owed tail-prefix survives only up to what was kept.
       if (_diagWatermark > keep) _diagWatermark = keep;
+    }
+
+    // (round-2 audit) Drop the single NEWEST whole line (head side). The
+    // tail never moves, so the protected watermark is untouched — this is
+    // the make-space shed that lets a full queue absorb fresh output
+    // without eating the owed prefix.
+    bool dropNewestWholeLine() {
+      if (_count == 0 || _lineInProgress) return false;
+      size_t index = (_head + Capacity - 1) % Capacity;  // the last byte
+      size_t scanned = 0;
+      size_t newlines = 0;
+      while (scanned < _count) {
+        const char c = _buffer[index];
+        scanned++;
+        if (c == '\n') {
+          newlines++;
+          if (newlines == 2) break;  // index sits on the boundary newline (kept)
+        }
+        index = (index + Capacity - 1) % Capacity;
+      }
+      if (newlines < 2) {
+        // Fewer than two complete lines: dropping the newest line empties
+        // the whole queue.
+        _count = 0;
+        _head = _tail;
+        return true;
+      }
+      // Keep everything up to and including the boundary newline at `index`.
+      _count -= (scanned - 1);
+      _head = (index + 1) % Capacity;
+      return true;
     }
 
     // (5.0.1 audit) Keep exactly the first `bytes` counts from the tail

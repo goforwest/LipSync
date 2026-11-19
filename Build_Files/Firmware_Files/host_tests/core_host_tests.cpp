@@ -303,6 +303,28 @@ static void test_serial_queue_keeps_the_pre_attach_diag_debt() {
   drain_queue(queue, wire, wireLength, 64);
   wire[wireLength] = '\0';
   CHECK(std::string(wire) == ": three\n");
+
+  // (round-2 audit) Overflow with a protected prefix: a small capacity
+  // queue forces make-space drops while protected lines are still queued —
+  // the watermark must survive (shed the newest lines first), and the
+  // double-debit bug the net-delta extension used to carry would walk it
+  // to zero here and let the next request clear the debt wholesale.
+  // Arithmetic: four protected lines = 4+4+4+7 = 19 bytes; "response-1\n"
+  // fills 30 of 32; "r2\n" forces make-space → the newest whole line
+  // ("response-1\n", 11 B) is shed, the 19 protected bytes untouched;
+  // prioritizeRequest then drops the still-stale "r2\n".
+  LSSerialTxQueue<32> small;
+  CHECK(small.enqueueProtectedLine("aaa", 3));
+  CHECK(small.enqueueProtectedLine("bbb", 3));
+  CHECK(small.enqueueProtectedLine("ccc", 3));
+  CHECK(small.enqueueProtectedLine("dddddd", 6));
+  CHECK(small.enqueueLine("response-1", 10));
+  CHECK(small.enqueueLine("r2", 2));
+  small.prioritizeRequest();
+  wireLength = 0;
+  drain_queue(small, wire, wireLength, 64);
+  wire[wireLength] = '\0';
+  CHECK(std::string(wire) == "aaa\nbbb\nccc\ndddddd\n");
 }
 
 // Upstream #58: the hard sip/puff band classifier. Numeric states mirror
@@ -453,6 +475,20 @@ static void test_host_oled_label_and_overflow() {
   std::snprintf(row.name, sizeof(row.name), "iPhone");  // short name: full + suffix
   lsHostOledLabel(&row, label, sizeof(label));
   CHECK(std::string(label) == "iPhone (3F)");
+
+  // (round-2 audit) Tight cap (the BT switch confirm page's 22): a
+  // full-length name must still carry the (XX) discriminator — the old
+  // free-for-name loop filled to 17 and the suffix's fit check then failed,
+  // dropping the ONLY thing that distinguishes two same-named hosts. The
+  // name yields room: 16 chars + " (XX)" = 21 glyphs. (lastMacByte is 0x3F
+  // here — set by the check above.)
+  std::snprintf(row.name, sizeof(row.name), "Hamoudi's MacBook Pro");
+  lsHostOledLabel(&row, label, 22);
+  CHECK(std::string(label) == "Hamoudi's MacBoo (3F)");
+
+  std::snprintf(row.name, sizeof(row.name), "iPhone 13 Pro Max");  // 17 chars
+  lsHostOledLabel(&row, label, 22);
+  CHECK(std::string(label) == "iPhone 13 Pro Ma (3F)");
 
   CHECK(lsHostHiddenCount(4) == 0);
   CHECK(lsHostHiddenCount(5) == 1);

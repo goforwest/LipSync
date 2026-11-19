@@ -643,6 +643,12 @@ void LSScreen::deactivateMenu() {
 // Return     : void
 //*********************************//
 void LSScreen::closeMenu() {
+  // (5.0.1 round-2 audit) Safe mode owns its display — the mirror of
+  // activateMenu's gate. The safe menu is the only menu a safe boot ever
+  // registers (its continuation fires once at boot), so a close here has
+  // no way back until a power cycle; every safe-boot dismiss door
+  // (the action tables' menu column, the CH,1:4 remote) is refused.
+  if (g_safeModeEnabled) return;
   if (inputIsFrozen()) return;  // A scheduled page transition / boot dwell page owns the display right now (wrap/stale-safe — see inputIsFrozen)
   deactivateMenu();
 }

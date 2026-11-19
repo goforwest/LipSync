@@ -156,7 +156,16 @@ static inline int lsHostCapEvictIndex(const lsHostRow* rows, int cap,
 static inline void lsHostOledLabel(const lsHostRow* row, char* out, int cap) {
   int o = 0;
   if (cap <= 0 || row == (const lsHostRow*)0) return;
-  for (; row->name[o] != '\0' && o < LSHOST_OLED_NAME_MAX && o < cap - 1; o++) {
+  // (5.0.1 round-2 audit) The name portion yields room for the " (XX)"
+  // suffix (cap - 6): the old free-for-name loop meant a caller with a
+  // tight cap and a full-length name (LSHOST_OLED_NAME_MAX = 17) failed the
+  // suffix's fit check and got a BARE name — the (XX) discriminator, the
+  // only thing that distinguishes two same-named hosts, silently dropped
+  // for exactly the longest (most common real-phone) name class. cap - 6
+  // changes nothing for the wide callers (cap 24: min(17, 24-6) is still
+  // the 17-name cap, suffix 17+5=22 <= 23 fits as before) and gives tight
+  // callers a guaranteed whole label: name <= cap-6, suffix always fits.
+  for (; row->name[o] != '\0' && o < LSHOST_OLED_NAME_MAX && o < cap - 6; o++) {
     out[o] = row->name[o];
   }
   static const char hex[] = "0123456789ABCDEF";
