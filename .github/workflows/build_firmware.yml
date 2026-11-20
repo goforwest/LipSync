@@ -151,7 +151,7 @@ jobs:
             -o core_host_tests \
             Build_Files/Firmware_Files/host_tests/core_host_tests.cpp
           ./core_host_tests | tee /tmp/core.out
-          grep -q '455 checks, 0 failures' /tmp/core.out
+          grep -q '460 checks, 0 failures' /tmp/core.out
 
       - name: Read firmware version and verify the tag matches
         run: |

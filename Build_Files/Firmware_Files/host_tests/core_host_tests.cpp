@@ -369,6 +369,24 @@ static void test_serial_queue_shed_events_count_drops() {
   CHECK(queue.enqueueLine("x", 1));
   queue.clear();
   CHECK(queue.shedEvents() == before + 1);
+
+  // (convergence fix) A NO-OP preserveHeadLineOnly — a single in-progress
+  // line with nothing queued behind it — drops nothing and must NOT bump
+  // (the old unconditional bump re-opened commit-on-delivery every pass).
+  LSSerialTxQueue<64> noop;
+  CHECK(noop.enqueueLine("MANUAL,0:BT,4:2", 15));
+  const size_t headChunk = noop.nextChunkSize(6);  // mid-line: "MANUA"
+  noop.consume(headChunk);
+  CHECK(noop.lineInProgress());
+  const uint32_t shedAtNoop = noop.shedEvents();
+  noop.prioritizeRequest();  // watermark 0 + in-progress -> preserveHeadLineOnly
+  CHECK(noop.lineInProgress());
+  CHECK(noop.shedEvents() == shedAtNoop);  // nothing was dropped
+  char wire2[64] = {};
+  size_t wire2Length = 0;
+  drain_queue(noop, wire2, wire2Length, 64);
+  wire2[wire2Length] = '\0';
+  CHECK(std::string(wire2) == ",0:BT,4:2\n");  // the remainder survived whole (consume(6) removed exactly "MANUAL")
 }
 
 // (5.0.0 audit round 4) CDC session teardown: a host closing the port drops
