@@ -182,11 +182,38 @@ jobs:
       - name: Compile firmware
         run: |
           mkdir -p build
+          # (release polish) HERMETIC BUILD: the one __FILE__-derived path that
+          # survives linkage is the core-bundled Adafruit_LittleFS' absolute
+          # path under the Arduino data directory (~/Library/Arduino15 on
+          # macOS, ~/.arduino15 on Linux) — it used to differ per builder
+          # (~16 bytes of layout shift and a wholly different image hash).
+          # Mapping the data directory to a fixed token in every compile step
+          # makes the flash image a function of the source alone: a local
+          # build and the CI build of the same tree hash identically. The
+          # sketch and repo sources compile from RELATIVE paths already (the
+          # only absolute prefix is the data dir), so mapping the data dir is
+          # sufficient — the workspace map below is belt-and-braces for any
+          # future repo-file __FILE__. -ffile-prefix-map needs GCC >= 8; the
+          # pinned core 1.1.13 toolchain qualifies.
+          # arduino-cli's per-OS default data directory (macOS keeps it under
+          # ~/Library/Arduino15, Linux under ~/.arduino15) — computed, not
+          # hardcoded, so the same recipe runs on any runner OS.
+          case "$(uname -s)" in
+            Darwin) ARDUINO_DATA_DIR="${ARDUINO_DATA_DIR:-$HOME/Library/Arduino15}" ;;
+            *)      ARDUINO_DATA_DIR="${ARDUINO_DATA_DIR:-$HOME/.arduino15}" ;;
+          esac
+          MAP_FLAGS="-ffile-prefix-map=$ARDUINO_DATA_DIR=arduino-data"
+          if [ -n "${GITHUB_WORKSPACE:-}" ]; then
+            MAP_FLAGS="$MAP_FLAGS -ffile-prefix-map=$GITHUB_WORKSPACE=."
+          fi
           arduino-cli compile \
             --fqbn "$FQBN" \
             --warnings all \
             --build-path build \
             --libraries Build_Files/Firmware_Files/Libraries \
+            --build-property "compiler.c.extra_flags=$MAP_FLAGS" \
+            --build-property "compiler.cpp.extra_flags=$MAP_FLAGS" \
+            --build-property "compiler.S.extra_flags=$MAP_FLAGS" \
             Build_Files/Firmware_Files/LipSync_Firmware
 
       - name: Generate UF2
