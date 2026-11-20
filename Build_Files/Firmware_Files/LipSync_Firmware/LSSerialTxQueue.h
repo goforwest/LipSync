@@ -232,7 +232,12 @@ class LSSerialTxQueue {
       // Every enqueue appends a newline. If invariants are ever violated,
       // preserve everything rather than manufacturing a truncated frame.
       if (keep == _count && _buffer[(index + Capacity - 1) % Capacity] != '\n') return;
-      _shedEvents++;  // (5.0.0 audit round 4) bytes behind the head line are dropped
+      // (5.0.0 audit round 4, convergence fix) Bump only on an ACTUAL drop:
+      // with nothing queued behind the in-progress head line, keep == _count
+      // and this is a no-op — a spurious bump would re-open
+      // commit-on-delivery on the next pass (a duplicate idempotent push)
+      // and over-count the diagnostic. Same conditional as keepTailBytes.
+      if (keep < _count) _shedEvents++;
       _count = keep;
       _head = index;
       // (5.0.1 audit) The dropped bytes were the NEWEST ones (behind the
