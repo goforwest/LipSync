@@ -199,13 +199,19 @@ jobs:
           # macOS, ~/.arduino15 on Linux) — it used to differ per builder
           # (~16 bytes of layout shift and a wholly different image hash).
           # Mapping the data directory to a fixed token in every compile step
-          # makes the flash image a function of the source alone: a local
-          # build and the CI build of the same tree hash identically. The
-          # sketch and repo sources compile from RELATIVE paths already (the
-          # only absolute prefix is the data dir), so mapping the data dir is
-          # sufficient — the workspace map below is belt-and-braces for any
-          # future repo-file __FILE__. -ffile-prefix-map needs GCC >= 8; the
-          # pinned core 1.1.13 toolchain qualifies.
+          # makes the flash image a function of the source and the TOOLCHAIN
+          # HOST: same-OS builds of the same tree hash byte-identically (the
+          # original release-polish goal), and a local build vs CI build of
+          # the same tree differ only where the per-OS arm-none-eabi-gcc
+          # host binaries emit marginally different codegen (round-4
+          # verification: 13 bytes in two Adafruit_GFX blocks out of 387072
+          # — macOS vs Linux, same gcc 9.2.1 version, same sizes, same
+          # section map). The sketch and repo sources compile from RELATIVE
+          # paths already (the only absolute prefix is the data dir), so
+          # mapping the data dir is sufficient — the workspace map below is
+          # belt-and-braces for any future repo-file __FILE__.
+          # -ffile-prefix-map needs GCC >= 8; the pinned core 1.1.13
+          # toolchain qualifies.
           # arduino-cli's per-OS default data directory (macOS keeps it under
           # ~/Library/Arduino15, Linux under ~/.arduino15) — computed, not
           # hardcoded, so the same recipe runs on any runner OS.
