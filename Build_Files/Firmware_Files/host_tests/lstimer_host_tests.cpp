@@ -546,6 +546,49 @@ static void test_callback_may_delete_another_timer_mid_run() {
   s_delPool = nullptr;
 }
 
+// (5.0.0 audit round 4) restartTimer from ANOTHER slot's callback during the
+// invoke pass must cancel the target's pending deferred-fire mark: run()'s
+// first loop marks due slots RUNONLY/RUNANDDEL and the second loop fires
+// them, so a restart landing between the two used to leave the mark set —
+// the slot still fired (and a one-shot still self-deleted) on an anchor the
+// caller had just declared obsolete. The restarter sits in the LOWER slot so
+// its callback runs before the victim's mark is consumed.
+static int s_rsPoolSet = 0;
+static LSTimer<void>* s_rsPool = nullptr;
+static int s_rsVictimId = -1;
+static int s_restarterFires = 0;
+static int s_rsVictimFires = 0;
+static void restartCb() {
+  s_restarterFires++;
+  if (s_rsPoolSet && s_rsPool && s_rsVictimId >= 0) s_rsPool->restartTimer(s_rsVictimId);
+}
+static void rsVictimCb() { s_rsVictimFires++; }
+
+static void test_restartTimer_cancels_a_pending_deferred_fire() {
+  resetCounters();
+  s_restarterFires = 0;
+  s_rsVictimFires = 0;
+  LSTimer<void> pool;
+  s_rsPool = &pool;
+  s_rsPoolSet = 1;
+  int restarterId = pool.setTimeout(100, restartCb);   // slot 0: due FIRST
+  s_rsVictimId = pool.setTimeout(100, rsVictimCb);     // slot 1: one-shot due the same pass
+  CHECK(restarterId >= 0 && s_rsVictimId >= 0);
+  CHECK(restarterId < s_rsVictimId);                   // invoke order: the restarter's callback runs first
+  pump(pool, 100);
+  CHECK_EQ(s_restarterFires, 1);
+  CHECK_EQ(s_rsVictimFires, 0);                        // the restart cancelled the pending fire (the fix)
+  CHECK_EQ(pool.getNumTimers(), 1);                    // and the one-shot victim did NOT self-delete
+  pump(pool, 300);
+  CHECK_EQ(s_rsVictimFires, 1);                        // it still fires, one full interval after the restart
+  CHECK_EQ(pool.getNumTimers(), 0);                    // and then self-deletes as a one-shot
+  pump(pool, 2000);
+  CHECK_EQ(s_rsVictimFires, 1);                        // no zombie fire later
+  s_rsPool = nullptr;
+  s_rsPoolSet = 0;
+  s_rsVictimId = -1;
+}
+
 //   - a NESTED run() on the same pool cannot double-fire a due RUNONLY
 //     timer in the same millisecond (the 4.5.7 pass-2 clears the mark
 //     before invoking).
@@ -716,6 +759,7 @@ int main() {
   test_maxNumRuns_above_saturation_ceiling_clamps();
   test_anchorAllToNow_clears_catchup_debt();
   test_pool_constructed_at_millis_zero();
+  test_restartTimer_cancels_a_pending_deferred_fire();
 
   std::printf("%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;

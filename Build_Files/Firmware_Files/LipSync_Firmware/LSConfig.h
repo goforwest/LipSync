@@ -188,7 +188,17 @@ const String CONF_LIPSYNC_VERSION_STRING = String(CONF_LIPSYNC_VERSION_MAJOR) + 
 
 // Flash Memory settings - Don't change
 #define CONF_SETTINGS_FILE    "/settings.txt"
-#define CONF_SETTINGS_JSON    "{\"MN\":0,\"VN1\":4,\"VN2\":1,\"VN3\":0,\"ID\":0,\"OM\":1,\"CM\":1,\"SS\":5,\"SL\":5,\"ST\":3.0,\"PT\":3.0,\"AV\":0,\"IZ\":0.07,\"OZ\":0.95,\"CA0\":[0.0,0.0],\"CA1\":[-13.0,13.0],\"CA2\":[13.0,13.0],\"CA3\":[13.0,-13.0],\"CA4\":[-13.0,-13.0],\"SM\":1,\"LM\":1,\"LL\":5,\"DM\":0,\"SD\":0,\"MA\":0,\"LK\":0,\"CF\":0,\"WS\":0,\"WL\":0,\"WM\":0,\"SA\":0,\"SB\":0,\"SC\":0,\"GA\":0,\"GB\":0,\"GC\":0}"
+// (5.0.0 audit round 4) The seed's VN fields are composed from THIS build's
+// version macros (stringized — no runtime cost): the seed used to be born
+// claiming 4.1.0 on a 5.0.0 firmware, and every freshly seeded file
+// (first boot, post-factory-reset, post-corruption reseed) claimed the
+// wrong version until getVersionNumber's heal rewrote it on the next boot.
+// A stored format version that is never true would also mislead any future
+// migration keyed on VN. The heal itself stays (upgraded 4.1.0 files and
+// files from builds with different versions still converge).
+#define CONF_LIPSYNC_STR2(x) #x
+#define CONF_LIPSYNC_STR(x) CONF_LIPSYNC_STR2(x)
+#define CONF_SETTINGS_JSON    "{\"MN\":0,\"VN1\":" CONF_LIPSYNC_STR(CONF_LIPSYNC_VERSION_MAJOR) ",\"VN2\":" CONF_LIPSYNC_STR(CONF_LIPSYNC_VERSION_MINOR) ",\"VN3\":" CONF_LIPSYNC_STR(CONF_LIPSYNC_VERSION_REV) ",\"ID\":0,\"OM\":1,\"CM\":1,\"SS\":5,\"SL\":5,\"ST\":3.0,\"PT\":3.0,\"AV\":0,\"IZ\":0.07,\"OZ\":0.95,\"CA0\":[0.0,0.0],\"CA1\":[-13.0,13.0],\"CA2\":[13.0,13.0],\"CA3\":[13.0,-13.0],\"CA4\":[-13.0,-13.0],\"SM\":1,\"LM\":1,\"LL\":5,\"DM\":0,\"SD\":0,\"MA\":0,\"LK\":0,\"CF\":0,\"WS\":0,\"WL\":0,\"WM\":0,\"SA\":0,\"SB\":0,\"SC\":0,\"GA\":0,\"GB\":0,\"GC\":0}"
 
 // Serialized-settings size budget (bench follow-up 2026-10-18): firmware
 // 4.1.0 — the oldest firmware the app can downgrade a device to — reads
@@ -687,8 +697,13 @@ const inputActionStruct sapActionProperty[]{
   // fires its action on release with NO hold-duration requirement — instant
   // access to the long-window actions for users who cannot sustain a 1-3 s
   // hold. Compiled defaults mirror the long-window cells exactly (hard puff
-  // -> drag/B3, hard sip -> scroll/B4); HA/HB (settings2) remap the
-  // mouse/gamepad columns caregiver-side through the same allowlist as SA-GC.
+  // -> drag/B3, hard sip -> scroll/B4); HA/HB (settings2) remap the MOUSE
+  // column caregiver-side through the mouse allowlist (5.0.0 audit round 4
+  // correction — the comment used to promise "the mouse/gamepad columns",
+  // but the apply path writes only mouseOutputActionNumber and the single
+  // HA/HB key cannot express the gamepad column's divergent allowlist (the
+  // 4.5.7 DRAG/SCROLL wedge); in gamepad mode the compiled gamepad cells
+  // stay in force by design).
   // Window 0..60000: the end boundary deliberately does NOT reuse 8000 —
   // effectiveWindowMs maps 8000 onto the user's stored max window, and a hard
   // hold outlasting it (the core audience cannot necessarily release quickly)

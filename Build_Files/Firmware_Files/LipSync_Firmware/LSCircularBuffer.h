@@ -130,16 +130,20 @@ void LSCircularBuffer<T>::clear()
 }
 
 //*********************************//
-// Function   : getElement 
-// 
+// Function   : getElement
+//
 // Description: Get an element at some depth into the circular buffer
 //              zero is the MOST RECENTLY pushed element (4.9.1 doc fix —
 //              pushElement increments the pointer before writing, so the
 //              push location of the NEXT element is one past index 0).
-//              Max: cBufferSize - 1
+//              Max: cBufferElementsUsed - 1 (5.0.0 audit round 4 doc fix —
+//              the effective depth is the FILLED count, not the capacity;
+//              an out-of-range depth silently clamps to the OLDEST retained
+//              sample rather than erroring, so a caller asking past the
+//              fill level reads stale data as if it were the requested one).
 //
 // Arguments :  uint16_t elementNum: number of element in
-// 
+//
 // Return     : element type T
 //*********************************//
 template<typename T>

@@ -56,7 +56,12 @@ class LSMemory {
     LSMemory();
     void begin();
     void initialize(String fileString, String jsonString);
-    void clear(String fileString);
+    // (5.0.0 audit round 4) LSMemory::clear(String) removed: a public,
+    // unguarded, caller-less primitive that removed any named file with no
+    // seed-gate consultation — one future caller would have bypassed the
+    // entire reseed discipline (an absent file reads as failed reads, not
+    // as "seed me", outside initialize()). Deliberate destruction goes
+    // through initialize() (which seeds) or resetMemory() (which formats).
     void format();
     long size(String fileString);
     bool writeAll(String fileString, String jsonString);
@@ -199,6 +204,38 @@ void LSMemory::initialize(String fileString, String jsonString) {
     }
   }
   if (fileHealthy) {
+    // (5.0.0 audit round 4) In-grammar corruption audit. A PARSEABLE file is
+    // "healthy" as far as the reseed gate reaches — parse-only integrity.
+    // A resting-state flash bit flip that stays inside JSON grammar (a key
+    // name "SD" -> "Sd") parses cleanly, is then read as a MISSING key (0 =
+    // default) from then on, and for the restriction family (SD/MA/LK/CF)
+    // that silently LIFTS a caregiver lock with SUCCESS on the wire and no
+    // trace. The compiled seed is the key inventory: any file key outside
+    // it is named here — once per boot per file (initialize runs once per
+    // file), through the protected pre-attach diagnostic path so the first
+    // host actually reads it. Reseeding on the finding was rejected
+    // deliberately: older-firmware files legitimately lack newer keys (the
+    // upgrade path), and a downgrade round-trip must keep unknown keys —
+    // so the honest treatment is naming, not destroying. Residual bound:
+    // value flips that stay inside a key's grammar and renamed keys that
+    // alias another KNOWN key remain undetectable without a checksum (a
+    // settings-format change, deliberately not attempted in this cycle).
+    JsonDocument seedDoc;
+    const DeserializationError seedErr = deserializeJson(seedDoc, jsonString);
+    if (!seedErr && seedDoc.is<JsonObject>() && doc.is<JsonObject>()) {
+      for (JsonPair kv : doc.as<JsonObject>()) {
+        if (seedDoc[kv.key()].isNull()) {
+          char unknownKeyLine[160];
+          const int unknownKeyLen = snprintf(unknownKeyLine, sizeof(unknownKeyLine),
+                                             "WARNING: settings file %s holds unknown key '%s' — the file may be damaged; that key reads as its default",
+                                             fileName, kv.key().c_str());
+          if (unknownKeyLen > 0 && unknownKeyLen < (int)sizeof(unknownKeyLine)) {
+            serialTxEnqueueDiagLine(unknownKeyLine, (size_t)unknownKeyLen);
+          }
+          break;  // one named finding per file per boot is enough to trace the damage
+        }
+      }
+    }
     return;  // Nothing to do — the stored settings parse
   }
   // 4.6.6: a file whose ONLY failure is the size budget (parseable, 481-511
@@ -313,18 +350,8 @@ void LSMemory::initialize(String fileString, String jsonString) {
 //*********************************//
 // Function   : clear 
 // 
-// Description: Deletes the memory file
-// 
-// Arguments :  fileString : String : the name of the file
-// 
-// Return     : void
-//*********************************//
-void LSMemory::clear(String fileString) {
-  const char* fileName = fileString.c_str();
-  file.close();
-  InternalFS.remove(fileName);
-  delay(1);  
-}
+// (5.0.0 audit round 4) LSMemory::clear(String) removed — see the class
+// declaration note.
 
 //***FORMAT ALL FILES FUNCTION***//
 //*********************************//

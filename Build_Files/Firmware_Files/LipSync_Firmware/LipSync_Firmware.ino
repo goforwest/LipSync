@@ -24,6 +24,7 @@
 #include "LSApiDeclarations.h"  // Explicit cross-tab declarations (roadmap item 5) — early so every tab sees them
 #include "LSConfig.h"
 #include "LSI2CScan.h"  // 4.9.8: the boot I2C scan's pure layer (self-contained — carries its own CONF_I2C_SCAN_* constants)
+#include "LSCornerPlausibility.h"  // 5.0.0 audit round 4: the calibration corner gate's pure layer (self-contained — carries its own min constant, static_assert-pinned below)
 #define LSTIMER_USE_SERIAL_TX_QUEUE 1  // Normal-context timer diagnostics share the line-safe CDC queue
 #include "LSTimer.h"
 #include <ArduinoJson.h>
@@ -53,6 +54,13 @@ static_assert(LSPRESSURE_CLASSIFY_NONE == PRESS_SAP_MAIN_STATE_NONE &&
               LSPRESSURE_CLASSIFY_HARD_SIP == PRESS_SAP_MAIN_STATE_HARD_SIP &&
               LSPRESSURE_CLASSIFY_HARD_PUFF == PRESS_SAP_MAIN_STATE_HARD_PUFF,
               "LSPressureClassify state numbers must mirror PRESS_SAP_MAIN_STATE_*");
+
+// (5.0.0 audit round 4) The corner gate's host-side min must be the config's
+// min — a config change that outgrew the pure copy would silently retune
+// which corners count as plausible (the same drift class the release
+// fraction's pin guards).
+static_assert(LSCORNER_PLAUSIBILITY_MIN_M_T == (float)CONF_JOY_CALIB_CORNER_MIN,
+              "LSCornerPlausibility min must mirror CONF_JOY_CALIB_CORNER_MIN");
 
 // Unique ID
 String g_deviceUID = "";  // Global variable for storing unique identifier for board
@@ -1091,6 +1099,12 @@ void loop() {
   // 4.9.9 review round 3: the TinyUSB mount/unmount debug events, emitted
   // from THIS task (the hooks only record them — see tud_mount_cb).
   usbEventDrain();
+
+  // (5.0.0 audit round 4) the CDC session edge — a host closing the port
+  // tears its undelivered queue content down (anti-replay into the next
+  // session; the owed pre-attach diagnostic prefix survives). No-op while
+  // the DTR state is unchanged.
+  serialTxSessionCheck();
 
   // 4.8.1: the mouse's unmount cleanup raised its take-and-clear flag — the
   // USB host went away while click/drag state was held. End the DRAG mode
@@ -2203,18 +2217,32 @@ extern "C" void tud_umount_cb(void) {
 
 void usbEventDrain() {
   if (g_usbEventPending == 0) return;
-  const uint8_t pending = g_usbEventPending;
-  // 4.9.9 review round 4 (lossy-clear fix): clear only the bits being
-  // drained — an event raised in the TinyUSB task between the read and the
-  // clear must survive (a whole-word store would erase it).
-  g_usbEventPending &= (uint8_t)~pending;
+  // (5.0.0 audit round 4) Atomic take-and-clear across the TinyUSB task —
+  // the g_bleVerdictDirty pattern above. The old `&= ~pending` shape only
+  // preserved bits NOT in `pending`: a fast unmount→remount while a
+  // previous event was still queued re-raised a bit inside `pending`
+  // between the read and the read-modify-write, and the clear erased it —
+  // exactly the loss the 4.9.9 round-4 comment claimed the shape prevents.
+  // USB_DEBUG-only diagnostics either way, but a forensics line that
+  // silently vanishes (or carries the other event's timestamp) misleads
+  // precisely in the stuck-enumeration investigations these lines exist
+  // for.
+  uint8_t pending = 0;
+  unsigned long configuredMs = 0;
+  unsigned long unconfiguredMs = 0;
+  taskENTER_CRITICAL();
+  pending = g_usbEventPending;
+  configuredMs = g_usbEventConfiguredMs;      // snapshot with the bits — an
+  unconfiguredMs = g_usbEventUnconfiguredMs;  // event landing right after the clear must not lend its timestamp to this line
+  g_usbEventPending = 0;
+  taskEXIT_CRITICAL();
   if (pending & 0x1) {
     Serial.print("USB-EVT: configured at ");
-    Serial.println(g_usbEventConfiguredMs);
+    Serial.println(configuredMs);
   }
   if (pending & 0x2) {
     Serial.print("USB-EVT: unconfigured at ");
-    Serial.println(g_usbEventUnconfiguredMs);
+    Serial.println(unconfiguredMs);
   }
 }
 
@@ -4056,7 +4084,16 @@ void performJoystickCalibrationStep(int* args) {
     // per-reading fallback installed a 13 mT default on the first sample if
     // the user was still moving into position; that default then beat every
     // later real corner below 13 mT and could never be replaced.
-    if ((abs(maxPoint.x) < CONF_JOY_CALIB_CORNER_MIN) || (abs(maxPoint.y) < CONF_JOY_CALIB_CORNER_MIN)) {
+    // (5.0.0 audit round 4) The gate measures the CENTER-RELATIVE per-axis
+    // deflection now (LSCornerPlausibility.h): the old raw-axis shape
+    // compared the neutral's distance from the sensor origin against the
+    // corner min, so on the documented off-origin-neutral unit class a
+    // barely-moved corner passed on the neutral's magnitude alone and a
+    // real far-quadrant corner could fall below the raw floor — both
+    // silently. Calibration runs sensorful, so the live center is always
+    // available here.
+    if (!lsCornerDeflectionPlausible(maxPoint.x, maxPoint.y,
+                                     js.getInputCenter().x, js.getInputCenter().y)) {
       pointFloatType tempDefaultPoint = { 0, 0 };
       switch (stepNumber) {
         case 1:  // Top left corner

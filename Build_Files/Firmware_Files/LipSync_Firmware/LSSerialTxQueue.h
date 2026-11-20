@@ -15,6 +15,12 @@ class LSSerialTxQueue {
     LSSerialTxQueue() { clear(); }
 
     void clear() {
+      // (5.0.0 audit round 4) A clear that actually discards queued bytes is
+      // a shed: commit-on-delivery callers (lsHostPushState's BT,4/BT,5
+      // sentinels) key on this counter to tell "the line drained to the
+      // FIFO" from "the line was dropped before the FIFO". The counter is
+      // monotonic and survives clear() on purpose.
+      if (_count > 0) _shedEvents++;
       _head = 0;
       _tail = 0;
       _count = 0;
@@ -25,6 +31,11 @@ class LSSerialTxQueue {
     size_t size() const { return _count; }
     size_t freeSpace() const { return Capacity - _count; }
     bool lineInProgress() const { return _lineInProgress; }
+    // (5.0.0 audit round 4) Monotonic count of shed events — every operation
+    // that discarded queued bytes without transmitting them. Callers
+    // snapshot it around an enqueue to detect that their line was dropped
+    // (see lsHostPushState's commit-on-delivery in LSBLE.h).
+    uint32_t shedEvents() const { return _shedEvents; }
 
     // Drop stale queued output before handling a new request. If part of the
     // head line is already on the wire, preserve exactly its unsent remainder
@@ -51,6 +62,42 @@ class LSSerialTxQueue {
         return;
       }
       preserveHeadLineOnly();
+    }
+
+    // (5.0.0 audit round 4) CDC session teardown — the DTR falling-edge hook
+    // (serialTxSessionCheck, loop task). Output enqueued but never drained
+    // when a host closes the port used to sit in the queue and replay as
+    // unsolicited traffic into the NEXT session (the 4.6.4 anti-replay
+    // rule's intent — its pre-attach discard only covered boot-time
+    // output). Two shapes need care:
+    //   - a PARTIALLY transmitted head line: its first half went to the dead
+    //     session, so the remainder must drop too — replaying it would
+    //     concatenate onto the next session's wire as a corrupt frame;
+    //   - the owed pre-attach diagnostic prefix (enqueueProtectedLine's
+    //     watermark): it is owed to the first host that actually READS it,
+    //     so an intact remainder survives the teardown — the 4.9.9 round-4
+    //     contract ("the first host reads THIS boot's diagnostics") is not
+    //     voided by a host that opened and closed without reading.
+    void sessionTeardown() {
+      if (_count == 0) return;
+      if (_lineInProgress) {
+        // Consume the head line's remainder through its newline — consume()
+        // debits the watermark byte-for-byte for the prefix bytes that die
+        // with the session.
+        size_t chunk = 0;
+        while (chunk < _count) {
+          const char consumed = _buffer[(_tail + chunk) % Capacity];
+          chunk++;
+          if (consumed == '\n') break;
+        }
+        consume(chunk);
+        _shedEvents++;  // a half-delivered line is neither delivered nor retained: force re-push semantics
+      }
+      if (_diagWatermark > 0) {
+        keepTailBytes(_diagWatermark);  // keeps the intact owed prefix (whole lines), drops the rest — bumps _shedEvents when it drops
+      } else {
+        clear();
+      }
     }
 
     bool enqueueLine(const char* line, size_t length) {
@@ -146,6 +193,7 @@ class LSSerialTxQueue {
     size_t _count = 0;
     bool _lineInProgress = false;
     size_t _diagWatermark = 0;  // (5.0.1 audit) bytes from _tail still owed to the first host (whole pre-attach diag lines)
+    uint32_t _shedEvents = 0;   // (5.0.0 audit round 4) monotonic dropped-without-transmit counter — see shedEvents()
 
     void pushByte(char value) {
       _buffer[_head] = value;
@@ -166,6 +214,7 @@ class LSSerialTxQueue {
       // (5.0.1 audit) A dropped oldest line was the watermark prefix's head —
       // the owed bytes it carried are gone with it.
       const size_t droppedCount = before - _count;
+      if (droppedCount > 0) _shedEvents++;
       if (_diagWatermark > droppedCount) _diagWatermark -= droppedCount; else _diagWatermark = 0;
       return true;
     }
@@ -183,6 +232,7 @@ class LSSerialTxQueue {
       // Every enqueue appends a newline. If invariants are ever violated,
       // preserve everything rather than manufacturing a truncated frame.
       if (keep == _count && _buffer[(index + Capacity - 1) % Capacity] != '\n') return;
+      _shedEvents++;  // (5.0.0 audit round 4) bytes behind the head line are dropped
       _count = keep;
       _head = index;
       // (5.0.1 audit) The dropped bytes were the NEWEST ones (behind the
@@ -196,6 +246,7 @@ class LSSerialTxQueue {
     // without eating the owed prefix.
     bool dropNewestWholeLine() {
       if (_count == 0 || _lineInProgress) return false;
+      _shedEvents++;  // (5.0.0 audit round 4) the newest whole line is dropped
       size_t index = (_head + Capacity - 1) % Capacity;  // the last byte
       size_t scanned = 0;
       size_t newlines = 0;
@@ -245,6 +296,7 @@ class LSSerialTxQueue {
         keep++;
         index = (index + 1) % Capacity;
       }
+      if (keep < _count) _shedEvents++;  // (5.0.0 audit round 4) bytes behind the kept prefix are dropped
       _count = keep;
       _head = index;
       if (_diagWatermark > keep) _diagWatermark = keep;

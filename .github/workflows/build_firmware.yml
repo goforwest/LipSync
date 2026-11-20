@@ -145,13 +145,13 @@ jobs:
             -o lstimer_host_tests \
             Build_Files/Firmware_Files/host_tests/lstimer_host_tests.cpp
           ./lstimer_host_tests | tee /tmp/lstimer.out
-          grep -q '168 checks, 0 failures' /tmp/lstimer.out
+          grep -q '176 checks, 0 failures' /tmp/lstimer.out
           c++ -std=c++17 -g -fsanitize=address,undefined \
             -IBuild_Files/Firmware_Files/LipSync_Firmware \
             -o core_host_tests \
             Build_Files/Firmware_Files/host_tests/core_host_tests.cpp
           ./core_host_tests | tee /tmp/core.out
-          grep -q '408 checks, 0 failures' /tmp/core.out
+          grep -q '455 checks, 0 failures' /tmp/core.out
 
       - name: Read firmware version and verify the tag matches
         run: |
@@ -170,6 +170,17 @@ jobs:
             exit 1
           fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          # (5.0.0 audit round 4) A workflow_dispatch fired ON a tag ref fails
+          # here with a named error, exactly as the release notes claim:
+          # releases are published by tag PUSHES; a dispatch is a debug build
+          # (the artifact upload below is its whole contract) and its
+          # ref-type=tag shape would otherwise walk the whole pipeline into
+          # `gh release create`/firmware-binaries against a tag the operator
+          # did not mean to publish. Dispatch it from a branch instead.
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "::error title=Dispatch on a tag ref::workflow_dispatch fired on tag ref '${GITHUB_REF_NAME}' — releases are published by tag pushes; dispatch this workflow from a branch for a debug build." >&2
+            exit 1
+          fi
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             TAG_VERSION="${GITHUB_REF_NAME#V}"
             TAG_VERSION="${TAG_VERSION#v}"

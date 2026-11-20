@@ -110,6 +110,29 @@ static inline int lsHostHiddenCount(int rowCount) {
   return (rowCount > LSHOST_MENU_MAX_ROWS) ? (rowCount - LSHOST_MENU_MAX_ROWS) : 0;
 }
 
+/* (5.0.0 audit round 4) Order-sensitive FNV-1a fingerprint of an enumerated
+ * row set — the BT,4 change-detect key. The old change-detect keyed on the
+ * COUNT alone: at the enumeration cap a 9th pairing renumbers every row
+ * while the capped count stays flat, so no BT,4 ever fired and the app —
+ * whose contract is to re-read BT,0 only after a BT,4 — kept the stale
+ * pre-pairing rows; a serial BT,1:<i> then resolved the renumbered row (the
+ * serial path deliberately passes no identity). The fingerprint covers each
+ * row's 12-hex mac IN ROW ORDER (the lsHostSortRows order), so any
+ * insertion/removal/renumber of the capped set changes it; the active flag
+ * is deliberately excluded (BT,5 owns that change). count may be 0 (empty
+ * set hashes to the FNV basis). */
+static inline unsigned int lsHostRowSetHash(const lsHostRow* rows, int count) {
+  unsigned int hash = 2166136261u;  /* FNV-1a 32-bit basis */
+  if (rows == (const lsHostRow*)0) return hash;
+  for (int i = 0; i < count; i++) {
+    for (int k = 0; k < LSHOST_MAC_CHARS; k++) {
+      hash ^= (unsigned char)rows[i].mac[k];
+      hash *= 16777619u;
+    }
+  }
+  return hash;
+}
+
 /* Strict byte-wise mac12 ordering ("shorter prefix sorts first", the
  * lsHostSortRows convention) without string.h — the same NUL-terminated
  * fixed-width key the sort uses. */

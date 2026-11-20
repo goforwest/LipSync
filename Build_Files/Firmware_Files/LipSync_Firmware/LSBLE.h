@@ -386,6 +386,16 @@ void LSBLEMouse::service(void)
     if (!_clickPressedSent) {
       _buttons |= _clickButton;
       if (mouseReport(_buttons, 0, 0, 0, 0)) _clickPressedSent = true;
+    } else if (outputAction == CONF_ACTION_DRAG && (_clickButton & MOUSE_LEFT)) {
+      // (5.0.0 audit round 4) A click landing while a DRAG holds the same
+      // button must not release the drag's hold: the press phase found the
+      // bit already down (a no-op), and clearing it here killed the
+      // user's in-progress drag on the wire while outputAction still
+      // reported DRAG. Complete the click's bookkeeping without touching
+      // the held bit — releaseOutputAction() owns it at drag end.
+      _clickPending = false;
+      _clickPressedSent = false;
+      _clickButton = 0;
     } else {
       _buttons &= (uint8_t)~_clickButton;
       if (mouseReport(_buttons, 0, 0, 0, 0)) {
@@ -487,9 +497,26 @@ using namespace Adafruit_LittleFS_Namespace;
 // state silently — no unsolicited MANUAL lines on a healthy boot (the
 // 4.5.29 wire contract); the app's connect load reads BT,0 for the current
 // truth. Every real change after the prime pushes BT,4/BT,5.
+// (5.0.0 audit round 4) COMMIT-ON-DELIVERY: the sentinels below move only
+// when the pushed line has provably reached the USB FIFO. A line enqueued
+// while the CDC FIFO is backed up (a ~1.2 KB EX,0 dump still draining, or a
+// host briefly not reading) used to be destroyed by the next request's
+// prioritizeRequest() shed AFTER the sentinel had already been committed at
+// enqueue time — the 1 s pass then saw no change and never re-pushed, and
+// the app's BT row model went stale against a renumbered table (the serial
+// BT,1/BT,2 path passes no identity, so a stale index acts on the
+// MAC-sorted renumbered row). The proof is serialTxQueueDepth()==0 (the
+// queue fully drained) with serialTxQueueShedEvents() unchanged since the
+// enqueue mark; any shed re-opens the compare on the next pass.
 uint8_t g_btPushedHostCount = 0xFF;
 int g_btPushedActiveRow = -1;
+unsigned int g_btPushedRowHash = 0;    // lsHostRowSetHash of the set as last pushed/primed
 bool g_btPushedPrimed = false;
+bool g_btPushAwaitingDelivery = false; // a push line is enqueued but not yet proven delivered
+uint8_t g_btPendingHostCount = 0;      // values as enqueued in the in-flight push
+int g_btPendingActiveRow = -1;
+unsigned int g_btPendingRowHash = 0;
+uint32_t g_btPushShedMark = 0;         // shedEvents() snapshot taken at enqueue time
 
 bool lsBleStackReady() {
   return !needsInitialization;
@@ -660,7 +687,24 @@ bool lsHostForgetByMac(const char* mac12) {
   char fname[48];  // sizeof("/adafruit/bond_prph/%02X%02X%02X%02X%02X%02X") — the lib's get_fname is internal to bonding.cpp, so build the documented name from the public format macro
   snprintf(fname, sizeof(fname), BOND_FNAME_PRPH,
            id.addr[0], id.addr[1], id.addr[2], id.addr[3], id.addr[4], id.addr[5]);
-  if (!InternalFS.exists(fname)) return true;  // already absent — forget is idempotent
+  if (!InternalFS.exists(fname)) {
+    // (5.0.0 audit round 4) Arm the resurrection guard on the
+    // idempotent-absent path too. The caller enumerated this row moments
+    // ago (the forget was addressed by MAC from a live table), so absence
+    // at probe time is exactly the vendored saver's remove→rewrite window:
+    // bond_save_keys_dfr runs on the ada-callback thread and rewrites the
+    // bond file unconditionally (remove first, then rewrite) — a re-pair
+    // completing at forget time could have removed the file between the
+    // enumeration and this probe, and its rewrite re-creates it right after
+    // this SUCCESS ack. Without the watch, the un-forget has no self-heal
+    // and no wire trace; with it, the 1 s pass re-removes a resurrected
+    // file, bounded, and names itself. A genuinely already-absent bond
+    // simply stays absent through the window and the watch disarms.
+    snprintf(g_forgetRecheckFname, sizeof(g_forgetRecheckFname), "%s", fname);
+    g_forgetRecheckArmedMs = millis();
+    g_forgetRecheckRemoves = 0;
+    return true;  // already absent — forget is idempotent
+  }
   if (!InternalFS.remove(fname)) return false;
   const bool gone = !InternalFS.exists(fname);  // verify — a "removed but still there" is a refusal, not a SUCCESS
   if (gone) {
@@ -733,21 +777,65 @@ void lsHostPushState(bool force) {  // default lives on the LSApiDeclarations.h 
   for (uint8_t i = 0; i < count && i < LSHOST_ENUM_CAP; i++) {
     if (rows[i].active) { activeRow = i + 1; break; }
   }
+  // (5.0.0 audit round 4) The list-change key is now the row-set
+  // fingerprint, not the count: at LSHOST_ENUM_CAP a 9th pairing renumbers
+  // every row while the capped count stays flat, and the app — whose
+  // contract is to re-read BT,0 only after a BT,4 — kept the stale
+  // pre-pairing rows.
+  const unsigned int rowHash = lsHostRowSetHash(rows, count);
+
+  // (5.0.0 audit round 4) Commit-on-delivery — see the state block above.
+  if (g_btPushAwaitingDelivery) {
+    if (serialTxQueueShedEvents() != g_btPushShedMark) {
+      g_btPushAwaitingDelivery = false;  // shed before delivery: the compares below re-enqueue
+    } else if (serialTxQueueDepth() == 0) {
+      g_btPushedHostCount = g_btPendingHostCount;
+      g_btPushedActiveRow = g_btPendingActiveRow;
+      g_btPushedRowHash = g_btPendingRowHash;
+      g_btPushAwaitingDelivery = false;
+    }
+    // else: still draining — hold; the sentinels stay stale so an
+    // undelivered push can never be swallowed by the change-detect.
+  }
+
   if (!g_btPushedPrimed && !force) {
     g_btPushedPrimed = true;
     g_btPushedHostCount = count;
     g_btPushedActiveRow = activeRow;
+    g_btPushedRowHash = rowHash;
     return;
   }
   g_btPushedPrimed = true;  // a forced first call syncs fully (sentinels still differ -> both lines below fire)
-  if (count != g_btPushedHostCount) {
-    g_btPushedHostCount = count;
-    printResponseInt(true, false, true, 0, "BT,4", true, count);
+
+  const bool listChanged = (count != g_btPushedHostCount) || (rowHash != g_btPushedRowHash);
+  const bool activeChanged = (activeRow != g_btPushedActiveRow);
+  if (!listChanged && !activeChanged) return;
+  if (g_btPushAwaitingDelivery && !force) return;  // a push is already in flight — commit, then the next pass compares again
+  g_btPushAwaitingDelivery = false;  // a force push supersedes any in-flight line (a duplicate BT,4 is an idempotent refresh)
+
+  // (5.0.0 audit round 4, fix-set review) The shed mark is taken BEFORE the
+  // enqueues, not after: the BT,5 enqueue's own make-space can shed the just
+  // enqueued BT,4 (the newest whole line in a near-full queue), and a
+  // mark-after capture would bless exactly that loss. Any shed during or
+  // after the enqueues now re-opens the compare on the next pass — the cost
+  // is a duplicate BT,4, already documented as an idempotent refresh.
+  const uint32_t shedMarkBefore = serialTxQueueShedEvents();
+  // The enqueue RESULTS gate the awaiting state: a refused enqueue (the
+  // queue could not fit the line even after shedding, or no host session is
+  // open) must not certify a phantom delivery — the sentinels stay stale and
+  // the next pass re-attempts.
+  bool bothPushed = true;
+  if (listChanged) {
+    bothPushed = printResponseInt(true, false, true, 0, "BT,4", true, count) && bothPushed;
   }
-  if (activeRow != g_btPushedActiveRow) {
-    g_btPushedActiveRow = activeRow;
-    printResponseInt(true, false, true, 0, "BT,5", true, activeRow);
+  if (activeChanged) {
+    bothPushed = printResponseInt(true, false, true, 0, "BT,5", true, activeRow) && bothPushed;
   }
+  g_btPendingHostCount = count;
+  g_btPendingActiveRow = activeRow;
+  g_btPendingRowHash = rowHash;
+  g_btPushShedMark = shedMarkBefore;
+  g_btPushAwaitingDelivery = bothPushed;
 }
 
 /*****************************
@@ -1017,6 +1105,14 @@ bool lsHostArmSwitchWindow(const char* targetMac12, int* outAddrType, int* outHa
   if (outAddrType != NULL) *outAddrType = -1;
   if (outHasIrk != NULL) *outHasIrk = 0;
   g_switchTargetIrkValid = false;
+  // (5.0.0 audit round 4) Clear the PREVIOUS window's target text up front:
+  // the text is written only after a successful identity read, so a failed
+  // arm used to leave g_switchWlText naming the LAST window's target — and
+  // the executor's outcome struct copies it unconditionally. Nothing on the
+  // wire reads it today (the armFailed INFO branch prints no text), but it
+  // is a published contract field; a stale target name is a wrong-host
+  // lie waiting for the first future consumer.
+  g_switchWlText[0] = '\0';
   if (Bluefruit.Advertising.isRunning()) {
     // Replaced by the window. Fail-closed, enforced (4.8.7 review — the
     // comment used to CLAIM this without checking the rc): a failed stop

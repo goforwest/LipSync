@@ -156,8 +156,16 @@ void watchdogLoop(void) {
   // A boot that stays up this long proves any hang was transient — restore
   // the full hang-streak budget for the next one (and the watchdog boot
   // count, for the DOG class).
+  // (5.0.0 audit round 4) Wrap-safe anchor: the raw `millis() > CONST`
+  // shape was the one non-wrap-safe deadline in the codebase. It is
+  // unreachable-harmful as written (a one-shot evaluated only in the first
+  // 120 s of uptime cannot cross the 49.7-day wrap) — but the anchor costs
+  // one static and keeps the file's deadline idiom uniform with
+  // LSTimer/LSScreen/LSJoystick, so a future reader cannot copy the raw
+  // shape into a long-lived deadline.
   static bool watchdogBootCountCleared = false;
-  if (!watchdogBootCountCleared && millis() > CONF_WATCHDOG_BOOT_CLEAR_MS) {
+  static unsigned long watchdogBootAnchorMs = millis();
+  if (!watchdogBootCountCleared && millis() - watchdogBootAnchorMs > CONF_WATCHDOG_BOOT_CLEAR_MS) {
     // 4.5.27 (Fable 5.1 consult): THIS was the next scheduled death — the
     // 120 s streak-clear is a raw POWER write that runs on LIVE boots with
     // the SoftDevice up (the stamp fixes would only have moved the kill to

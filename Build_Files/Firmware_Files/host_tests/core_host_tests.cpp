@@ -1,3 +1,4 @@
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -13,6 +14,7 @@
 #include "LSPressureOffsetFilter.h"
 #include "LSSerialRx.h"
 #include "LSSerialTxQueue.h"
+#include "LSCornerPlausibility.h"
 
 static int checks = 0;
 static int failures = 0;
@@ -327,6 +329,100 @@ static void test_serial_queue_keeps_the_pre_attach_diag_debt() {
   CHECK(std::string(wire) == "aaa\nbbb\nccc\ndddddd\n");
 }
 
+// (5.0.0 audit round 4) The shed counter: every operation that discards
+// queued bytes without transmitting them bumps it, and the counter survives
+// clears — commit-on-delivery callers (lsHostPushState's BT,4/BT,5) key on
+// it to tell "the line drained to the FIFO" from "the line was dropped
+// before the FIFO".
+static void test_serial_queue_shed_events_count_drops() {
+  LSSerialTxQueue<64> queue;
+  const uint32_t shedAtStart = queue.shedEvents();
+  CHECK(queue.enqueueLine("DEBUG,1", 7));
+  queue.prioritizeRequest();  // wholesale clear of a non-in-progress queue
+  CHECK(queue.size() == 0);
+  CHECK(queue.shedEvents() == shedAtStart + 1);
+
+  // A clean enqueue + full drain sheds nothing (the commit-on-delivery
+  // "delivered" signature: depth 0, unchanged counter).
+  CHECK(queue.enqueueLine("MANUAL,0:BT,4:2", 15));
+  CHECK(queue.shedEvents() == shedAtStart + 1);
+  char wire[128] = {};
+  size_t wireLength = 0;
+  drain_queue(queue, wire, wireLength, 64);
+  CHECK(queue.size() == 0);
+  CHECK(queue.shedEvents() == shedAtStart + 1);
+
+  // The make-space shed (dropNewestWholeLine) bumps: fill the 64-byte queue
+  // and force an overflow with one more line.
+  CHECK(queue.enqueueLine("one-11111111111", 15));
+  CHECK(queue.enqueueLine("two-222222222222", 16));
+  CHECK(queue.enqueueLine("three-3333333333", 16));
+  CHECK(queue.enqueueLine("four-44444444444", 16));  // 63 bytes queued...
+  CHECK(queue.enqueueLine("five-5555555555555", 18)); // ...this one forces a shed
+  CHECK(queue.shedEvents() > shedAtStart + 1);
+  drain_queue(queue, wire, wireLength, 64);
+
+  // A clear with bytes present bumps; an empty clear does not.
+  const uint32_t before = queue.shedEvents();
+  queue.clear();
+  CHECK(queue.shedEvents() == before);  // already drained by the drain above
+  CHECK(queue.enqueueLine("x", 1));
+  queue.clear();
+  CHECK(queue.shedEvents() == before + 1);
+}
+
+// (5.0.0 audit round 4) CDC session teardown: a host closing the port drops
+// its undelivered output (anti-replay into the next session) EXCEPT the
+// intact owed pre-attach diagnostic prefix; a partially transmitted head
+// line drops through its newline (its first half went to the dead session).
+static void test_serial_queue_session_teardown() {
+  LSSerialTxQueue<128> queue;
+
+  // Shape 1: no owed prefix — everything undelivered drops, including the
+  // remainder of a partially transmitted line.
+  CHECK(queue.enqueueLine("SUCCESS,0:EX,0:aaaa", 19));
+  CHECK(queue.enqueueLine("SUCCESS,0:EX,0:bbbb", 19));
+  size_t chunk = queue.nextChunkSize(8);  // "SUCCESS," — mid-line
+  queue.consume(chunk);
+  CHECK(queue.lineInProgress());
+  queue.sessionTeardown();
+  CHECK(queue.size() == 0);
+  CHECK(!queue.lineInProgress());
+
+  // Shape 2: an intact owed prefix survives the teardown; the session's own
+  // response output behind it drops.
+  LSSerialTxQueue<128> queue2;
+  CHECK(queue2.enqueueProtectedLine("WARNING: safe mode", 18));
+  CHECK(queue2.enqueueProtectedLine("ERROR: JOYSTICK missing", 23));
+  CHECK(queue2.enqueueLine("SUCCESS,0:EX,0:aaaa", 19));
+  queue2.sessionTeardown();
+  char wire[128] = {};
+  size_t wireLength = 0;
+  drain_queue(queue2, wire, wireLength, 64);
+  wire[wireLength] = '\0';
+  CHECK(std::string(wire) == "WARNING: safe mode\nERROR: JOYSTICK missing\n");
+
+  // Shape 3: a partially transmitted PROTECTED line loses its remainder
+  // (the dead session heard its head); the protected lines after it survive.
+  LSSerialTxQueue<128> queue3;
+  CHECK(queue3.enqueueProtectedLine("WARNING: safe mode", 18));
+  CHECK(queue3.enqueueProtectedLine("ERROR: JOYSTICK missing", 23));
+  chunk = queue3.nextChunkSize(6);  // "WARNIN" — mid-line inside the prefix
+  queue3.consume(chunk);
+  CHECK(queue3.lineInProgress());
+  queue3.sessionTeardown();
+  wireLength = 0;
+  drain_queue(queue3, wire, wireLength, 64);
+  wire[wireLength] = '\0';
+  CHECK(std::string(wire) == "ERROR: JOYSTICK missing\n");
+
+  // Shape 4: an empty teardown is a no-op (no phantom shed).
+  LSSerialTxQueue<128> queue4;
+  const uint32_t shedBefore = queue4.shedEvents();
+  queue4.sessionTeardown();
+  CHECK(queue4.shedEvents() == shedBefore);
+}
+
 // Upstream #58: the hard sip/puff band classifier. Numeric states mirror
 // PRESS_SAP_MAIN_STATE_*; thresholds mirror the compiled defaults (regular
 // 3.0 hPa, hard 10.0 hPa, release fraction 0.7).
@@ -456,6 +552,73 @@ static void test_host_row_sort_is_deterministic() {
   }
   lsHostSortRows(three, 3);
   CHECK(std::string(three[1].mac) == "112233445566");  // was row 3, now row 2
+}
+
+// (5.0.0 audit round 4) The BT,4 change-detect fingerprint: order-sensitive
+// over the row MACs, so a renumbering of the capped set changes it even when
+// the count is flat (the cap case the count-only key missed), while the
+// active flag is excluded (BT,5 owns that change).
+static void test_host_row_set_hash() {
+  lsHostRow rows[3];
+  const char* macs[3] = {"001122334455", "112233445566", "aabbccddeeff"};
+  for (int i = 0; i < 3; i++) {
+    std::snprintf(rows[i].mac, sizeof(rows[i].mac), "%s", macs[i]);
+    std::snprintf(rows[i].name, sizeof(rows[i].name), "H%d", i);
+    rows[i].lastMacByte = 0;
+    rows[i].active = 0;
+  }
+  const unsigned int base = lsHostRowSetHash(rows, 3);
+  CHECK(base != 0);  // the FNV basis only survives an EMPTY set
+
+  // Stable: same set, same order -> same hash.
+  CHECK(lsHostRowSetHash(rows, 3) == base);
+
+  // Order-sensitive: a renumbering (swap two rows) changes it at flat count.
+  lsHostRow swapped[3] = {rows[1], rows[0], rows[2]};
+  CHECK(lsHostRowSetHash(swapped, 3) != base);
+
+  // A row removed (the forget/eviction case) changes it.
+  CHECK(lsHostRowSetHash(rows, 2) != base);
+
+  // The active flag is NOT part of the fingerprint (BT,5's business).
+  rows[1].active = 1;
+  CHECK(lsHostRowSetHash(rows, 3) == base);
+  rows[1].active = 0;
+
+  // The empty set hashes to the FNV basis (the documented sentinel).
+  CHECK(lsHostRowSetHash(rows, 0) == 2166136261u);
+  CHECK(lsHostRowSetHash(nullptr, 5) == 2166136261u);
+}
+
+// (5.0.0 audit round 4) The corner-plausibility gate measures CENTER-RELATIVE
+// per-axis deflection — the raw-axis shape accepted a barely-moved corner on
+// the neutral's own magnitude (the off-origin-neutral unit class) and could
+// reject a real far-quadrant corner whose deflection crossed the origin.
+static void test_corner_plausibility_is_center_relative() {
+  // A neutral-origin unit: identical to the old raw-axis semantics.
+  CHECK(lsCornerDeflectionPlausible(5.0f, 5.0f, 0.0f, 0.0f) == 1);
+  CHECK(lsCornerDeflectionPlausible(2.9f, 5.0f, 0.0f, 0.0f) == 0);
+
+  // The off-origin class: neutral at {30,30}. A barely-moved corner at raw
+  // {29,29} (2 mT deflection) used to PASS on |29| >= 3 — now it fails.
+  CHECK(lsCornerDeflectionPlausible(29.0f, 29.0f, 30.0f, 30.0f) == 0);
+  // A real corner (18 mT per-axis deflection toward the origin) passes even
+  // though its raw coordinate {12,12} is well inside the old raw floor's
+  // reach, and passes the min exactly at the boundary.
+  CHECK(lsCornerDeflectionPlausible(12.0f, 12.0f, 30.0f, 30.0f) == 1);
+  CHECK(lsCornerDeflectionPlausible(27.0f, 27.0f, 30.0f, 30.0f) == 1);  // exactly 3.0 on both axes
+  CHECK(lsCornerDeflectionPlausible(27.1f, 27.0f, 30.0f, 30.0f) == 0);  // just under on one axis
+
+  // Both axes must deflect (the capture convention requires BOTH at or
+  // beyond the min).
+  CHECK(lsCornerDeflectionPlausible(27.0f, 29.0f, 30.0f, 30.0f) == 0);
+
+  // Non-finite corners/centers fail the gate.
+  CHECK(lsCornerDeflectionPlausible(std::nanf(""), 5.0f, 0.0f, 0.0f) == 0);
+  CHECK(lsCornerDeflectionPlausible(5.0f, 5.0f, std::nanf(""), 0.0f) == 0);
+
+  // The pinned constant mirrors LSConfig's (host-side copy).
+  CHECK(LSCORNER_PLAUSIBILITY_MIN_M_T == 3.0f);
 }
 
 static void test_host_oled_label_and_overflow() {
@@ -1083,9 +1246,13 @@ int main() {
   test_pressure_offset_boot_baseline_rejects_held_gestures();
   test_serial_queue_never_truncates_an_inflight_line();
   test_serial_queue_keeps_the_pre_attach_diag_debt();
+  test_serial_queue_shed_events_count_drops();
+  test_serial_queue_session_teardown();
   test_hard_band_classification_semantics();
   test_host_name_sanitization();
   test_host_row_sort_is_deterministic();
+  test_host_row_set_hash();
+  test_corner_plausibility_is_center_relative();
   test_host_oled_label_and_overflow();
   test_host_switch_decision_precedence();
   test_host_forget_decision_allows_active();

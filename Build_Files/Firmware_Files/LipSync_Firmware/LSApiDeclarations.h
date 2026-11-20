@@ -240,6 +240,7 @@ void lsHostServiceSwitchWindow(void);  // per-loop-pass window service (millisec
 bool lsHostSwitchWindowOpen(void);     // 4.9.0: is a switch window open? (the BT,3 gate — the bouncer would drop the peer pair-new admits)
 void lsHidWatchdogLoop(void);  // HID-subscription watchdog (btFeedbackLoop, 1 s): cycle a bonded link whose mouse CCCD never enables (bounded 3, grace 5 s); no-op unless BLE is up and no window is open
 extern int g_comMode;          // 0 = None, 1 = USB, 2 = Wireless (defined in LipSync_Firmware.ino; the watchdog reads it)
+extern int outputAction;       // (5.0.0 audit round 4) the in-force output action (CONF_ACTION_*, LipSync_Firmware.ino) — the mouse classes' click release reads it to leave a held DRAG button down
 bool lsHostForgetByMac(const char* mac12);  // remove one bond file (explicit InternalFS.remove + absence verification — the lib's void bond_remove_key cannot report failure)
 void lsHostForgetRecheckPass(void);  // (5.0.1 audit) forget-resurrection guard (btFeedbackLoop, 1 s): re-remove a bond file the stack's deferred bond save recreated after a forget (bounded, self-naming)
 void lsHostPushState(bool force = false);  // MANUAL,0:BT,4/BT,5 pushes with change-detect + silent boot prime (the CH,5 contract); force skips the prime for the forget paths
@@ -315,7 +316,11 @@ void printResponseIntArray(bool responseEnabled,
                            int responseParameter[]);
 // The scalar formatter, for callers outside LSAPI.ino (LSBLE.h's BT,4/BT,5
 // pushes — upstream #16; same canonical-formatter rule as the array twin above).
-void printResponseInt(bool responseEnabled,
+// (5.0.0 audit round 4, fix-set review) Returns the ENQUEUE result (false =
+// the line was refused — the queue could not fit it even after shedding, or
+// no host session is open). Callers with delivery obligations key on it;
+// response-shape callers ignore it.
+bool printResponseInt(bool responseEnabled,
                       bool apiEnabled,
                       bool responseStatus,
                       int responseNumber,
@@ -323,7 +328,7 @@ void printResponseInt(bool responseEnabled,
                       bool responseParameterEnabled,
                       int responseParameter);
 // The string-param formatter (BT,0:<i> row answers carry <i>:<name>:<state>).
-void printResponseString(bool responseEnabled,
+bool printResponseString(bool responseEnabled,
                          bool apiEnabled,
                          bool responseStatus,
                          int responseNumber,
@@ -377,6 +382,16 @@ bool serialTxEnqueueLine(const String &line);
 // anti-replay gate. Everything response-shaped keeps serialTxEnqueueLine.
 bool serialTxEnqueueDiagLine(const char* line, size_t length);
 bool serialTxEnqueueDiagLine(const String &line);
+// (5.0.0 audit round 4) Commit-on-delivery probes for the push state
+// machines: depth 0 + an unchanged shed count since the enqueue mark is the
+// only observable proof that an enqueued line reached the USB FIFO (see
+// lsHostPushState in LSBLE.h). Both run in the loop task only.
+size_t serialTxQueueDepth(void);
+uint32_t serialTxQueueShedEvents(void);
+// (5.0.0 audit round 4) CDC session edge (called from loop()): on the DTR
+// falling edge, tear the TX queue down for the closed session — see
+// LSSerialTxQueue::sessionTeardown.
+void serialTxSessionCheck(void);
 
 // ---- Cross-tab free functions (defined in LipSync_Firmware.ino) ----
 

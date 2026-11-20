@@ -395,6 +395,15 @@ void LSUSBMouse::service(void)
     if (!_clickPressedSent) {
       _buttons |= _clickButton;
       if (mouseReport(_buttons, 0, 0, 0, 0)) _clickPressedSent = true;
+    } else if (outputAction == CONF_ACTION_DRAG && (_clickButton & MOUSE_LEFT)) {
+      // (5.0.0 audit round 4) The BLE twin's drag-hold guard, mirrored: a
+      // click landing while a DRAG holds the same button completes its
+      // bookkeeping WITHOUT clearing the bit — the release would kill the
+      // in-progress drag on the wire while outputAction still reported
+      // DRAG. releaseOutputAction() owns the bit at drag end.
+      _clickPending = false;
+      _clickPressedSent = false;
+      _clickButton = 0;
     } else {
       _buttons &= (uint8_t)~_clickButton;
       if (mouseReport(_buttons, 0, 0, 0, 0)) {
@@ -413,6 +422,16 @@ void LSUSBMouse::service(void)
 
 void LSUSBMouse::click(uint8_t b)
 {
+  // (5.0.0 audit round 4) Stage only on a begun instance — the send paths
+  // have been no-ops until begin() registered the interface since the
+  // 5.0.1 round-2 audit, but the STAGING shape (this function) still set
+  // _clickPending on a never-begun instance: in gamepad mode a
+  // mouse-column-admissible LEFT_CLICK remap staged a click that neither
+  // phase could ever advance (mouseReport refuses at the _begun gate), so
+  // the pending state and its per-pass isReady() re-evaluation lived
+  // forever with no wire trace. The staging gate makes the whole action a
+  // no-op, symmetric with the send paths.
+  if (!_begun) return;
   if (_clickPending) return;  // One complete click is safer than interleaving two half-clicks
   b &= MOUSE_ALL;
   if (b == 0) return;
@@ -431,13 +450,20 @@ void LSUSBMouse::buttons(uint8_t b)
 	}
 }
 
-void LSUSBMouse::press(uint8_t b) 
+void LSUSBMouse::press(uint8_t b)
 {
+	// (5.0.0 audit round 4) Staging gate — see click(). press() on a
+	// never-begun instance used to set _buttons AND _buttonStatePending (the
+	// report refuses at the _begun gate), leaving a phantom held button that
+	// service() would re-evaluate every pass.
+	if (!_begun) return;
 	buttons(_buttons | b);
 }
 
 void LSUSBMouse::release(uint8_t b)
 {
+	// (5.0.0 audit round 4) Staging gate — see click().
+	if (!_begun) return;
 	buttons(_buttons & ~b);
 }
 
@@ -610,6 +636,13 @@ void LSUSBGamepad::countReportMovement(void) {
 
 void LSUSBGamepad::press(uint8_t b)
 {
+  // (5.0.0 audit round 4) Staging gate — the mirror of LSUSBMouse's: the
+  // send paths are no-ops until begin() registered the interface, but the
+  // staging shape set _report.buttons bits on a never-begun instance (a
+  // gamepad-column remap firing in mouse mode staged a button that could
+  // never send, and releaseAll's scheduled cleanup then cleared a state
+  // that never existed on the wire).
+  if (!_begun) return;
   b &= 0x7; // Limit value between 0..7
   _report.buttons |= (uint8_t)1 << b;
 }
@@ -617,6 +650,8 @@ void LSUSBGamepad::press(uint8_t b)
 
 void LSUSBGamepad::release(uint8_t b)
 {
+  // (5.0.0 audit round 4) Staging gate — see press().
+  if (!_begun) return;
   b &= 0x7; // Limit value between 0..7
   _report.buttons &= ~((uint8_t)1 << b);
 }
@@ -624,6 +659,9 @@ void LSUSBGamepad::release(uint8_t b)
 
 void LSUSBGamepad::releaseAll(void)
 {
+  // (5.0.0 audit round 4) Staging gate — see press(). An unbegun instance
+  // holds no staged state, so clearing it is a no-op by definition.
+  if (!_begun) return;
   _report.buttons = 0;
 }
 

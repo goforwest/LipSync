@@ -249,6 +249,38 @@ unsigned long serialRxBufLastByteMs = 0;
 const size_t SERIAL_TX_BUFFER_SIZE = 4096;
 LSSerialTxQueue<SERIAL_TX_BUFFER_SIZE> serialTxQueue;
 
+// (5.0.0 audit round 4) Commit-on-delivery probes for the push state
+// machines (lsHostPushState's BT,4/BT,5): a push line enqueued while the
+// CDC FIFO is backed up can be shed by the next request's
+// prioritizeRequest() before it ever reaches the wire. The push sentinels
+// may only move once the queue has fully drained (depth 0) AND no shed
+// occurred since the enqueue — an undelivered push leaves the sentinels
+// stale, so the next 1 s pass re-pushes instead of swallowing the change.
+size_t serialTxQueueDepth(void) {
+  return serialTxQueue.size();
+}
+
+uint32_t serialTxQueueShedEvents(void) {
+  return serialTxQueue.shedEvents();
+}
+
+// (5.0.0 audit round 4) CDC session edge detection: the Serial bool is the
+// DTR state (tud_cdc_n_connected), so a true->false transition IS the host
+// closing the port. Response output enqueued but never drained in that
+// session must not replay into the next one — see
+// LSSerialTxQueue::sessionTeardown for the exact keep/drop contract (the
+// owed pre-attach diagnostic prefix survives; everything else, including a
+// partially transmitted head line, drops).
+static bool g_serialSessionWasOpen = false;
+
+void serialTxSessionCheck(void) {
+  const bool sessionOpen = (bool)Serial;
+  if (g_serialSessionWasOpen && !sessionOpen) {
+    serialTxQueue.sessionTeardown();
+  }
+  g_serialSessionWasOpen = sessionOpen;
+}
+
 void serialTxService() {
   if (serialTxQueue.size() == 0 || !Serial) return;
   int available = Serial.availableForWrite();
@@ -1439,9 +1471,15 @@ void setJoystickInitialization(bool responseEnabled, bool apiEnabled, String opt
 // reading at capture time could never have persisted. {0,0} (what a failed
 // read used to yield implicitly) and any NaN/garbage fail this gate and the
 // caller keeps the live stored corner instead.
-static bool isPlausibleStoredCorner(pointFloatType p) {
-  if (!isfinite(p.x) || !isfinite(p.y)) return false;
-  return (fabsf(p.x) >= CONF_JOY_CALIB_CORNER_MIN) && (fabsf(p.y) >= CONF_JOY_CALIB_CORNER_MIN);
+// (5.0.0 audit round 4) The gate is CENTER-RELATIVE now (the shared pure
+// layer, LSCornerPlausibility.h — the same quantity the capture gate
+// measures): the raw-axis shape accepted a barely-moved corner on the
+// neutral's own magnitude on the documented off-origin-neutral unit class
+// (raw |axis| ≈ |neutral| ≥ min regardless of the actual deflection). A
+// sensorless caller passes the {0,0} center, which degrades to the old
+// raw-axis shape honestly — there is no better reference without a sensor.
+static bool isPlausibleStoredCorner(pointFloatType p, pointFloatType center) {
+  return lsCornerDeflectionPlausible(p.x, p.y, center.x, center.y) != 0;
 }
 
 void getJoystickCalibration(bool responseEnabled, bool apiEnabled) {
@@ -1473,7 +1511,7 @@ void getJoystickCalibration(bool responseEnabled, bool apiEnabled) {
   {
     commandKey = "CA" + String(i);
     pointFloatType storedCorner = {0.0f, 0.0f};
-    if (mem.readPoint(CONF_SETTINGS_FILE, commandKey, storedCorner) && isPlausibleStoredCorner(storedCorner)) {
+    if (mem.readPoint(CONF_SETTINGS_FILE, commandKey, storedCorner) && isPlausibleStoredCorner(storedCorner, calibrationPointArray[0])) {
       calibrationPointArray[i] = storedCorner;
     } else {
       calibrationPointArray[i] = js.getStoredInputMax(i);
@@ -4874,7 +4912,23 @@ void exportSettings(bool responseEnabled, bool apiEnabled, String optionalParame
 void runTest(bool responseEnabled, bool apiEnabled, int inputTest) {
   String commandKey = "RT";
 
-  if ((inputTest >= CONF_TEST_MODE_MIN) && (inputTest <= CONF_TEST_MODE_MAX)) { 
+  // (5.0.0 audit round 4) The same flow-ownership gate the DM setter carries
+  // (the sibling IN,1/CA,1/DM shape: FAIL,3, one answer, nothing started):
+  // the tests stall the main loop for tens of seconds (testDelay feeds only
+  // buzzer/serial/watchdog), so an RT,1 landing while a calibration/center
+  // chain runs starved the chain's timers — a corner's 10-reading window
+  // collected zero samples and the plausibility gate substituted the ±13
+  // default WITH a SUCCESS ack (the user's calibration silently degraded for
+  // that quadrant), and an RT,3 deliberately reboots the device mid-flow.
+  // The window gate mirrors CA,1's: the window's tick is serviced from the
+  // main loop, which the test stall would freeze for the test's duration.
+  if (g_calibrationRunning || g_centerRunning || lsHostSwitchWindowOpen()) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "RT,1", true, inputTest);
+    serialTxEnqueueLine("ERROR: RT refused: a calibration/center flow or switch window is active — retry once it finishes");
+    return;
+  }
+
+  if ((inputTest >= CONF_TEST_MODE_MIN) && (inputTest <= CONF_TEST_MODE_MAX)) {
     printResponseInt(responseEnabled, apiEnabled, true, 0, "RT,1", true, inputTest);
     activateTest(inputTest); // run the test
   }
@@ -5005,6 +5059,24 @@ void resetSettings(bool responseEnabled, bool apiEnabled, String optionalParamet
 // Return     : void
 //***************************//
 void doFactoryReset(bool responseEnabled, bool apiEnabled) {
+
+  // (5.0.0 audit round 4) The 4.9.9-round-4 gate moved INTO the shared body:
+  // the serial 3-arg wrapper gated before calling this, but the MENU paths
+  // (Hub menu and safe-menu Factory Reset both funnel through the confirm
+  // page into this 2-arg overload) called it DIRECTLY — the old shape set
+  // g_shutdownInProgress, FORMATTED the filesystem and reseeded both
+  // settings files, acked SUCCESS, and only then reached softwareReset()'s
+  // gate. On a BLE boot whose init task is inside a wedged Bluefruit.begin()
+  // (a window the gate's own comment says can stretch to seconds; the menu
+  // input poll is live from setup), a user completing the double confirm
+  // during that window destroyed settings+bonds, got a SUCCESS promising an
+  // imminent reset, then the named ERROR refusal — the device stayed up
+  // with factory flash under stale live RAM until some later reset. Refuse
+  // here, before ANY state moves, exactly like the serial path.
+  if (!softwareResetGate()) {
+    printResponseInt(responseEnabled, apiEnabled, false, 3, "FR,1", true, 1);
+    return;
+  }
 
   // Exempt the whole reset chain from the hang witness (4.5.7 review): the
   // reset work below (filesystem format + ONE atomic default-settings seed —
@@ -5252,13 +5324,19 @@ void enterUpdateMode(bool responseEnabled, bool apiEnabled, String optionalParam
 //
 // Return     : void
 //***********************************************************************//
-void printResponseString(bool responseEnabled, 
+bool printResponseString(bool responseEnabled, 
                          bool apiEnabled,
                          bool responseStatus,
                          int responseNumber,
                          String responseCommand, 
                          bool responseParameterEnabled, 
                          String responseParameter) {
+  // (5.0.0 audit round 4, fix-set review) Returns the ENQUEUE result so a
+  // caller with delivery obligations (lsHostPushState's commit-on-delivery)
+  // can tell a refused enqueue from a queued/delivered one. When
+  // responseEnabled is false nothing was attempted — report true (nothing
+  // is owed). Every pre-existing caller ignores the return value; the
+  // void->bool change is source-compatible by construction.
   if (responseEnabled) {
     String line;
     line.reserve(responseCommand.length() + responseParameter.length() + 24);
@@ -5275,8 +5353,9 @@ void printResponseString(bool responseEnabled,
       line += ':';
       line += responseParameter;
     }
-    serialTxEnqueueLine(line);
+    return serialTxEnqueueLine(line);
   }
+  return true;
 }
 
 //***SERIAL PRINT OUT COMMAND RESPONSE WITH INT PARAMETER FUNCTION***//
@@ -5295,14 +5374,14 @@ void printResponseString(bool responseEnabled,
 //
 // Return     : void
 //***********************************************************************//
-void printResponseInt(bool responseEnabled, 
+bool printResponseInt(bool responseEnabled, 
                       bool apiEnabled,
                       bool responseStatus, 
                       int responseNumber, 
                       String responseCommand, 
                       bool responseParameterEnabled, 
                       int responseParameter) {
-  printResponseString(responseEnabled, apiEnabled, responseStatus, responseNumber, responseCommand, responseParameterEnabled, String(responseParameter));
+  return printResponseString(responseEnabled, apiEnabled, responseStatus, responseNumber, responseCommand, responseParameterEnabled, String(responseParameter));
 }
 
 //***SERIAL PRINT OUT COMMAND RESPONSE WITH INT PARAMETER FUNCTION***//

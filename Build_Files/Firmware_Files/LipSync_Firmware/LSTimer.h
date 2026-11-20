@@ -770,6 +770,20 @@ void LSTimer<T>::restartTimer(int timerId) {
 
     timer[timerId].previousTime = millis();
     timer[timerId].numRuns = 0;
+    // (5.0.0 audit round 4) A restart from ANOTHER slot's callback during
+    // run()'s invoke pass must also cancel the target's pending deferred-fire
+    // mark: the first loop marks due slots RUNONLY/RUNANDDEL and the second
+    // loop fires them, so a "restart" landing between the two used to leave
+    // the mark set — the slot still fired (and a RUNANDDEL slot still
+    // self-deleted) on an anchor the caller had just declared obsolete.
+    // Guarded on !callbackActive: from the slot's OWN callback the mark is
+    // either already consumed (RUNONLY clears before the invoke) or the
+    // documented self-rearm/full-pool limitation applies (RUNANDDEL deletes
+    // after the callback returns — restart semantics there are the
+    // documented chain-end, not this fix's business).
+    if (!callbackActive[timerId] && timer[timerId].toBeCalled != DEFCALL_DONTRUN) {
+        timer[timerId].toBeCalled = DEFCALL_DONTRUN;
+    }
 }
 
 

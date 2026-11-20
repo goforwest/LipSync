@@ -630,6 +630,14 @@ void LSJoystick::setOutputRange(int rangeLevel){
   if (USB_DEBUG) { Serial.print("USBDEBUG: setOutputRange("); Serial.print(rangeLevel); Serial.println(")"); }
 
   // When operating as a mouse, the following function sets the upper limit of cursor value output each update
+  // (5.0.0 audit round 4) In-header range enforcement, the same trust-the-header
+  // shape 4.9.1 gave the deadzone setters so a future caller will trust them:
+  // the truncating polynomial itself is untouched (it is pinned), but an
+  // unvalidated rangeLevel used to map straight to _rangeValue — level 100
+  // would drive ±1024 px/tick outputs with no downstream clamp. All shipped
+  // callers validate 1..10 before this runs; this is the backstop.
+  if (rangeLevel < CONF_JOY_CURSOR_SPEED_LEVEL_MIN) rangeLevel = CONF_JOY_CURSOR_SPEED_LEVEL_MIN;
+  if (rangeLevel > CONF_JOY_CURSOR_SPEED_LEVEL_MAX) rangeLevel = CONF_JOY_CURSOR_SPEED_LEVEL_MAX;
   if (_operatingMode == CONF_OPERATING_MODE_MOUSE){
     // Calculate the output range value
     // NOTE (4.5.7 review): this is the long-shipped TRUNCATING polynomial —
@@ -674,7 +682,10 @@ int LSJoystick::getMouseSpeedRange(){
 // Return     : void
 //*********************************//
 int LSJoystick::getMinimumRadius(){
-  return _inputRadius;
+  // (5.0.0 audit round 4) Round, don't truncate: the implicit float→int
+  // conversion reported 3 for a 3.9 mT radius. No shipped caller reads this
+  // yet, but a diagnostics endpoint or app readout would trust the answer.
+  return (int)lroundf(_inputRadius);
 }
 
 //*********************************//
@@ -828,7 +839,14 @@ pointFloatType LSJoystick::getInputMax(int quad) {
   // A failed read is NOT a corner sample: {0,0} would replace a real held
   // deflection with the origin on this step (hold the last good point by
   // returning the stored corner below unchanged).
-  if (quad < 0 || quad >= JOY_CALIBR_ARRAY_SIZE) {
+  // (5.0.0 audit round 4) Slot 0 is the CENTER, not a corner: this function
+  // is a max-accumulator over a measurement window, and a quad==0 call
+  // would max-accumulate corner samples into the calibrated neutral —
+  // every later reading "centered" against a deflected point, a full-throw
+  // cursor with no fault signal. The shipped callers pass only steps 1-4;
+  // refuse 0 (and out of range) so a future caller cannot corrupt the
+  // center through this door. Center access goes through getInputCenter().
+  if (quad <= 0 || quad >= JOY_CALIBR_ARRAY_SIZE) {
     return pointFloatType{0.0f, 0.0f};
   }
   double xReading = 0.0, yReading = 0.0, zReading = 0.0;

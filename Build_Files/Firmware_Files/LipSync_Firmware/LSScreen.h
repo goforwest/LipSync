@@ -219,6 +219,7 @@ public:
   // LSHostSwitch decision layer (refusals = error cue + named note page).
   void btHostsMenu();
   void btSwitchConfirmPage();
+  void btSwitchConfirmDrawRows();  // (5.0.0 audit round 4) the confirm page's manual layout, shared by open and re-render — NEVER re-captures the target identity
   void btForgetListPage();
   void btSwitchingPage();
   void btNotePage(const String &line1, const String &line2, const String &line3 = String());
@@ -624,6 +625,19 @@ void LSScreen::deactivateMenu() {
   _isActive = false;
   clear();
   flushDisplay();
+  // (5.0.0 audit round 4) Un-latch the No-USB episode when the glass frees.
+  // The (5.0.1) fix deliberately does not latch while the menu owns the
+  // glass at episode START — but the mirrored order still broke: an episode
+  // that painted FIRST (noUsbPage + shown/painted latch), then a menu
+  // opened over it and closed (this function blanks the glass), left
+  // every later drawUsbErrorPageOnce hitting the `_usbErrorPageShown`
+  // early return — a blank OLED for the rest of the outage, the exact
+  // "blank reads as dead" state the page exists to prevent. Clearing the
+  // latch here lets the next connection-check tick repaint (the painted
+  // flag stays; resetUsbErrorPage's recovery semantics are unchanged). A
+  // no-op when no episode is live or when the menu owned the whole episode
+  // (that path never latches).
+  _usbErrorPageShown = false;
 }
 
 //*********************************//
@@ -715,6 +729,28 @@ void LSScreen::beginLongTextScroll() {
 
 void LSScreen::returnToMenu() {
   _transitionTimerId = -1;
+  // (5.0.0 audit round 4) Safe mode owns the display — every continuation
+  // that lands here must hand it BACK to the safe menu, not close or
+  // re-register a normal menu over it. The unmasked safe-mode serial
+  // CA,1/IN,1 paths (supported flows: a sensorful WATCHDOG/HANG safe boot
+  // passes every run gate) end here with _calibrationClosesMenu armed: the
+  // old shape closed the menu (_isActive = false) and painted the "Ready to
+  // use" splash — a lie in safe mode (all output is disabled) — and the
+  // safe menu could never come back: activateMenu refuses in safe mode,
+  // closeMenu refuses, the 5-minute timeout is disabled, and
+  // nextMenuItem/selectMenuItem gate on _isActive. The device's only
+  // button-only Restart/Factory-Reset surface was gone until a power
+  // cycle. The non-API branch has the same class of failure: in safe mode
+  // `_isActive` is still true (the safe menu registered from boot), so
+  // mainMenu() would re-register the MAIN menu for the safe column's
+  // NEXT/SELECT to walk. Re-register the safe menu instead; the flag
+  // hygiene keeps a later non-safe returnToMenu honest.
+  if (g_safeModeEnabled) {
+    _calibrationClosesMenu = false;
+    _isActive = true;
+    safeModeMenu();
+    return;
+  }
   if (_calibrationClosesMenu) {
     // #36: this calibration run was started over the serial API — the menu
     // was not how the flow started, so it must not be how it ends. Close it,
@@ -854,7 +890,21 @@ bool LSScreen::resetUsbErrorPage() {
   // stayed on the OLED for the rest of the boot on a fully working device —
   // the user had to restart by hand. The clear now succeeds only when the
   // ready page can actually land; the caller re-arms while it cannot.
-  if (!_usbErrorPageShown) return true;
+  if (!_usbErrorPageShown) {
+    // (5.0.0 audit round 4) deactivateMenu un-latches a painted episode when
+    // the menu closes over it — recovery that lands BEFORE the next
+    // connection-check tick could repaint the No-USB page finds shown=false
+    // with painted=true and a BLANK glass (deactivateMenu cleared it). Paint
+    // the ready page so recovery is visible symmetrically with the painted
+    // path below, then end the episode. Every other shown=false shape
+    // (never painted, or the menu-owned-the-episode non-latch) has nothing
+    // on the glass to recover FROM and keeps the old early return.
+    if (_usbErrorPagePainted && !_isActive && g_displayConnected && Wire.busHealthy() && _displayHealthy) {
+      _usbErrorPagePainted = false;
+      splashScreen2();
+    }
+    return true;
+  }
   if (!_usbErrorPagePainted) {
     // The latch was set but nothing ever reached the OLED (headless unit,
     // every draw was gated, or — (5.0.1 audit) — the menu owned the glass
@@ -1267,6 +1317,16 @@ void LSScreen::selectMenuItem() {
         //_tempOperatingMode = _currentSelection;
         if ((_tempOperatingMode != _operatingMode) || (_tempCommunicationMode != _communicationMode)) {
           confirmModeChange();
+        } else {
+          // (5.0.0 audit round 4) Selecting the ALREADY-ACTIVE mode row was a
+          // bare silent no-op — the "reads as a dead button" pattern the bench
+          // named for the BT already-active case (2026-11-09) and for the
+          // locked rows above (2026-10-16). The BT note page's continuation
+          // lands on the Bluetooth host list, so it is the wrong surface
+          // here; the page's own short-cue vocabulary (the locked rows'
+          // buzzerErrorCue, no confirm page) gives the press an audible ack
+          // without leaving the Mode menu.
+          buzzerErrorCue();
         }
       } else if (_currentSelection == (_modeMenuLen - 1)) {
         mainMenu();
@@ -1384,7 +1444,11 @@ void LSScreen::selectMenuItem() {
           btNotePage("Bluetooth", "not active");
         } else if (g_calibrationRunning || g_centerRunning) {
           buzzerErrorCue();
-          btNotePage("Busy: calib.", "in progress");
+          // (5.0.0 audit round 4) ≤10 chars per line — the size-2 OLED width
+          // (btNoteForReason's rule; "Busy: calib."/"in progress" clipped
+          // mid-glyph with wrap off). Same wording as the shared refusal
+          // note below.
+          btNotePage("Busy:", "in calib.");
         } else if (lsHostAnyConnected()) {
           buzzerErrorCue();
           btNotePage("Disconnect", "host first");
@@ -1871,6 +1935,24 @@ void LSScreen::selectMenuItem() {
     case FACTORY_RESET_CONFIRM2_PAGE:
       switch (_currentSelection) {
         case 0:  // Perform factory reset
+          // (5.0.0 audit round 4, fix-set review) Pre-flight the reset gate
+          // BEFORE drawing the page: the round-4 gate ordering fix moved the
+          // gate into doFactoryReset, but this path drew "FACTORY RESET..."
+          // first — a refusal (a wedged Bluefruit.begin() window) left that
+          // page up with `_isActive` still true (the 3 s self-clear is an
+          // _isActive-gated deactivateMenu no-op) and, on a safe boot, no
+          // menu timeout to ever clear it. The gate's refusal restores the
+          // calling menu (Back's own map) so the surface is visibly intact;
+          // doFactoryReset's own gate remains as the backstop.
+          if (!softwareResetGate()) {
+            buzzerErrorCue();
+            if (_prevMenu == SAFEMODE_MENU) {
+              safeModeMenu();
+            } else {
+              moreMenu();
+            }
+            break;
+          }
           factoryResetPage();
           doFactoryReset(false, false);
           break;
@@ -1952,6 +2034,17 @@ void LSScreen::setupDisplay() {
 //*********************************//
 void LSScreen::displayMenu() {
   if (!_begun || _currentMenuText == nullptr) return;
+  // (5.0.0 audit round 4) The BT switch confirm page owns a MANUAL layout
+  // (its "name (XX)" target row is size-1 by design). The generic shape
+  // below prints every row at size 2 — a wrap-around NEXT that lands here
+  // re-rendered the page with the target clipped back off-panel, exactly
+  // the discriminator loss the 4.8.7/5.0.1 fit fixes exist to prevent.
+  // Delegate; the helper redraws from the captured text and never
+  // re-captures the target identity (see btSwitchConfirmDrawRows).
+  if (_currentMenu == BT_SWITCH_CONFIRM_PAGE) {
+    btSwitchConfirmDrawRows();
+    return;
+  }
   setupDisplay();
 
   const int textLength = _cursorStart + _currentMenuLength;
@@ -2658,7 +2751,7 @@ void LSScreen::fullCalibrationPrompt(int stepNum) {
       _display.println("Movement");
       _display.println("too small.");
       _display.println("Returned");
-      _display.println("to default.");
+      _display.println("to default");  // (5.0.0 audit round 4) <=10 chars - the size-2 width (the trailing period clipped)
   }
 
   flushDisplay();
@@ -2937,7 +3030,7 @@ void LSScreen::fullCalibrationConfirmPage(void) {
   _currentSelection = 0;  // draw-only dwell reports row 0 — never inherit the interrupted page's selection (the sibling pages' convention)
   setupDisplay();
   _display.println("Incorrect");
-  _display.println("full calib.");
+  _display.println("full calib");  // (5.0.0 audit round 4) <=10 chars - the size-2 width
   _display.println("may cause");
   _display.println("drift.");
   flushDisplay();
@@ -3311,6 +3404,21 @@ void LSScreen::btSwitchConfirmPage() {
   // (4.9.0 review) the second `if (!_begun) return;` here was dead —
   // nothing between the two checks can clear _begun — and is removed with
   // the honest-ack rationale it duplicated.
+  btSwitchConfirmDrawRows();
+}
+
+// (5.0.0 audit round 4) The confirm page's manual layout, shared by the
+// open path above and displayMenu's re-render. Kept SEPARATE from the open
+// path on purpose: a wrap-around NEXT (Confirm -> Back -> wrap to 0) calls
+// displayMenu(), whose generic shape prints every row at size 2 — the
+// target line ("name (XX)", the page's whole discriminator) clipped back
+// off-panel for the longest names. The redraw uses the captured
+// _btConfirmText as-is and must NEVER re-run the open path's enumeration +
+// identity capture: a table renumbering during navigation would silently
+// re-point the confirm at a different row mid-decision (the capture is the
+// open's contract; execution re-validates it).
+void LSScreen::btSwitchConfirmDrawRows() {
+  if (!_begun) return;
   setupDisplay();
   _display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
   _display.setTextSize(2);
@@ -3603,10 +3711,13 @@ void LSScreen::warningUSBDebugOn(void) {
   if (USB_DEBUG) { Serial.println("USBDEBUG: LSScreen::warningUSBDebugOn()"); }
 
   setupDisplay();
+  // (5.0.0 audit round 4) ≤10 chars per line — the size-2 OLED width with
+  // wrap off ("USB_DEBUG=1" (11) clipped its final glyph). Same rule as
+  // holdConfirmNotePage's 4.8.7 fix.
   _display.println("Warning:");
-  _display.println("USB_DEBUG=1");
-  _display.println("Set to 0");
-  _display.println("for user.");
+  _display.println("USB debug");
+  _display.println("is on. Set");
+  _display.println("DM,0 first");
   flushDisplay();
 
   if (_screenStateTimerId >= 0) {  // Delete-before-rearm — see splashScreen2 (4.5.7 review)
@@ -3631,7 +3742,7 @@ void LSScreen::restartPage() {
 
   setupDisplay();
   _display.println("");
-  _display.println("RESTARTING...");
+  _display.println("RESTARTING");  // (5.0.0 audit round 4) <=10 chars - the size-2 width (the trailing dots clipped)
   _display.println("");
 
   flushDisplay();
