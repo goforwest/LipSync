@@ -1,0 +1,115 @@
+bench-24 — LipSync 5.0.0 round-4 build, automated wire session (2026-11-20)
+Device: Seeed XIAO nRF52840, /dev/cu.usbmodem101, flashed with the final
+V5.0.0 release (tag rebuilt from d6d64c6; build provenance confirmed on-device
+by the round-4 RT refusal line before the session). Driver: /tmp/bench24.py —
+one client, SETTINGS handshake per command, fixed-wall-clock drains,
+EX,0 baseline captured and every setter restored (final drift check PASS).
+
+RESULT: 55/55 checks PASS, 0 FAIL.
+
+
+Baseline capture
+  [PASS] EX,0 framing + SIZE2 line (round-1..3 live) — SUCCESS,0:EX,0:SIZE2:34/256
+  [PASS] EX,0 parsed keys — 36 keys
+
+Boot / identity
+  [PASS] pre-command drain silent (4.5.29 contract) — 0 lines: []
+
+Bus health
+  [PASS] BH 30-field row + vdd nominal — 30 fields, vdd=3324mV, row=SUCCESS,0:BH,0:0,1,1,1,1,-1,1,0,0,0,1,0,0,0,0,1101,1,1898,18...
+
+Identity
+  [PASS] VN == 5.0.0 — SUCCESS,0:VN,0:5.0.0
+  [PASS] ID answers a UID — SUCCESS,0:ID,0:f783be64
+  [PASS] MN == 1 — SUCCESS,0:MN,0:1
+
+Restore verification
+  [PASS] settings match the pre-bench baseline (corners exact; center drift = the documented probe re-zero) —  | noted: {'IN': 'live center re-zeroed by the RT-gate probe (1.88|-15.07 -> 1.74|-14.99; documented side effect)', 'CA': 'CA0 pair re-zeroed by th...
+
+Getter sweep
+  [PASS] all getters answer in range — 28 endpoints
+
+Grammar / refusal classes
+  [PASS] refusal classes FAIL,1/2/3 — 6 shapes exact
+
+Overflow swallow
+  [PASS] 40-byte flood -> exactly ONE FAIL,1 with the first-32 echo — got: FAIL,1:XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+  [PASS] post-flood VN clean (no double answer) — SUCCESS,0:VN,0:5.0.0
+
+Settings-mode re-entry attack
+  [PASS] settings re-entry: 33B frame swallows the SETTINGS tail — tail swallowed
+  [PASS] EXIT outside settings mode -> FAIL,0 — ['FAIL,0:EXIT']
+
+Round-4 fixes, live
+  [PASS] RT flow gate: FAIL,3 + the named ERROR line mid-flow — refused=True named=True
+  [PASS] center flow completed honestly after the refusal — SUCCESS,0:IN,1:1.80|-15.05
+  [PASS] session teardown: no dump replay after DTR close mid-drain — 0 replay lines: []
+  [PASS] fresh session serves commands cleanly after teardown — SUCCESS,0:VN,0:5.0.0
+
+Setter round-trips (restore discipline)
+  [PASS] SS cursor-speed round-trip (7) — SS,0:0 -> 7 (want 7)
+  [PASS] SS restored (9) — SS,0:0 -> 9 (want 9)
+  [PASS] SL scroll-level round-trip (3) — SL,0:0 -> 3 (want 3)
+  [PASS] SL restored (7) — SL,0:0 -> 7 (want 7)
+  [PASS] LL brightness round-trip (5) — LL,0:0 -> 5 (want 5)
+  [PASS] LL restored (10) — LL,0:0 -> 10 (want 10)
+  [PASS] WL window round-trip (2500) — WL,0:0 -> 2500 (want 2500)
+  [PASS] WL restored (3000) — WL,0:0 -> 3000 (want 3000)
+  [PASS] ST sip-threshold round-trip (12.5) — ST,0:0 -> 12.50 (want 12.5)
+  [PASS] ST restored (2.75) — ST,0:0 -> 2.75 (want 2.75)
+  [PASS] HS hard-sip threshold round-trip (15.0) — HS,0:0 -> 15.00 (want 15.0)
+  [PASS] HS restored (11.25) — HS,0:0 -> 11.25 (want 11.25)
+  [PASS] HA allowlist: action 99 refused FAIL,3 — ['FAIL,3:HA,1:99']
+  [PASS] HA legal action set — ['SUCCESS,0:HA,1:6']
+  [PASS] HA restored (5) — HA,0:0 -> 5 (want 5)
+  [PASS] SA remap getter read-back (write skipped by design) — SUCCESS,0:SA,0:1,4,19
+  [PASS] SD restriction round-trip (1 -> read 1 -> restore) — SUCCESS,0:SD,0:1
+  [PASS] SD restored (0) — SUCCESS,0:SD,0:0
+  [PASS] MA restriction round-trip (1 -> read 1 -> restore) — SUCCESS,0:MA,0:1
+  [PASS] MA restored (0) — SUCCESS,0:MA,0:0
+  [PASS] CF restriction round-trip (1 -> read 1 -> restore) — SUCCESS,0:CF,0:1
+  [PASS] CF restored (0) — SUCCESS,0:CF,0:0
+
+Mode lock (LK) gate
+  [PASS] LK,1:1 (mode lock) set — ['SUCCESS,0:LK,1:1']
+  [PASS] locked mode change refused FAIL,3 — ['FAIL,3:OM,1:2']
+  [PASS] LK setter stays reachable while locked; restored 0 — ['SUCCESS,0:LK,1:0']
+  [PASS] LK read-back 0 — SUCCESS,0:LK,0:0
+
+Software reset path
+  [PASS] SR,1 acked; USB port dropped (real reset); reboot carries only the boot-center MANUAL push — acked=True dropped=True fresh=['MANUAL,0:IN,1:1.88|-15.01']
+  [PASS] marker SS=8 persisted across the real reset — SUCCESS,0:SS,0:8
+  [PASS] SS restored (9) — SUCCESS,0:SS,0:9
+
+Communication-mode round-trip
+  [PASS] CM,1:1 -> reset -> mode persisted — fresh lines 0, CM=1
+  [PASS] CM,1:2 -> reset -> mode persisted — fresh lines 0, CM=2
+
+Bluetooth host surface
+  [PASS] BT,0 host count answers — SUCCESS,0:BT,0:2
+  [PASS] BT,0 rows parse (2 hosts)
+
+Hub menu remote + Bluetooth host surface
+  [PASS] CH,1:1 opens the menu; CH,0 reads state — SUCCESS,0:CH,0:1,0,0
+  [PASS] CH,1:3 advances the menu row — SUCCESS,0:CH,0:1,0,0 -> SUCCESS,0:CH,0:1,0,1
+  [PASS] CH,1:0 out-of-range refused FAIL,3 — ['FAIL,3:CH,1:0']
+  [PASS] CH,1:4 closes the menu — state now SUCCESS,0:CH,0:0,0,1
+
+Round-4 fixes receiving their FIRST hardware (wire-visible) confirmation in
+this session: the RT flow gate (FAIL,3 + the named refusal line mid-flow),
+the CDC session teardown (an EX,0 dump closed mid-drain does not replay into
+the next session), and the RT/center/DM gate family re-verified after the
+round-4 edits. The push commit-on-delivery and fingerprint BT,4 need bond
+churn (a pairing/forget) to observe — left for the user's radio round.
+
+Known session artifacts: each RT-gate probe legitimately re-zeroed the live
+center (IN/CA0 first pair drifts a few hundredths of a mT per probe; the four
+stored corners verified byte-identical after the session). Debug mode was left
+as found (DM=1). Device returned in BLE mouse mode, all sensors connected,
+vdd 3318-3335 mV across the session.
+
+Deliberately not run (destructive / needs the human): CA,1 full calibration
+(needs the corners sipped on cue), RS/FR factory reset, BT,1/BT,2 host switch/
+forget (drops live links), UM,1:1 (enters the bootloader), RT,3 (watchdog
+starvation boots safe mode), and every physically-driven input (sip/puff,
+switch jacks, hub buttons, joystick corners).
