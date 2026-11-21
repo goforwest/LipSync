@@ -1,0 +1,55 @@
+bench-24 destructive phase — user-authorized, wire-driven (2026-11-21)
+Device: Seeed XIAO nRF52840, flashed with the final V5.0.0 release (build
+provenance confirmed on-device). Driver: /tmp/bench24d.py + /tmp/bench24redo.py.
+Every phase executed with a defined recovery; the device was left powered,
+healthy (vdd 3329 mV), in BLE mouse mode, settings restored to the user's
+values — with two deliberate losses flagged below.
+
+1. BT SWITCH WINDOW (live, non-target) .................. PASS
+   BT,1:2 opened the directed window (target E9:91:DF:97:C4:D8/1, irk=1);
+   the connected laptop tried to reconnect and the bouncer bounced it
+   120+ times ("BT window bouncing non-target 743542DC571C (#N)") while
+   waiting for the absent desktop; the window ran out its bound, the device
+   returned to open advertising, and the LAPTOP AUTO-RECONNECTED. A follow-up
+   BT,1:1 was correctly refused: "this host is already the connected one".
+2. BT FORGET (bond destroyed ............................. PASS
+   BT,2:2 removed the desktop bond; BT,0 count 2 -> 1. The desktop needs a
+   manual re-pair when next used.
+3. WATCHDOG RESET -> SAFE MODE -> RECOVERY ............... PASS
+   RT,1:3 stalled the loop; the WDT reset at its 30 s timeout (USB port
+   dropped, verified); the reboot entered safe mode — proven on the wire by
+   the round-1..3 gate refusing the menu open with the named line:
+   "ERROR: menu open refused — safe mode owns the display (use the Hub
+   buttons: Restart / Factory Reset)". SR,1:1 from safe mode acked and the
+   recovery boot was normal (no safe-mode lines). VN 5.0.0 after.
+4. RS,1 SETTINGS RESET ................................... PASS
+   The seed overwrote /settings.txt (SS 9 -> 5 verified by EX,0), the device
+   reset, and all 22 user-settable keys were restored over the API
+   (missed=[]). The CORNERS reverted to the seed defaults (CA0-CA4) — no API
+   write path exists for corners; a physical full calibration is required.
+5. HUB-MENU FACTORY RESET VIA THE SERIAL REMOTE (the round-4 pre-flight
+   gate's primary path) ................................... PASS
+   Driven through CH,1 navigation with CH,0 state verification at every step:
+   main menu -> 4x next -> "More" (menu id 5) -> 6x next -> "Factory Reset"
+   (row 6) -> confirm1 (page 57) -> warn (page 572) -> confirm2 (page 571) ->
+   select -> the reset RAN (USB port dropped). Post-FR: SS back to the seed 5,
+   bonds 0 (the filesystem format wipes the bond directory — re-pairing
+   required). All 22 keys restored again (missed=[]).
+6. UPDATE MODE -> SERIAL DFU BOOTLOADER -> RE-FLASH ...... PASS
+   UM,1:1 rebooted into the stock bootloader (mid-read port teardown — the
+   harness saw the re-enumeration as "Device not configured", the expected
+   shape); adafruit-nrfutil flashed the release DFU package ("Device
+   programmed"); the app rebooted with VN 5.0.0, the same UID (f783be64), and
+   the FILESYSTEM PRESERVED (settings + the remaining bond survived the DFU).
+
+State after the session (deliberate losses, both recoverable by the user):
+  - Bonds: 0 (the factory reset's format wiped the laptop bond; re-pair via
+    the macOS Bluetooth UI, then the device's pair-new if prompted)
+  - Corners: seed defaults (the RS/FR reseeds; re-run Full Calibration)
+  - Settings: restored to the user's values (verified SS=9, WL=3000, DM=1)
+  - Mode: BLE mouse (CM=2), vdd 3329 mV, VN 5.0.0, UID f783be64
+
+Not driven (needs the human): physical full calibration, sip/puff all bands,
+external switches, hub buttons (including the safe menu's own Restart /
+Factory Reset rows), macOS-side re-pairing, and the LipSync Connect app's
+WebUSB flash flow (the serial-DFU twin of item 6 is now proven).
