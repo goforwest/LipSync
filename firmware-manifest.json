@@ -1,0 +1,23 @@
+{
+  "firmwareVersion": "5.0.0",
+  "tag": "V5.0.0",
+  "fqbn": "Seeeduino:nrf52:xiaonRF52840",
+  "builtAt": "2026-11-21T00:00:20+00:00",
+  "files": {
+    "dfu": {
+      "fileName": "LipSync_Firmware_5.0.0_dfu.zip",
+      "size": 387586,
+      "sha256": "fdafcaff213fa39b23f4479eed1d7517e7080a1871d05d3d7274792bf573be06"
+    },
+    "uf2": {
+      "fileName": "LipSync_Firmware_5.0.0.uf2",
+      "size": 773632,
+      "sha256": "07cde42f1e4201e90c27e5a8be535aa86ca17c9d6aae3856d09bed551c713ca9"
+    },
+    "hex": {
+      "fileName": "LipSync_Firmware_5.0.0.hex",
+      "size": 1087787,
+      "sha256": "99788fb88f80fd1359ed7d6b3fbb408cced1592b90726b895762be9ddd2d14ed"
+    }
+  }
+}
